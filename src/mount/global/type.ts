@@ -50,4 +50,5 @@ declare var global: {
     nodeList: [myNode[]?]
     currentNodeIndex: number
     helpText: string
+    debug?: boolean
 }

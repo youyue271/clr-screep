@@ -47,6 +47,7 @@ export default class CreepExtension extends Creep {
             return
         } else {
             // work over, get another work
+            this.releaseCurrentWork()
             this.memory.working = false
             this.memory.currentWork = undefined
             this.memory.currentWorkType = undefined
@@ -58,25 +59,74 @@ export default class CreepExtension extends Creep {
 
     getWork(): boolean {
         const room = this.room
+        if (!global.room[room.name] || !global.room[room.name].creepTask) {
+            return false
+        }
         const TaskList = roleToTask[this.memory.role]
-        for (const task of TaskList) {
-            // console.log(task, global.room[this.room.name].creepTask[task])
-            if (global.room[this.room.name].creepTask[task].length > 0) {
-                this.memory.currentWork = global.room[this.room.name].creepTask[task].shift();
-                this.memory.currentWorkType = task
-                this.memory.working = true
-                return true
+        const now = Game.time
+        for (const taskType of TaskList) {
+            const queue = global.room[room.name].creepTask[taskType]
+            if (!queue || !queue.length) {
+                continue
+            }
+            for (let i = 0; i < queue.length; i++) {
+                const task = queue[i]
+                if (!task) {
+                    continue
+                }
+                if (task.capacity === undefined) {
+                    task.capacity = 1
+                }
+                if (!task.reservedBy) {
+                    task.reservedBy = []
+                }
+                if (task.persistent) {
+                    task.reservedBy = task.reservedBy.filter(item => Game.creeps[item.name])
+                    const existing = task.reservedBy.find(item => item.name === this.name)
+                    if (existing) {
+                        existing.lastTick = now
+                    } else {
+                        if (task.reservedBy.length >= task.capacity) {
+                            continue
+                        }
+                        task.reservedBy.push({name: this.name, lastTick: now})
+                    }
+                    this.memory.currentWork = task
+                    this.memory.currentWorkType = taskType
+                    this.memory.working = true
+                    return true
+                } else {
+                    const picked = queue.shift()
+                    if (!picked) {
+                        continue
+                    }
+                    if (picked.capacity === undefined) {
+                        picked.capacity = 1
+                    }
+                    if (!picked.reservedBy) {
+                        picked.reservedBy = []
+                    }
+                    this.memory.currentWork = picked
+                    this.memory.currentWorkType = taskType
+                    this.memory.working = true
+                    return true
+                }
             }
         }
         return false
     }
 
     changeRole(role: Role): boolean {
-        if (this.memory.currentWorkType) {
+        if (this.memory.currentWorkType && this.memory.currentWork) {
             // 被丢下的工作放在队列最前面, 优先被其他creep选取
-            global.room[this.room.name].creepTask[this.memory.currentWorkType].unshift(this.memory.currentWork)
+            this.releaseCurrentWork()
+            if (!this.memory.currentWork.persistent) {
+                global.room[this.room.name].creepTask[this.memory.currentWorkType].unshift(this.memory.currentWork)
+            }
             this.memory.currentWorkType = undefined
             this.memory.currentWork = undefined
+        } else if (this.memory.currentWorkType) {
+            this.memory.currentWorkType = undefined
         }
         this.memory.oldRole = this.memory.role
         this.memory.role = role
@@ -84,9 +134,18 @@ export default class CreepExtension extends Creep {
         return true
     }
 
+    releaseCurrentWork() {
+        const task = this.memory.currentWork
+        if (task && task.reservedBy) {
+            task.reservedBy = task.reservedBy.filter(item => item.name !== this.name)
+        }
+    }
 
     harvestSource(sourceId: Id<any>, containerPosX: number, ContainerPosY: number): boolean {
         const source: Source = Game.getObjectById(sourceId)
+        if (!source) {
+            return true
+        }
         this.say("⛏️007采矿")
 
         if (!this.pos.inRangeTo(containerPosX, ContainerPosY, 0)) {
@@ -99,6 +158,14 @@ export default class CreepExtension extends Creep {
 
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant) {
         const structure = Game.getObjectById(id)
+        if (!structure) {
+            this.releaseCurrentWork()
+            delete this.memory.currentWorkType
+            delete this.memory.currentWork
+            this.changeRole(this.memory.oldRole)
+            delete this.memory.oldRole
+            return true
+        }
         this.say("🫳偷拿资源")
         const res = this.withdraw(structure, energyType)
         if (res == ERR_NOT_IN_RANGE) {
@@ -115,6 +182,7 @@ export default class CreepExtension extends Creep {
     collectEnergy(id: Id<any>) {
         const resource = <Resource>Game.getObjectById(id)
         if (!resource) {
+            this.releaseCurrentWork()
             delete this.memory.currentWorkType
             delete this.memory.currentWork
             this.changeRole(this.memory.oldRole)
@@ -144,10 +212,13 @@ export default class CreepExtension extends Creep {
 
     upgrade(controllerId: Id<StructureController>): boolean {
         const controller = Game.getObjectById(controllerId)
+        if (!controller) {
+            return true
+        }
         if (this.store['energy']) {
             this.say("⚡升本!")
-            if (this.upgradeController(this.room.controller) == ERR_NOT_IN_RANGE) {
-                this.moveTo(this.room.controller, {visualizePathStyle: {stroke: '#ffffff'}});
+            if (this.upgradeController(controller) == ERR_NOT_IN_RANGE) {
+                this.moveTo(controller, {visualizePathStyle: {stroke: '#ffffff'}});
             }
         } else {
             this.changeRole('emptyWorker')
@@ -168,8 +239,17 @@ export default class CreepExtension extends Creep {
 
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean {
         if (this.store['energy']) {
-            this.say("⚡运输中")
             const target = Game.getObjectById(targetId)
+            if (!target) {
+                this.say("⚡找不到目标")
+                this.releaseCurrentWork()
+                delete this.memory.currentWorkType
+                delete this.memory.currentWork
+                this.changeRole(this.memory.oldRole)
+                delete this.memory.oldRole
+                return true
+            }
+            this.say("⚡运输中")
             const res = this.transfer(target, resourceType)
             if (res == ERR_NOT_IN_RANGE) {
                 this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}});
@@ -180,6 +260,14 @@ export default class CreepExtension extends Creep {
                     this.room.registTask(getCarryList([target], resourceType))
                 }
                 return false
+            } else if (res == ERR_FULL) {
+                this.say("⚡目标已满")
+                this.releaseCurrentWork()
+                delete this.memory.currentWorkType
+                delete this.memory.currentWork
+                this.changeRole(this.memory.oldRole)
+                delete this.memory.oldRole
+                return true
             }
         } else {
             this.changeRole('emptyWorker')
@@ -193,6 +281,14 @@ export default class CreepExtension extends Creep {
         if (this.store['energy']) {
             this.say("⚡建造中")
             const target = Game.getObjectById(constructionId)
+            if (!target) {
+                this.releaseCurrentWork()
+                delete this.memory.currentWorkType
+                delete this.memory.currentWork
+                this.changeRole(this.memory.oldRole)
+                delete this.memory.oldRole
+                return true
+            }
             const res = this.build(target)
             if (res == ERR_NOT_IN_RANGE) {
                 this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}});

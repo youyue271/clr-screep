@@ -3317,7 +3317,7 @@ const spawnTable = {
     'worker': [0, 11, 4, 9, 9, 7, 7, 7, 3],
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 };
-const upgradeTaskNum = [0, 5, 1, 5, 5, 4, 4, 4, 1];
+const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1];
 
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
 /**
@@ -3332,25 +3332,33 @@ function harvestSource(room) {
     });
     let tasks = [];
     for (const sourceId of sources) {
-        const pos = Game.getObjectById(sourceId).pos.findInRange(containerPos, 1);
+        const source = Game.getObjectById(sourceId);
+        if (!source) {
+            continue;
+        }
+        const pos = source.pos.findInRange(containerPos, 1);
+        const targetPos = pos.length ? pos[0] : source.pos;
         tasks.push({
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
-            taskParam: [sourceId, pos[0].x, pos[0].y]
+            taskParam: [sourceId, targetPos.x, targetPos.y]
         });
     }
     return tasks;
 }
 function upgrade(room) {
-    let tasks = [];
-    for (let i = 0; i < upgradeTaskNum[room.controller.level]; i++) {
-        tasks.push({
+    const capacity = upgradeTaskCapacity[room.controller.level];
+    if (!capacity) {
+        return [];
+    }
+    return [{
             taskType: 'upgradeTask',
             taskFunc: 'upgrade',
-            taskParam: [room.controller.id]
-        });
-    }
-    return tasks;
+            taskParam: [room.controller.id],
+            capacity: capacity,
+            persistent: true,
+            targetId: room.controller.id
+        }];
 }
 function construct(ConstructionSiteId) {
     return [{
@@ -3475,6 +3483,7 @@ class CreepExtension extends Creep {
         }
         else {
             // work over, get another work
+            this.releaseCurrentWork();
             this.memory.working = false;
             this.memory.currentWork = undefined;
             this.memory.currentWorkType = undefined;
@@ -3483,33 +3492,94 @@ class CreepExtension extends Creep {
         }
     }
     getWork() {
-        this.room;
+        const room = this.room;
+        if (!global.room[room.name] || !global.room[room.name].creepTask) {
+            return false;
+        }
         const TaskList = roleToTask[this.memory.role];
-        for (const task of TaskList) {
-            // console.log(task, global.room[this.room.name].creepTask[task])
-            if (global.room[this.room.name].creepTask[task].length > 0) {
-                this.memory.currentWork = global.room[this.room.name].creepTask[task].shift();
-                this.memory.currentWorkType = task;
-                this.memory.working = true;
-                return true;
+        const now = Game.time;
+        for (const taskType of TaskList) {
+            const queue = global.room[room.name].creepTask[taskType];
+            if (!queue || !queue.length) {
+                continue;
+            }
+            for (let i = 0; i < queue.length; i++) {
+                const task = queue[i];
+                if (!task) {
+                    continue;
+                }
+                if (task.capacity === undefined) {
+                    task.capacity = 1;
+                }
+                if (!task.reservedBy) {
+                    task.reservedBy = [];
+                }
+                if (task.persistent) {
+                    task.reservedBy = task.reservedBy.filter(item => Game.creeps[item.name]);
+                    const existing = task.reservedBy.find(item => item.name === this.name);
+                    if (existing) {
+                        existing.lastTick = now;
+                    }
+                    else {
+                        if (task.reservedBy.length >= task.capacity) {
+                            continue;
+                        }
+                        task.reservedBy.push({ name: this.name, lastTick: now });
+                    }
+                    this.memory.currentWork = task;
+                    this.memory.currentWorkType = taskType;
+                    this.memory.working = true;
+                    return true;
+                }
+                else {
+                    const picked = queue.shift();
+                    if (!picked) {
+                        continue;
+                    }
+                    if (picked.capacity === undefined) {
+                        picked.capacity = 1;
+                    }
+                    if (!picked.reservedBy) {
+                        picked.reservedBy = [];
+                    }
+                    this.memory.currentWork = picked;
+                    this.memory.currentWorkType = taskType;
+                    this.memory.working = true;
+                    return true;
+                }
             }
         }
         return false;
     }
     changeRole(role) {
-        if (this.memory.currentWorkType) {
+        if (this.memory.currentWorkType && this.memory.currentWork) {
             // 被丢下的工作放在队列最前面, 优先被其他creep选取
-            global.room[this.room.name].creepTask[this.memory.currentWorkType].unshift(this.memory.currentWork);
+            this.releaseCurrentWork();
+            if (!this.memory.currentWork.persistent) {
+                global.room[this.room.name].creepTask[this.memory.currentWorkType].unshift(this.memory.currentWork);
+            }
             this.memory.currentWorkType = undefined;
             this.memory.currentWork = undefined;
+        }
+        else if (this.memory.currentWorkType) {
+            this.memory.currentWorkType = undefined;
         }
         this.memory.oldRole = this.memory.role;
         this.memory.role = role;
         this.memory.working = false;
         return true;
     }
+    releaseCurrentWork() {
+        const task = this.memory.currentWork;
+        if (task && task.reservedBy) {
+            task.reservedBy = task.reservedBy.filter(item => item.name !== this.name);
+        }
+    }
     harvestSource(sourceId, containerPosX, ContainerPosY) {
         const source = Game.getObjectById(sourceId);
+        if (!source) {
+            return true;
+        }
         this.say("⛏️007采矿");
         if (!this.pos.inRangeTo(containerPosX, ContainerPosY, 0)) {
             this.moveTo(containerPosX, ContainerPosY, { visualizePathStyle: { stroke: '#ffffff' } });
@@ -3521,6 +3591,14 @@ class CreepExtension extends Creep {
     }
     getEnergyFromStructure(id, energyType) {
         const structure = Game.getObjectById(id);
+        if (!structure) {
+            this.releaseCurrentWork();
+            delete this.memory.currentWorkType;
+            delete this.memory.currentWork;
+            this.changeRole(this.memory.oldRole);
+            delete this.memory.oldRole;
+            return true;
+        }
         this.say("🫳偷拿资源");
         const res = this.withdraw(structure, energyType);
         if (res == ERR_NOT_IN_RANGE) {
@@ -3537,6 +3615,7 @@ class CreepExtension extends Creep {
     collectEnergy(id) {
         const resource = Game.getObjectById(id);
         if (!resource) {
+            this.releaseCurrentWork();
             delete this.memory.currentWorkType;
             delete this.memory.currentWork;
             this.changeRole(this.memory.oldRole);
@@ -3565,11 +3644,14 @@ class CreepExtension extends Creep {
         return false;
     }
     upgrade(controllerId) {
-        Game.getObjectById(controllerId);
+        const controller = Game.getObjectById(controllerId);
+        if (!controller) {
+            return true;
+        }
         if (this.store['energy']) {
             this.say("⚡升本!");
-            if (this.upgradeController(this.room.controller) == ERR_NOT_IN_RANGE) {
-                this.moveTo(this.room.controller, { visualizePathStyle: { stroke: '#ffffff' } });
+            if (this.upgradeController(controller) == ERR_NOT_IN_RANGE) {
+                this.moveTo(controller, { visualizePathStyle: { stroke: '#ffffff' } });
             }
         }
         else {
@@ -3589,8 +3671,17 @@ class CreepExtension extends Creep {
     }
     carryEnergy(targetId, resourceType) {
         if (this.store['energy']) {
-            this.say("⚡运输中");
             const target = Game.getObjectById(targetId);
+            if (!target) {
+                this.say("⚡找不到目标");
+                this.releaseCurrentWork();
+                delete this.memory.currentWorkType;
+                delete this.memory.currentWork;
+                this.changeRole(this.memory.oldRole);
+                delete this.memory.oldRole;
+                return true;
+            }
+            this.say("⚡运输中");
             const res = this.transfer(target, resourceType);
             if (res == ERR_NOT_IN_RANGE) {
                 this.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' } });
@@ -3602,6 +3693,15 @@ class CreepExtension extends Creep {
                     this.room.registTask(getCarryList([target], resourceType));
                 }
                 return false;
+            }
+            else if (res == ERR_FULL) {
+                this.say("⚡目标已满");
+                this.releaseCurrentWork();
+                delete this.memory.currentWorkType;
+                delete this.memory.currentWork;
+                this.changeRole(this.memory.oldRole);
+                delete this.memory.oldRole;
+                return true;
             }
         }
         else {
@@ -3615,6 +3715,14 @@ class CreepExtension extends Creep {
         if (this.store['energy']) {
             this.say("⚡建造中");
             const target = Game.getObjectById(constructionId);
+            if (!target) {
+                this.releaseCurrentWork();
+                delete this.memory.currentWorkType;
+                delete this.memory.currentWork;
+                this.changeRole(this.memory.oldRole);
+                delete this.memory.oldRole;
+                return true;
+            }
             const res = this.build(target);
             if (res == ERR_NOT_IN_RANGE) {
                 this.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' } });
@@ -4012,6 +4120,9 @@ class RoomExtension extends Room {
         }
     }
     globalReset() {
+        if (!this.controller || !this.controller.my) {
+            return;
+        }
         global.room[this.name] = {};
         global.room[this.name].spawnList = [];
         global.room[this.name].creepTask = {
@@ -4140,7 +4251,13 @@ class RoomExtension extends Room {
                         memory.role = memory.oldRole;
                     }
                     if (memory.currentWorkType) {
-                        global.room[this.name].creepTask[memory.currentWorkType].push(memory.currentWork);
+                        const task = memory.currentWork;
+                        if (task && task.reservedBy) {
+                            task.reservedBy = task.reservedBy.filter(item => item.name !== creepName);
+                        }
+                        if (!task || !task.persistent) {
+                            global.room[memory.spawnRoom].creepTask[memory.currentWorkType].push(memory.currentWork);
+                        }
                     }
                     room.addToSpawnList(memory.role);
                 }
@@ -4251,10 +4368,17 @@ class RoomExtension extends Room {
      * @param tasks
      */
     registTask(tasks) {
+        var _a, _b, _c;
         for (const task of tasks) {
             global.room[this.name].creepTask[task.taskType].push({
+                id: `${task.taskFunc}-${Game.time}-${Math.random().toString(36).slice(2)}`,
                 taskFunc: task.taskFunc,
-                taskParam: task.taskParam
+                taskParam: task.taskParam,
+                priority: (_a = task.priority) !== null && _a !== void 0 ? _a : 1,
+                capacity: (_b = task.capacity) !== null && _b !== void 0 ? _b : 1,
+                persistent: (_c = task.persistent) !== null && _c !== void 0 ? _c : false,
+                targetId: task.targetId,
+                reservedBy: []
             });
         }
         // console.log()
@@ -5020,20 +5144,6 @@ const GlobalNodes = [
                 delete Memory[memory];
             }
             for (const room in Game.rooms) {
-                // 暂时就分三种， 0是主基地，1是分基地也就是矿场，用于reserve，2是其他房间
-                if (!Game.rooms[room].controller) {
-                    Game.rooms[room].memory.roomType = 2;
-                    console.log(room);
-                }
-                else {
-                    if (!Game.rooms[room].controller.my) {
-                        Game.rooms[room].memory.roomType = 2;
-                    }
-                    else {
-                        Game.rooms[room].memory.roomType = 0;
-                        console.log(room);
-                    }
-                }
                 Game.rooms[room].init();
             }
             return "全局初始化执行完毕\n" + global.currentMenu;
@@ -5967,7 +6077,7 @@ function mount () {
 function globalInit() {
     global.room = {};
     for (const roomName in Game.rooms) {
-        Game.rooms[roomName].globalReset();
+        Game.rooms[roomName].init();
     }
 }
 
@@ -6011,7 +6121,7 @@ const loop = errorMapper(() => {
     // }
     creepControl();
     roomControl();
-    generatePixel();
+    //generatePixel()
     for (const room in Game.rooms) {
         // getBiggestSquare(11, room)
         // visualize(totalCluster1, room, 15, 12, Game.time % 9)
@@ -6021,9 +6131,13 @@ const loop = errorMapper(() => {
         // // console.log(x, y)
         // Game.rooms[room].visualize(totalCluster1, x, y)
     }
+    debugDump();
 });
 function roomControl() {
     for (const room in Game.rooms) {
+        if (!global.room[room]) {
+            Game.rooms[room].init();
+        }
         // Game.rooms[room].registEvent(testEvent(Game.rooms[room]))
         Game.rooms[room].runEvent();
         // Game.rooms[room].calSourceMap()
@@ -6043,13 +6157,49 @@ function creepControl() {
         creep.work();
     }
 }
-/**
- * 生成 pixel
- */
-function generatePixel() {
-    if (Game.cpu.bucket == 10000) {
-        Game.cpu.generatePixel();
+function debugDump() {
+    if (!global.debug) {
+        return;
     }
+    const lines = [];
+    lines.push(`DEBUG ${Game.time}`);
+    if (!global.room) {
+        loggerInstance.debug(lines.join("\n"));
+        return;
+    }
+    for (const roomName in global.room) {
+        const roomData = global.room[roomName];
+        if (!roomData) {
+            continue;
+        }
+        lines.push(`room:${roomName}`);
+        if (roomData.spawnList) {
+            const roles = roomData.spawnList.map(item => item === null || item === void 0 ? void 0 : item.role).filter(Boolean).join(",");
+            lines.push(`spawnList:${roles}`);
+        }
+        const creepTask = roomData.creepTask;
+        if (creepTask) {
+            for (const taskType in creepTask) {
+                const list = (creepTask[taskType] || []);
+                const size = list.length || 0;
+                let detail = "";
+                if (size) {
+                    const sample = list.slice(0, 3).map(task => {
+                        var _a;
+                        if (!task) {
+                            return "null";
+                        }
+                        const reserved = task.reservedBy ? task.reservedBy.map(item => item.name).join(" | ") : "";
+                        const capacity = (_a = task.capacity) !== null && _a !== void 0 ? _a : 1;
+                        return `${task.taskFunc}@cap${capacity}@res[${reserved}]`;
+                    }).join(";");
+                    detail = `:${sample}`;
+                }
+                lines.push(`task:${taskType} = ${size}${detail}`);
+            }
+        }
+    }
+    loggerInstance.debug(lines.join("\n"));
 }
 
 exports.loop = loop;

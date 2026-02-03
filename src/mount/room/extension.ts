@@ -28,6 +28,9 @@ export default class RoomExtension extends Room {
     }
 
     globalReset() {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
         global.room[this.name] = {}
         global.room[this.name].spawnList = []
         global.room[this.name].creepTask = {
@@ -159,7 +162,13 @@ export default class RoomExtension extends Room {
                         memory.role = memory.oldRole
                     }
                     if (memory.currentWorkType) {
-                        global.room[this.name].creepTask[memory.currentWorkType].push(memory.currentWork)
+                        const task = memory.currentWork
+                        if (task && task.reservedBy) {
+                            task.reservedBy = task.reservedBy.filter(item => item.name !== creepName)
+                        }
+                        if (!task || !task.persistent) {
+                            global.room[memory.spawnRoom].creepTask[memory.currentWorkType].push(memory.currentWork)
+                        }
                     }
                     room.addToSpawnList(memory.role)
                 }
@@ -285,8 +294,14 @@ export default class RoomExtension extends Room {
     registTask(tasks: MyTask[]) {
         for (const task of tasks) {
             global.room[this.name].creepTask[task.taskType].push({
+                id: `${task.taskFunc}-${Game.time}-${Math.random().toString(36).slice(2)}`,
                 taskFunc: task.taskFunc,
-                taskParam: task.taskParam
+                taskParam: task.taskParam,
+                priority: task.priority ?? 1,
+                capacity: task.capacity ?? 1,
+                persistent: task.persistent ?? false,
+                targetId: task.targetId,
+                reservedBy: []
             })
         }
         // console.log()

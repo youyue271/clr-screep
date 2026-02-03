@@ -1,5 +1,5 @@
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
-import {upgradeTaskNum} from "@/setting";
+import {upgradeTaskCapacity} from "@/setting";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -13,26 +13,34 @@ export function harvestSource(room: Room) {
     })
     let tasks: MyTask[] = []
     for (const sourceId of sources) {
-        const pos = Game.getObjectById<Source>(sourceId).pos.findInRange(containerPos, 1)
+        const source = Game.getObjectById<Source>(sourceId)
+        if (!source) {
+            continue
+        }
+        const pos = source.pos.findInRange(containerPos, 1)
+        const targetPos = pos.length ? pos[0] : source.pos
         tasks.push({
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
-            taskParam: [sourceId, pos[0].x, pos[0].y]
+            taskParam: [sourceId, targetPos.x, targetPos.y]
         })
     }
     return tasks
 }
 
 export function upgrade(room: Room): MyTask[] {
-    let tasks: MyTask[] = []
-    for (let i = 0; i < upgradeTaskNum[room.controller.level]; i++) {
-        tasks.push({
-            taskType: 'upgradeTask',
-            taskFunc: 'upgrade',
-            taskParam: [room.controller.id]
-        })
+    const capacity = upgradeTaskCapacity[room.controller.level]
+    if (!capacity) {
+        return []
     }
-    return tasks
+    return [{
+        taskType: 'upgradeTask',
+        taskFunc: 'upgrade',
+        taskParam: [room.controller.id],
+        capacity: capacity,
+        persistent: true,
+        targetId: room.controller.id
+    }]
 }
 
 export function construct(ConstructionSiteId: any): MyTask[] {

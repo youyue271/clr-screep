@@ -8,4 +8,4 @@ export const spawnTable: { [role in Role]: number[] } = {
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 }
 
-export const upgradeTaskNum = [0, 5, 1, 5, 5, 4, 4, 4, 1]
+export const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1]
