@@ -22,6 +22,10 @@ interface TaskEntity {
     }[]
 }
 
+type TaskBucket = {
+    [priority: string]: TaskEntity[]
+}
+
 
 
 type TaskType = 'workTask'
@@ -30,3 +34,4 @@ type TaskType = 'workTask'
     | 'upgradeTask'
     | "constructTask"
     | 'energyTask'
+    | 'spawnTask'

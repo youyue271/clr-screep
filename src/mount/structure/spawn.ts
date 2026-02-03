@@ -8,6 +8,7 @@
 import {CalBodyCost} from "@/util/utils";
 import log from "@/util/log";
 import {spawnCreepErrorDescription} from "@/util/errorInformation";
+import { getCarryList } from "@/task/roomTask";
 
 export default class SpawnExtension extends Spawn {
     /**
@@ -28,14 +29,34 @@ export default class SpawnExtension extends Spawn {
                 {align: 'left', opacity: 0.8})
             return
         } else {
-            // spawnList is empty
-            if (!global.room[this.room.name].spawnList.length) {
+            const spawnBuckets = this.room.memory.creepTask?.['spawnTask'] || {}
+            const bucketKeys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b)
+            let spawnQueue: TaskEntity[] | undefined
+            let activeKey: string | undefined
+            for (const key of bucketKeys) {
+                const bucket = spawnBuckets[String(key)]
+                if (bucket && bucket.length) {
+                    spawnQueue = bucket
+                    activeKey = String(key)
+                    break
+                }
+            }
+            if (!spawnQueue || !spawnQueue.length) {
                 return
             } else {
-                const data = global.room[this.room.name].spawnList[0]
-                let energyNeeded = CalBodyCost(data.rolePart)
+                const task = spawnQueue[0]
+                const role = task?.taskParam?.[0] as Role
+                const rolePart = task?.taskParam?.[1] as BodyPartConstant[]
+                if (!role || !rolePart) {
+                    spawnQueue.shift()
+                    if (activeKey && spawnQueue.length === 0) {
+                        delete spawnBuckets[activeKey]
+                    }
+                    return
+                }
+                let energyNeeded = CalBodyCost(rolePart)
                 this.room.visual.text(
-                    '🛠️' + data.role,
+                    '🛠️' + role,
                     this.pos.x + 1,
                     this.pos.y,
                     {align: 'left', opacity: 0.8, font: "20px"})
@@ -52,20 +73,45 @@ export default class SpawnExtension extends Spawn {
                 if (this.room.energyAvailable < energyNeeded) {
                     return
                 } else {
+                    const energyStructureList: (StructureExtension | StructureSpawn)[] = this.room.energyList().map(obj=>{return Game.getObjectById(obj)}).concat(this.room.find(FIND_MY_SPAWNS))
+                    let energyAvailable = 0
+                    for (const structure of energyStructureList) {
+                        if(!structure) {
+                            return
+                        }
+                        energyAvailable += structure.store.getUsedCapacity(RESOURCE_ENERGY)
+                    }
                     //TODO: 在自动规划以后，这里可以加上对应的精准控制消耗的逻辑
-                    let creepName = data.role + Game.time
-                    let res = this.spawnCreep(data.rolePart, creepName, {
+                    let creepName = role + Game.time
+                    let res = this.spawnCreep(rolePart, creepName, {
                         memory: {
-                            role: data.role,
+                            role: role,
                             spawnRoom: this.room.name,
                             working: false,
                             reSpawn: true
-                        }
+                        },
+                        energyStructures: energyStructureList
                     })
                     if (res == OK) {
                         /* 孵化成功 */
-                        global.room[this.room.name].spawnList.shift()
-                        this.room.initCarryList()
+                        spawnQueue.shift()
+                        if (activeKey && spawnQueue.length === 0) {
+                            delete spawnBuckets[activeKey]
+                        }
+                        this.room.memory.energyList = this.room.energyList().map(id=>{
+                            const extension = Game.getObjectById(id)
+                            if (extension.store.getFreeCapacity(RESOURCE_ENERGY) != 0) {
+                                this.room.registTask(getCarryList([extension], RESOURCE_ENERGY))
+                            } 
+                            if (extension.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                                return id
+                            }
+                        })
+                        this.room.find(FIND_MY_SPAWNS).map(spawn=>{
+                            if (spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                                this.room.registTask(getCarryList([spawn], RESOURCE_ENERGY))
+                            }
+                        })
                         this.room.registEvent({
                             triggerTime: Game.time + 1,
                             triggerFunc: "calSpawningTime",

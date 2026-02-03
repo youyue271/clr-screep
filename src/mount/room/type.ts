@@ -3,6 +3,12 @@ interface RoomMemory {
         [tick: number]: [func?: string, param?: any[]][]
     }
 
+    creepTask?: {
+        [task in TaskType]: TaskBucket
+    }
+
+    energyList?: Id<StructureExtension | StructureSpawn>[]
+
     roomPlanType?: number
     roomType?: number
     plan1Pos?: [number, number]
@@ -27,6 +33,12 @@ interface Room {
     initResource(): void
 
     globalReset(): void
+
+    energyList(): Id<StructureExtension | StructureSpawn>[]
+
+    addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
+
+    refreshEnergyCarryTasks(): void
 
     /**
      * 初始化Spawn列表

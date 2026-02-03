@@ -31,7 +31,9 @@ export const loop = errorMapper(() => {
 
 function roomControl(){
     for(const room in Game.rooms){
-        if (!global.room[room]) {
+        const currentRoom = Game.rooms[room]
+        const isOwned = !!currentRoom.controller?.my
+        if (!global.room[room] || (isOwned && !currentRoom.memory.creepTask)) {
             Game.rooms[room].init()
         }
         // Game.rooms[room].registEvent(testEvent(Game.rooms[room]))
@@ -67,9 +69,9 @@ function generatePixel(): void {
 }
 
 function debugDump() {
-    if (!global.debug) {
-        return
-    }
+    // if (!global.debug) {
+    //     return
+    // }
     const lines: string[] = []
     lines.push(`DEBUG ${Game.time}`)
     if (!global.room) {
@@ -82,18 +84,44 @@ function debugDump() {
             continue
         }
         lines.push(`room:${roomName}`)
-        if (roomData.spawnList) {
-            const roles = roomData.spawnList.map(item => item?.role).filter(Boolean).join(",")
-            lines.push(`spawnList:${roles}`)
+        const room = Game.rooms[roomName]
+        if (!room) {
+            continue
         }
-        const creepTask = roomData.creepTask
+        const spawnBuckets = room.memory.creepTask?.['spawnTask']
+        if (spawnBuckets) {
+            const roles: string[] = []
+            const keys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b)
+            for (const key of keys) {
+                const bucket = spawnBuckets[String(key)]
+                if (!bucket || !bucket.length) {
+                    continue
+                }
+                roles.push(...bucket.map(item => item?.taskParam?.[0]).filter(Boolean))
+            }
+            if (roles.length) {
+                lines.push(`spawnTask:${roles.join(",")}`)
+            }
+        }
+        const creepTask = room.memory.creepTask
         if (creepTask) {
             for (const taskType in creepTask) {
-                const list = (creepTask[taskType as TaskType] || []) as TaskEntity[]
-                const size = list.length || 0
+                const buckets = creepTask[taskType as TaskType] || {}
+                let size = 0
                 let detail = ""
+                const sampleTasks: TaskEntity[] = []
+                for (const key in buckets) {
+                    const bucket = buckets[key]
+                    if (!bucket || !bucket.length) {
+                        continue
+                    }
+                    size += bucket.length
+                    if (sampleTasks.length < 3) {
+                        sampleTasks.push(...bucket.slice(0, 3 - sampleTasks.length))
+                    }
+                }
                 if (size) {
-                    const sample = list.slice(0, 3).map(task => {
+                    const sample = sampleTasks.map(task => {
                         if (!task) {
                             return "null"
                         }

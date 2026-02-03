@@ -14,10 +14,7 @@ declare var global: {
             sources?:any[]
             sourceBFS?:any[]
             controllerBFS?:any[]
-            spawnList?: [SpawnData?]
-            creepTask?: {
-                [task in TaskType]: [TaskEntity?]
-            }
+            energyExtensionList?: Id<StructureExtension | StructureSpawn>[]
             container?:any[]
             containerCount?: number
             resources?:Resource[]

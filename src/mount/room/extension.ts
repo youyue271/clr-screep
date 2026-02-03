@@ -10,8 +10,8 @@ export default class RoomExtension extends Room {
      * 初始化部分
      */
     init() {
-        this.memory = {
-            timer: {}
+        if (!this.memory.timer) {
+            this.memory.timer = {}
         }
         // 暂时就分三种， 0是主基地，1是分基地也就是矿场，用于reserve，2是其他房间
         if (!this.controller){
@@ -32,19 +32,58 @@ export default class RoomExtension extends Room {
             return
         }
         global.room[this.name] = {}
-        global.room[this.name].spawnList = []
-        global.room[this.name].creepTask = {
-            'harvestTask': [],
-            'workTask': [],
-            'carryTask': [],
-            'upgradeTask': [],
-            'constructTask': [],
-            'energyTask': []
+        const hasTask = !!this.memory.creepTask
+        const taskTypes: TaskType[] = [
+            'harvestTask',
+            'workTask',
+            'carryTask',
+            'upgradeTask',
+            'constructTask',
+            'energyTask',
+            'spawnTask'
+        ]
+        if (!this.memory.creepTask) {
+            this.memory.creepTask = {
+                'harvestTask': {},
+                'workTask': {},
+                'carryTask': {},
+                'upgradeTask': {},
+                'constructTask': {},
+                'energyTask': {},
+                'spawnTask': {}
+            }
+        } else {
+            for (const type of taskTypes) {
+                const current = this.memory.creepTask[type]
+                if (!current) {
+                    this.memory.creepTask[type] = {}
+                    continue
+                }
+                if (Array.isArray(current)) {
+                    const buckets: TaskBucket = {}
+                    for (const task of current) {
+                        if (!task) {
+                            continue
+                        }
+                        const key = String(task.priority ?? 1)
+                        if (!buckets[key]) {
+                            buckets[key] = []
+                        }
+                        buckets[key].push(task)
+                    }
+                    this.memory.creepTask[type] = buckets
+                }
+            }
         }
-        this.initBuildList()
-        this.initSpawn(this.controller.level)
-        this.initTask(this.controller.level)
-        this.initCarryList()
+        if (!this.memory.energyList) {
+            this.memory.energyList = []
+        }
+        if (!hasTask) {
+            this.initBuildList()
+            this.initSpawn(this.controller.level)
+            this.initTask(this.controller.level)
+            this.initCarryList()
+        }
         this.initResource()
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
@@ -61,7 +100,10 @@ export default class RoomExtension extends Room {
     }
 
     initCarryList() {
-        const structureList = this.find(FIND_MY_STRUCTURES, {
+        if (!this.memory.creepTask) {
+            return
+        }
+        const structureList:Structure[] = this.find(FIND_MY_STRUCTURES, {
             filter: (object: any) => {
                 // console.log(object.structureType)
                 if (!object.store) {
@@ -81,10 +123,97 @@ export default class RoomExtension extends Room {
                 }
             }
         })
-        structureList.forEach(item => {
-            // console.log(item.structureType)
-        })
         this.registTask(getCarryList(structureList, RESOURCE_ENERGY))
+    }
+
+    refreshEnergyCarryTasks() {
+        if (!this.memory.creepTask) {
+            return
+        }
+        const structureList = this.find(FIND_MY_STRUCTURES, {
+            filter: (object: any) => {
+                if (!object.store) {
+                    return false
+                }
+                const isEnergyStructure = object.structureType == STRUCTURE_EXTENSION || object.structureType == STRUCTURE_SPAWN
+                if (!isEnergyStructure) {
+                    return false
+                }
+                return object.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+            }
+        }) as (StructureExtension | StructureSpawn)[]
+        const carryBuckets = this.memory.creepTask['carryTask'] || {}
+        const neededIds = new Set(structureList.map(item => item.id))
+        const existingIds = new Set<string>()
+        for (const key in carryBuckets) {
+            const bucket = carryBuckets[key]
+            if (!bucket || !bucket.length) {
+                delete carryBuckets[key]
+                continue
+            }
+            const nextBucket: TaskEntity[] = []
+            for (const task of bucket) {
+                if (!task) {
+                    continue
+                }
+                const taskTargetId = task.targetId ?? task.taskParam?.[0]
+                if (!taskTargetId || !neededIds.has(taskTargetId)) {
+                    continue
+                }
+                existingIds.add(taskTargetId)
+                nextBucket.push(task)
+            }
+            if (nextBucket.length) {
+                carryBuckets[key] = nextBucket
+            } else {
+                delete carryBuckets[key]
+            }
+        }
+        this.memory.creepTask['carryTask'] = carryBuckets
+        const toAdd = structureList.filter(item => !existingIds.has(item.id))
+        if (toAdd.length) {
+            this.registTask(getCarryList(toAdd, RESOURCE_ENERGY))
+        }
+    }
+
+    addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]) {
+        if (!this.memory.creepTask) {
+            return
+        }
+        const carryBuckets = this.memory.creepTask['carryTask'] || {}
+        const existingIds = new Set<string>()
+        for (const key in carryBuckets) {
+            const bucket = carryBuckets[key]
+            if (!bucket || !bucket.length) {
+                continue
+            }
+            for (const task of bucket) {
+                if (!task) {
+                    continue
+                }
+                const taskTargetId = task.targetId ?? task.taskParam?.[0]
+                if (taskTargetId) {
+                    existingIds.add(taskTargetId)
+                }
+            }
+        }
+        const toAdd: (StructureExtension | StructureSpawn)[] = []
+        for (const id of structureIds) {
+            const structure = Game.getObjectById<StructureExtension | StructureSpawn>(id)
+            if (!structure) {
+                continue
+            }
+            if (!structure.store.getFreeCapacity(RESOURCE_ENERGY)) {
+                continue
+            }
+            if (existingIds.has(structure.id)) {
+                continue
+            }
+            toAdd.push(structure)
+        }
+        if (toAdd.length) {
+            this.registTask(getCarryList(toAdd, RESOURCE_ENERGY))
+        }
     }
 
     /**
@@ -131,18 +260,27 @@ export default class RoomExtension extends Room {
     }
 
     addToSpawnList(role: Role) {
-        if (role == 'harvester') {
-            // 优先级较高的放在最前面
-            global.room[this.name].spawnList.unshift({
-                role: role,
-                rolePart: getBody(role, this)
-            })
-        } else {
-            global.room[this.name].spawnList.push({
-                role: role,
-                rolePart: getBody(role, this)
-            })
+        if (!this.memory.creepTask) {
+            return
         }
+        const spawnBuckets = this.memory.creepTask['spawnTask']
+        if (!spawnBuckets) {
+            return
+        }
+        const task: TaskEntity = {
+            id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
+            taskFunc: "spawnCreep",
+            taskParam: [role, getBody(role, this)],
+            priority: role == 'harvester' || role == 'carrier' ? 0 : 1,
+            capacity: 1,
+            persistent: false, 
+            reservedBy: []
+        }
+        const key = String(task.priority)
+        if (!spawnBuckets[key]) {
+            spawnBuckets[key] = []
+        }
+        spawnBuckets[key].push(task)
     }
 
     creepRecycle() {
@@ -155,6 +293,7 @@ export default class RoomExtension extends Room {
         }
         for (let creepName in Memory.creeps) {
             if (!Game.creeps[creepName]) {
+                // creep 已经死了
                 const memory = Memory.creeps[creepName]
                 if (memory.spawnRoom && memory.reSpawn) {
                     const room = Game.rooms[memory.spawnRoom]
@@ -164,10 +303,17 @@ export default class RoomExtension extends Room {
                     if (memory.currentWorkType) {
                         const task = memory.currentWork
                         if (task && task.reservedBy) {
+                            // 如果在干活， 就把自己去掉
                             task.reservedBy = task.reservedBy.filter(item => item.name !== creepName)
-                        }
-                        if (!task || !task.persistent) {
-                            global.room[memory.spawnRoom].creepTask[memory.currentWorkType].push(memory.currentWork)
+                            if(task.reservedBy.length == 0 && !task.persistent){
+                                const buckets = room.memory.creepTask[memory.currentWorkType] || {}
+                                const key = String(task.priority ?? 1)
+                                if (!buckets[key]) {
+                                    buckets[key] = []
+                                }
+                                buckets[key].push(task)
+                                room.memory.creepTask[memory.currentWorkType] = buckets
+                            }
                         }
                     }
                     room.addToSpawnList(memory.role)
@@ -293,16 +439,22 @@ export default class RoomExtension extends Room {
      */
     registTask(tasks: MyTask[]) {
         for (const task of tasks) {
-            global.room[this.name].creepTask[task.taskType].push({
+            const bucketKey = String(task.priority ?? 2)
+            const buckets = this.memory.creepTask[task.taskType]
+            if (!buckets[bucketKey]) {
+                buckets[bucketKey] = []
+            }
+            buckets[bucketKey].push({
                 id: `${task.taskFunc}-${Game.time}-${Math.random().toString(36).slice(2)}`,
                 taskFunc: task.taskFunc,
                 taskParam: task.taskParam,
-                priority: task.priority ?? 1,
+                priority: task.priority ?? 2,
                 capacity: task.capacity ?? 1,
                 persistent: task.persistent ?? false,
                 targetId: task.targetId,
                 reservedBy: []
             })
+            this.memory.creepTask[task.taskType] = buckets
         }
         // console.log()
     }
@@ -395,14 +547,19 @@ export default class RoomExtension extends Room {
             const containerPos = []
             this.sources().forEach(item => {
                 const source = Game.getObjectById(item)
+                if (!source) {
+                    return
+                }
                 // 先找有没有以前的container
                 let containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
+                // console.log(containers)
                 if (containers.length > 0) {
+                    // console.log(containers[0].pos.x, containers[0].pos.y)
                     containerPos.push([containers[0].pos.x, containers[0].pos.y])
                 } else {
                     // 在找有没有新的constructionSite
                     let constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
-
+                    // console.log(constructionSites)
                     if (constructionSites.length > 0) {
                         containerPos.push([constructionSites[0].pos.x, constructionSites[0].pos.y])
                     } else {
@@ -421,10 +578,24 @@ export default class RoomExtension extends Room {
                                 containerPosList.push(this.getPositionAt(x, y))
                             }
                         }
-                        const pos = this.getPositionAt(this.memory.plan1Pos[0], this.memory.plan1Pos[1])
-                        const finalPos: RoomPosition = pos.findClosestByPath(containerPosList, {algorithm: "astar"})
-                        this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
-                        this.registTask(construct(pos.lookFor(LOOK_CONSTRUCTION_SITES)[0].id))
+                        if (!this.memory.plan1Pos) {
+                            return
+                        }
+                        const planPos = this.getPositionAt(this.memory.plan1Pos[0], this.memory.plan1Pos[1])
+                        if (!planPos) {
+                            return
+                        }
+                        const finalPos: RoomPosition = planPos.findClosestByPath(containerPosList, {algorithm: "astar"})
+                        if (!finalPos) {
+                            return
+                        }
+                        const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
+                        if (createResult == OK) {
+                            const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0]
+                            if (site) {
+                                this.registTask(construct(site.id))
+                            }
+                        }
                     }
                 }
             })
@@ -436,7 +607,17 @@ export default class RoomExtension extends Room {
     }
 
     energyList() {
-
+        if (this.memory.energyList) {
+            return this.memory.energyList
+        }
+        const structures = this.find(FIND_MY_STRUCTURES, {
+            filter: (object: any) => {
+                const isEnergyStructure = object.structureType === STRUCTURE_EXTENSION 
+                return isEnergyStructure && object.store?.getFreeCapacity(RESOURCE_ENERGY) !== 0
+            }
+        }) as (StructureExtension | StructureSpawn)[]
+        this.memory.energyList = structures.map(obj=>{return obj.id})
+        return structures.map(obj=>{return obj.id})
     }
 
     /**

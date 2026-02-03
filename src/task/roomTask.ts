@@ -118,12 +118,16 @@ export function getEnergyWithoutStorage(room:Room): MyTask[] {
     }
 }
 
-export function getCarryList(targetList:any[], resourceType:ResourceConstant): MyTask[]{
+export function getCarryList(targetList:Structure[], resourceType:ResourceConstant): MyTask[]{
     return targetList.map(item => {
         return {
             taskType: 'carryTask',
             taskFunc: "carryEnergy",
-            taskParam: [item.id, resourceType]
+            taskParam: [item.id, resourceType],
+            priority: 1,
+            capacity: 1,
+            persistent: true,
+            targetId: item.id
         }
     })
 }

@@ -239,10 +239,20 @@ const RoomNodes: myNode[] = [
                 return "> 请先指定房间\n"
             }
             let txt = ""
-            txt += "> spawnList:\n\t"
-            global.room[global.currentRoom.name].spawnList.forEach((item) => {
-                txt += item.role + " "
-            })
+            txt += "> spawnTask:\n\t"
+            const spawnBuckets = global.currentRoom.memory.creepTask['spawnTask']
+            if (spawnBuckets) {
+                const keys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b)
+                for (const key of keys) {
+                    const bucket = spawnBuckets[String(key)]
+                    if (!bucket || !bucket.length) {
+                        continue
+                    }
+                    bucket.forEach((item) => {
+                        txt += item?.taskParam?.[0] + " "
+                    })
+                }
+            }
             txt += "\n\n"
             txt += "> creepTask:\n"
             const TaskType = ['workTask'
@@ -250,9 +260,17 @@ const RoomNodes: myNode[] = [
                 , 'carryTask'
                 , 'upgradeTask'
                 , "constructTask"
-                , 'energyTask']
+                , 'energyTask'
+                , 'spawnTask']
             for (const type of TaskType) {
-                txt += "\t"+ type + ": " + global.room[global.currentRoom.name].creepTask[type].length + "\n"
+                const buckets = global.currentRoom.memory.creepTask[type]
+                let size = 0
+                if (buckets) {
+                    for (const key in buckets) {
+                        size += buckets[key]?.length || 0
+                    }
+                }
+                txt += "\t"+ type + ": " + size + "\n"
                 // global.room[global.currentRoom.name].creepTask[type].forEach((item: TaskEntity) => {
                 //     txt += item.taskParam
                 // })
@@ -260,7 +278,7 @@ const RoomNodes: myNode[] = [
             return txt + "\n" + global.currentMenu
         },
         help: "memoryInfo\n" +
-            "\t房间中挂载在global上的信息\n"
+            "\t房间中挂载在memory上的信息\n"
     },
     back,
     quit
