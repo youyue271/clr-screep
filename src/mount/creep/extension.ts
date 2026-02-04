@@ -328,16 +328,9 @@ export default class CreepExtension extends Creep {
             } else if (res == OK) {
                 // 这个persistent不知道是用来干什么的，先不删了
                 // if (this.memory.currentWork?.persistent && !target.store.getFreeCapacity(resourceType)) {
+                addToEnergyList()
                 if (!target.store.getFreeCapacity(resourceType)) {
-                    addToEnergyList()
                     this.removeCurrentWorkFromQueue()
-                    // const targetRole = this.memory.oldRole ?? this.memory.role
-                    // if (targetRole) {
-                    //     this.changeRole(targetRole)
-                    // } else {
-                    //     this.remember()
-                    // }
-                    // delete this.memory.oldRole
                     return true
                 }
                 return false
@@ -345,13 +338,6 @@ export default class CreepExtension extends Creep {
                 this.say("⚡目标已满")
                 addToEnergyList()
                 this.removeCurrentWorkFromQueue()
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
                 return true
             }
         } else {

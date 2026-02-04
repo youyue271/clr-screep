@@ -79,7 +79,7 @@ const getHarvesterBody = function (room: Room) {
     let body = [];
     // 如果没有能量直接返回，不然后面会出现负数
     // if (room.energyAvailable <= 250) return body
-    // if (room.workingCreepNum('harvester') == 0) {
+    // if (room.find(FIND_MY_CR) < 2) {
     body = calcBodyPart({[MOVE]: 1, [WORK]: 2, [CARRY]: 1})
     // } else {
     //     let num = Math.floor((room.energyCapacityAvailable * spawnPercent - 50) / 250)

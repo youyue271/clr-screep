@@ -32,65 +32,38 @@ export default class RoomExtension extends Room {
             return
         }
         global.room[this.name] = {}
-        const hasTask = !!this.memory.creepTask
-        const taskTypes: TaskType[] = [
-            'harvestTask',
-            'workTask',
-            'carryTask',
-            'upgradeTask',
-            'constructTask',
-            'energyTask',
-            'spawnTask'
-        ]
-        if (!this.memory.creepTask) {
-            this.memory.creepTask = {
-                'harvestTask': {},
-                'workTask': {},
-                'carryTask': {},
-                'upgradeTask': {},
-                'constructTask': {},
-                'energyTask': {},
-                'spawnTask': {}
-            }
-        } else {
-            for (const type of taskTypes) {
-                const current = this.memory.creepTask[type]
-                if (!current) {
-                    this.memory.creepTask[type] = {}
-                    continue
-                }
-                if (Array.isArray(current)) {
-                    const buckets: TaskBucket = {}
-                    for (const task of current) {
-                        if (!task) {
-                            continue
-                        }
-                        const key = String(task.priority ?? 1)
-                        if (!buckets[key]) {
-                            buckets[key] = []
-                        }
-                        buckets[key].push(task)
-                    }
-                    this.memory.creepTask[type] = buckets
-                }
-            }
+        this.memory.creepTask = {
+            'harvestTask': {},
+            'workTask': {},
+            'carryTask': {},
+            'upgradeTask': {},
+            'constructTask': {},
+            'energyTask': {},
+            'spawnTask': {}
         }
-        if (!this.memory.energyList) {
-            this.memory.energyList = []
-        }
-        if (!hasTask) {
-            this.initBuildList()
-            this.initSpawn(this.controller.level)
-            this.initTask(this.controller.level)
-            this.initCarryList()
-            this.initCreepRecycle()
-        }
+
+        this.initEnergyList()
         this.initResource()
+        this.initBuildList()
+        this.initSpawn(this.controller.level)
+        this.initTask(this.controller.level)
+        this.initCarryList()
+        this.initCreepRecycle()
+        
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
 
+    initEnergyList(): void {
+        const extensions = this.find(FIND_MY_STRUCTURES, {
+            filter: (object: any) => {
+                return object.structureType == STRUCTURE_EXTENSION && object.store['energy']
+            }
+        })
+        this.memory.energyList = extensions.map((extension: StructureExtension) => extension.id)
+    }
+
     initBuildList() {
-        delete this.memory.creepTask['constructTask']
+        // delete this.memory.creepTask['constructTask']
         this.construct(this.controller.level)
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES)
         this.registTask(createBuildTask(constructionSites))
@@ -392,7 +365,7 @@ export default class RoomExtension extends Room {
 
     calSpawningTime(SpawnId: Id<StructureSpawn>) {
         const thisSpawn = Game.getObjectById(SpawnId)
-        const nextEnergyList: Id<StructureExtension | StructureSpawn>[] = []
+        const nextEnergyList: Id<StructureExtension>[] = []
         for (const id of thisSpawn.room.energyList()) {
             const extension = Game.getObjectById(id)
             if (!extension) {
@@ -400,7 +373,8 @@ export default class RoomExtension extends Room {
             }
             if (extension.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                 thisSpawn.room.registTask(getCarryList([extension], RESOURCE_ENERGY))
-            } else {
+            }
+            if (extension.store['energy']){
                 nextEnergyList.push(id)
             }
         }
@@ -668,10 +642,13 @@ export default class RoomExtension extends Room {
         }
         const structures = this.find(FIND_MY_STRUCTURES, {
             filter: (object: any) => {
-                const isEnergyStructure = object.structureType === STRUCTURE_EXTENSION 
-                return isEnergyStructure && object.store?.getFreeCapacity(RESOURCE_ENERGY) !== 0
+                if (!object.store) {
+                    return false
+                }
+                const isEnergyStructure = object.structureType === STRUCTURE_EXTENSION
+                return isEnergyStructure && object.store['energy']
             }
-        }) as (StructureExtension | StructureSpawn)[]
+        }) as (StructureExtension)[]
         this.memory.energyList = structures.map(obj=>{return obj.id})
         return structures.map(obj=>{return obj.id})
     }

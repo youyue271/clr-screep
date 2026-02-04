@@ -118,7 +118,6 @@ const GlobalNodes: myNode[] = [
         exec: function () {
             console.log("清理全局room缓存")
             global.room = {}
-            delete Memory.rooms
             for (const room in Game.rooms) {
                 Game.rooms[room].init()
             }

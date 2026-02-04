@@ -73,7 +73,7 @@ export default class SpawnExtension extends Spawn {
                 if (this.room.energyAvailable < energyNeeded) {
                     return
                 } else {
-                    const energyStructureList: (StructureExtension | StructureSpawn)[] = this.room.energyList().map(obj=>{return Game.getObjectById(obj)}).concat(this.room.find(FIND_MY_SPAWNS))
+                    const energyStructureList: (StructureExtension | StructureSpawn)[] = [...this.room.energyList().map(obj=>{return Game.getObjectById(obj)}),...this.room.find(FIND_MY_SPAWNS)]
                     let energyAvailable = 0
                     for (const structure of energyStructureList) {
                         if(!structure) {

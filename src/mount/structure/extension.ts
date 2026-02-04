@@ -1,7 +1,5 @@
-import { getCarryList } from "@/task/roomTask";
-
-export default class ControllerExtension extends StructureController {
-    public onbuild(){
-        this.room.registTask(getCarryList([this], RESOURCE_ENERGY))
+export default class ExtensionExtension extends StructureExtension {
+    public onBuild() {
+        this.room.addExtensionCarryTasks([this.id])
     }
 }
