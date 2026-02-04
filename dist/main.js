@@ -4299,7 +4299,9 @@ class RoomExtension extends Room {
         this.memory.energyList = extensions.map((extension) => extension.id);
     }
     initBuildList() {
-        // delete this.memory.creepTask['constructTask']
+        if (this.memory.creepTask) {
+            this.memory.creepTask['constructTask'] = {};
+        }
         this.construct(this.controller.level);
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES);
         this.registTask(createBuildTask(constructionSites));

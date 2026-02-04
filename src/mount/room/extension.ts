@@ -63,7 +63,9 @@ export default class RoomExtension extends Room {
     }
 
     initBuildList() {
-        // delete this.memory.creepTask['constructTask']
+        if (this.memory.creepTask) {
+            this.memory.creepTask['constructTask'] = {}
+        }
         this.construct(this.controller.level)
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES)
         this.registTask(createBuildTask(constructionSites))

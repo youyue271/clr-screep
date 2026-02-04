@@ -210,7 +210,7 @@ export default class CreepExtension extends Creep {
             this.moveTo(structure, {visualizePathStyle: {stroke: '#ffff00'}})
             return false
         } else if (res == OK) {
-            this.releaseCurrentWork()
+            // this.releaseCurrentWork()
             const targetRole = this.memory.oldRole
             if (targetRole) {
                 this.changeRole(targetRole)
@@ -220,7 +220,7 @@ export default class CreepExtension extends Creep {
             delete this.memory.oldRole
             return true
         } else if (res == ERR_NOT_ENOUGH_RESOURCES) {
-            this.releaseCurrentWork()
+            // this.releaseCurrentWork()
             return true
         }
         return false
