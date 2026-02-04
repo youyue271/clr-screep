@@ -77,32 +77,21 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
  //  */
 const getHarvesterBody = function (room: Room) {
     let body = [];
-    // 如果没有能量直接返回，不然后面会出现负数
-    // if (room.energyAvailable <= 250) return body
-    // if (room.find(FIND_MY_CR) < 2) {
-    body = calcBodyPart({[MOVE]: 1, [WORK]: 2, [CARRY]: 1})
-    // } else {
-    //     let num = Math.floor((room.energyCapacityAvailable * spawnPercent - 50) / 250)
-    //     if (num > 3) num = 3
-    //     if (num <= 0) num = 1
-    //     body = calcBodyPart({[CARRY]: 1, [WORK]: 2 * num, [MOVE]: num})
-    // }
+    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent)
+    let num = Math.floor((energyBase - 50) / 250)
+    if (num > 3) num = 3
+    if (num <= 0) num = 1
+    body = calcBodyPart({[CARRY]: 1, [WORK]: 2 * num, [MOVE]: num})
     return body
 }
 
 const getCarrierBody = function (room: Room) {
     let body: any[];
-    // if (room.workingCreepNum('carrier') <= 1) {
-    //     let num = Math.floor(room.energyAvailable / 300)
-    //     if (num <= 0) num = 1
-    //     if (num > 8) num = 8
-    body = calcBodyPart({[MOVE]: 3, [CARRY]: 3})
-    // } else {
-    //     let num = Math.floor((room.energyCapacityAvailable * spawnPercent) / 100)
-    //     if (num > 25) num = 25
-    //     if (num <= 0) num = 1
-    //     body = calcBodyPart({[CARRY]: num, [MOVE]: num})
-    // }
+    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent)
+    let num = Math.floor(energyBase / 100)
+    if (num > 25) num = 25
+    if (num <= 0) num = 1
+    body = calcBodyPart({[CARRY]: num, [MOVE]: num})
     return body
 }
 

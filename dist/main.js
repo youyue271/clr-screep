@@ -3357,16 +3357,14 @@ function getTombstoneEnergy(room) {
         return [];
     }
     else {
-        return tombstones.map(tombstone => {
-            if (tombstone.store['energy']) {
-                return {
-                    taskType: 'energyTask',
-                    taskFunc: 'getEnergyFromStructure',
-                    priority: 3,
-                    taskParam: [tombstone.id, RESOURCE_ENERGY],
-                    capacity: 1
-                };
-            }
+        return tombstones.filter(tombstone => tombstone.store['energy']).map(tombstone => {
+            return {
+                taskType: 'energyTask',
+                taskFunc: 'getEnergyFromStructure',
+                priority: 3,
+                taskParam: [tombstone.id, RESOURCE_ENERGY],
+                capacity: 1
+            };
         });
     }
 }
@@ -3954,9 +3952,9 @@ function CalBodyCost(bodys) {
 function getBody(role, room) {
     switch (role) {
         case 'harvester':
-            return getHarvesterBody();
+            return getHarvesterBody(room);
         case 'carrier':
-            return getCarrierBody();
+            return getCarrierBody(room);
         case 'worker':
             return getWorkerBody(room);
         case 'claimer':
@@ -3976,31 +3974,24 @@ function getBody(role, room) {
  //  */
 const getHarvesterBody = function (room) {
     let body = [];
-    // 如果没有能量直接返回，不然后面会出现负数
-    // if (room.energyAvailable <= 250) return body
-    // if (room.find(FIND_MY_CR) < 2) {
-    body = calcBodyPart({ [MOVE]: 1, [WORK]: 2, [CARRY]: 1 });
-    // } else {
-    //     let num = Math.floor((room.energyCapacityAvailable * spawnPercent - 50) / 250)
-    //     if (num > 3) num = 3
-    //     if (num <= 0) num = 1
-    //     body = calcBodyPart({[CARRY]: 1, [WORK]: 2 * num, [MOVE]: num})
-    // }
+    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent);
+    let num = Math.floor((energyBase - 50) / 250);
+    if (num > 3)
+        num = 3;
+    if (num <= 0)
+        num = 1;
+    body = calcBodyPart({ [CARRY]: 1, [WORK]: 2 * num, [MOVE]: num });
     return body;
 };
 const getCarrierBody = function (room) {
     let body;
-    // if (room.workingCreepNum('carrier') <= 1) {
-    //     let num = Math.floor(room.energyAvailable / 300)
-    //     if (num <= 0) num = 1
-    //     if (num > 8) num = 8
-    body = calcBodyPart({ [MOVE]: 3, [CARRY]: 3 });
-    // } else {
-    //     let num = Math.floor((room.energyCapacityAvailable * spawnPercent) / 100)
-    //     if (num > 25) num = 25
-    //     if (num <= 0) num = 1
-    //     body = calcBodyPart({[CARRY]: num, [MOVE]: num})
-    // }
+    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent);
+    let num = Math.floor(energyBase / 100);
+    if (num > 25)
+        num = 25;
+    if (num <= 0)
+        num = 1;
+    body = calcBodyPart({ [CARRY]: num, [MOVE]: num });
     return body;
 };
 const getWorkerBody = function (room) {
