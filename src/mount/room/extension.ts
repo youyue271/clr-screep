@@ -575,80 +575,76 @@ export default class RoomExtension extends Room {
     }
 
     containerPos() {
-        if (!this.memory.containerPos) {
-            const containerPos = []
-            this.sources().forEach(item => {
-                const source = Game.getObjectById(item)
-                if (!source) {
-                    return
-                }
-                // console.log(source.pos)
-                // 先找有没有以前的container
-                let containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
-                // console.log(containers.length)
-                if (containers.length > 0) {
-                    // console.log(containers[0].pos.x, containers[0].pos.y)
-                    containerPos.push([containers[0].pos.x, containers[0].pos.y])
-                } else {
-                    // 在找有没有新的constructionSite
-                    let constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
-                    // console.log(constructionSites)
-                    if (constructionSites.length > 0) {
-                        containerPos.push([constructionSites[0].pos.x, constructionSites[0].pos.y])
-                    } else {
-                        // 新建constructionSite
-                        const direction = [
-                            [-1, -1], [-1, 0], [-1, 1],
-                            [0, -1], [0, 1],
-                            [1, -1], [1, 0], [1, 1]
-                        ]
-                        const containerPosList: RoomPosition[] = []
-                        for (const [xx, yy] of direction) {
-                            const x = xx + source.pos.x
-                            const y = yy + source.pos.y
-                            const pos = new RoomPosition(x, y, this.name)
-                            if (pos.lookFor(LOOK_TERRAIN)[0] != 'wall') {
-                                const targetPos = this.getPositionAt(x, y)
-                                if (targetPos) {
-                                    containerPosList.push(targetPos)
-                                }
-                            }
-                        }
-                        if (!containerPosList.length) {
-                            return
-                        }
-                        let finalPos: RoomPosition = containerPosList[0]
-                        let anchorPos: [number, number] | null = null
-                        if (this.memory.roomPlanType === 2 && this.memory.plan2Pos?.core) {
-                            anchorPos = this.memory.plan2Pos.core
-                        } else if (this.memory.plan1Pos) {
-                            anchorPos = this.memory.plan1Pos
-                        }
-                        const planPos = anchorPos
-                            ? this.getPositionAt(anchorPos[0], anchorPos[1])
-                            : null
-                        if (planPos) {
-                            const bestPos = planPos.findClosestByPath(containerPosList, {algorithm: "astar"})
-                            if (bestPos) {
-                                finalPos = bestPos
-                            }
-                        }
-                        containerPos.push([finalPos.x, finalPos.y])
-                        const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
-                        if (createResult == OK) {
-                            const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0]
-                            if (site) {
-                                this.registTask(construct(site.id))
-                            }
-                        }
+        const cached = this.memory.containerPos ?? []
+        const sources = this.sources()
+        const containerPos: [number, number][] = []
+        sources.forEach((item, index) => {
+            const source = Game.getObjectById(item)
+            if (!source) {
+                return
+            }
+            const containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
+            if (containers.length > 0) {
+                containerPos.push([containers[0].pos.x, containers[0].pos.y])
+                return
+            }
+            const constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
+            if (constructionSites.length > 0) {
+                containerPos.push([constructionSites[0].pos.x, constructionSites[0].pos.y])
+                return
+            }
+            const cachedPos = cached[index]
+            if (cachedPos) {
+                containerPos.push([cachedPos[0], cachedPos[1]])
+                return
+            }
+            const direction = [
+                [-1, -1], [-1, 0], [-1, 1],
+                [0, -1], [0, 1],
+                [1, -1], [1, 0], [1, 1]
+            ]
+            const containerPosList: RoomPosition[] = []
+            for (const [xx, yy] of direction) {
+                const x = xx + source.pos.x
+                const y = yy + source.pos.y
+                const pos = new RoomPosition(x, y, this.name)
+                if (pos.lookFor(LOOK_TERRAIN)[0] != 'wall') {
+                    const targetPos = this.getPositionAt(x, y)
+                    if (targetPos) {
+                        containerPosList.push(targetPos)
                     }
                 }
-            })
-            this.memory.containerPos = containerPos
-            return containerPos
-        } else {
-            return this.memory.containerPos
-        }
+            }
+            if (!containerPosList.length) {
+                return
+            }
+            let finalPos: RoomPosition = containerPosList[0]
+            let anchorPos: [number, number] | null = null
+            if (this.memory.roomPlanType === 2 && this.memory.plan2Pos?.core) {
+                anchorPos = this.memory.plan2Pos.core
+            } else if (this.memory.plan1Pos) {
+                anchorPos = this.memory.plan1Pos
+            }
+            const planPos = anchorPos
+                ? this.getPositionAt(anchorPos[0], anchorPos[1])
+                : null
+            if (planPos) {
+                const bestPos = planPos.findClosestByPath(containerPosList, {algorithm: "astar"})
+                if (bestPos) {
+                    finalPos = bestPos
+                }
+            }
+            containerPos.push([finalPos.x, finalPos.y])
+            const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
+            if (createResult == OK) {
+                const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0]
+                if (site) {
+                    this.registTask(construct(site.id))
+                }
+            }
+        })
+        this.memory.containerPos = containerPos
+        return containerPos
     }
 
     energyList() {
