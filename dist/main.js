@@ -3267,6 +3267,7 @@ function harvestSource(room) {
     const containerPos = room.containerPos().map(item => {
         return room.getPositionAt(item[0], item[1]);
     });
+    // console.log(containerPos)
     let tasks = [];
     for (const sourceId of sources) {
         const source = Game.getObjectById(sourceId);
@@ -3314,7 +3315,8 @@ function getContainerEnergy(room) {
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority: 2,
-            taskParam: [containerId, RESOURCE_ENERGY]
+            taskParam: [containerId, RESOURCE_ENERGY],
+            capacity: 10
         }));
     }
 }
@@ -3328,7 +3330,8 @@ function getResourceEnergy(room) {
             taskType: 'energyTask',
             taskFunc: 'collectEnergy',
             priority: 1,
-            taskParam: [resource.id]
+            taskParam: [resource.id],
+            capacity: 1
         }));
     }
 }
@@ -3343,7 +3346,8 @@ function getStorageEnergy(room) {
                 taskType: 'energyTask',
                 taskFunc: 'getEnergyFromStructure',
                 priority: 3,
-                taskParam: [storage.id, RESOURCE_ENERGY]
+                taskParam: [storage.id, RESOURCE_ENERGY],
+                capacity: 5
             }];
     }
 }
@@ -3357,7 +3361,8 @@ function getTombstoneEnergy(room) {
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority: 3,
-            taskParam: [tombstone.id, RESOURCE_ENERGY]
+            taskParam: [tombstone.id, RESOURCE_ENERGY],
+            capacity: 1
         }));
     }
 }
@@ -3620,7 +3625,7 @@ class CreepExtension extends Creep {
         this.memory.currentWorkType = undefined;
     }
     removeCurrentWorkFromQueue() {
-        var _a, _b;
+        var _a, _b, _c;
         const task = this.memory.currentWork;
         const taskType = this.memory.currentWorkType;
         if (!taskType || !task) {
@@ -3643,6 +3648,14 @@ class CreepExtension extends Creep {
                     continue;
                 }
                 if (item.id === taskId || (taskTargetId && item.targetId === taskTargetId)) {
+                    if (item.reservedBy && item.reservedBy.length) {
+                        for (const reserver of item.reservedBy) {
+                            if (!reserver || reserver.name === this.name) {
+                                continue;
+                            }
+                            (_c = Game.creeps[reserver.name]) === null || _c === void 0 ? void 0 : _c.releaseCurrentWork();
+                        }
+                    }
                     queue.splice(i, 1);
                     if (!queue.length) {
                         delete buckets[key];
@@ -4780,13 +4793,15 @@ class RoomExtension extends Room {
         if (!this.memory.containerPos) {
             const containerPos = [];
             this.sources().forEach(item => {
+                var _a;
                 const source = Game.getObjectById(item);
                 if (!source) {
                     return;
                 }
+                // console.log(source.pos)
                 // 先找有没有以前的container
                 let containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, { filter: { structureType: STRUCTURE_CONTAINER } });
-                // console.log(containers)
+                // console.log(containers.length)
                 if (containers.length > 0) {
                     // console.log(containers[0].pos.x, containers[0].pos.y)
                     containerPos.push([containers[0].pos.x, containers[0].pos.y]);
@@ -4811,20 +4826,33 @@ class RoomExtension extends Room {
                             const y = yy + source.pos.y;
                             const pos = new RoomPosition(x, y, this.name);
                             if (pos.lookFor(LOOK_TERRAIN)[0] != 'wall') {
-                                containerPosList.push(this.getPositionAt(x, y));
+                                const targetPos = this.getPositionAt(x, y);
+                                if (targetPos) {
+                                    containerPosList.push(targetPos);
+                                }
                             }
                         }
-                        if (!this.memory.plan1Pos) {
+                        if (!containerPosList.length) {
                             return;
                         }
-                        const planPos = this.getPositionAt(this.memory.plan1Pos[0], this.memory.plan1Pos[1]);
-                        if (!planPos) {
-                            return;
+                        let finalPos = containerPosList[0];
+                        let anchorPos = null;
+                        if (this.memory.roomPlanType === 2 && ((_a = this.memory.plan2Pos) === null || _a === void 0 ? void 0 : _a.core)) {
+                            anchorPos = this.memory.plan2Pos.core;
                         }
-                        const finalPos = planPos.findClosestByPath(containerPosList, { algorithm: "astar" });
-                        if (!finalPos) {
-                            return;
+                        else if (this.memory.plan1Pos) {
+                            anchorPos = this.memory.plan1Pos;
                         }
+                        const planPos = anchorPos
+                            ? this.getPositionAt(anchorPos[0], anchorPos[1])
+                            : null;
+                        if (planPos) {
+                            const bestPos = planPos.findClosestByPath(containerPosList, { algorithm: "astar" });
+                            if (bestPos) {
+                                finalPos = bestPos;
+                            }
+                        }
+                        containerPos.push([finalPos.x, finalPos.y]);
                         const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER);
                         if (createResult == OK) {
                             const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0];
@@ -5527,7 +5555,6 @@ const GlobalNodes = [
         exec: function () {
             console.log("清理全局room缓存");
             global.room = {};
-            delete Memory.rooms;
             for (const room in Game.rooms) {
                 Game.rooms[room].init();
             }

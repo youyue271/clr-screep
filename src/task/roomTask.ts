@@ -11,6 +11,7 @@ export function harvestSource(room: Room) {
     const containerPos = room.containerPos().map(item => {
         return room.getPositionAt(item[0], item[1])
     })
+    // console.log(containerPos)
     let tasks: MyTask[] = []
     for (const sourceId of sources) {
         const source = Game.getObjectById<Source>(sourceId)
@@ -60,7 +61,8 @@ export function getContainerEnergy(room: Room): MyTask[] {
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority: 2,
-            taskParam: [containerId, RESOURCE_ENERGY]
+            taskParam: [containerId, RESOURCE_ENERGY],
+            capacity:10
         }))
     }
 
@@ -75,7 +77,8 @@ export function getResourceEnergy(room: Room): MyTask[] {
             taskType: 'energyTask',
             taskFunc: 'collectEnergy',
             priority: 1,
-            taskParam: [resource.id]
+            taskParam: [resource.id],
+            capacity: 1
         }))
     }
 }
@@ -90,7 +93,8 @@ export function getStorageEnergy(room: Room): MyTask[] {
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority:3, 
-            taskParam: [storage.id, RESOURCE_ENERGY]
+            taskParam: [storage.id, RESOURCE_ENERGY],
+            capacity:5
         }]
     }
 }
@@ -104,7 +108,8 @@ export function getTombstoneEnergy(room: Room): MyTask[] {
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority:3, 
-            taskParam: [tombstone.id, RESOURCE_ENERGY]
+            taskParam: [tombstone.id, RESOURCE_ENERGY],
+            capacity: 1
         }))
     }
 }

@@ -30,7 +30,8 @@ interface Creep {
      * 主要用于调配相近部件creep的数量关系
      */
     changeRole(role:Role): boolean
-
+    releaseCurrentWork(): void
+    removeCurrentWorkFromQueue():void
     /**
      * 采能量矿逻辑
      * @param sourceId
@@ -38,6 +39,10 @@ interface Creep {
      * @param ContainerPosY
      */
     harvestSource(sourceId: Id<any>, containerPosX:number, ContainerPosY:number): boolean
-
+    getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant): boolean
+    collectEnergy(id: Id<any>): boolean
+    upgrade(controllerId: Id<StructureController>): boolean
     remember(): void
+    carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean
+    buildConstructionSite(constructionId: Id<any>):boolean
 }

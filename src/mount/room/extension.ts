@@ -580,9 +580,10 @@ export default class RoomExtension extends Room {
                 if (!source) {
                     return
                 }
+                // console.log(source.pos)
                 // 先找有没有以前的container
                 let containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
-                // console.log(containers)
+                // console.log(containers.length)
                 if (containers.length > 0) {
                     // console.log(containers[0].pos.x, containers[0].pos.y)
                     containerPos.push([containers[0].pos.x, containers[0].pos.y])
@@ -599,26 +600,38 @@ export default class RoomExtension extends Room {
                             [0, -1], [0, 1],
                             [1, -1], [1, 0], [1, 1]
                         ]
-                        const containerPosList = []
+                        const containerPosList: RoomPosition[] = []
                         for (const [xx, yy] of direction) {
                             const x = xx + source.pos.x
                             const y = yy + source.pos.y
                             const pos = new RoomPosition(x, y, this.name)
                             if (pos.lookFor(LOOK_TERRAIN)[0] != 'wall') {
-                                containerPosList.push(this.getPositionAt(x, y))
+                                const targetPos = this.getPositionAt(x, y)
+                                if (targetPos) {
+                                    containerPosList.push(targetPos)
+                                }
                             }
                         }
-                        if (!this.memory.plan1Pos) {
+                        if (!containerPosList.length) {
                             return
                         }
-                        const planPos = this.getPositionAt(this.memory.plan1Pos[0], this.memory.plan1Pos[1])
-                        if (!planPos) {
-                            return
+                        let finalPos: RoomPosition = containerPosList[0]
+                        let anchorPos: [number, number] | null = null
+                        if (this.memory.roomPlanType === 2 && this.memory.plan2Pos?.core) {
+                            anchorPos = this.memory.plan2Pos.core
+                        } else if (this.memory.plan1Pos) {
+                            anchorPos = this.memory.plan1Pos
                         }
-                        const finalPos: RoomPosition = planPos.findClosestByPath(containerPosList, {algorithm: "astar"})
-                        if (!finalPos) {
-                            return
+                        const planPos = anchorPos
+                            ? this.getPositionAt(anchorPos[0], anchorPos[1])
+                            : null
+                        if (planPos) {
+                            const bestPos = planPos.findClosestByPath(containerPosList, {algorithm: "astar"})
+                            if (bestPos) {
+                                finalPos = bestPos
+                            }
                         }
+                        containerPos.push([finalPos.x, finalPos.y])
                         const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
                         if (createResult == OK) {
                             const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0]

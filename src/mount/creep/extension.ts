@@ -156,6 +156,14 @@ export default class CreepExtension extends Creep {
                     continue
                 }
                 if (item.id === taskId || (taskTargetId && item.targetId === taskTargetId)) {
+                    if (item.reservedBy && item.reservedBy.length) {
+                        for (const reserver of item.reservedBy) {
+                            if (!reserver || reserver.name === this.name) {
+                                continue
+                            }
+                            Game.creeps[reserver.name]?.releaseCurrentWork()
+                        }
+                    }
                     queue.splice(i, 1)
                     if (!queue.length) {
                         delete buckets[key]
