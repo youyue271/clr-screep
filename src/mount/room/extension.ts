@@ -534,7 +534,7 @@ export default class RoomExtension extends Room {
     }
 
     getResources() {
-        if (!global.room[this.name].resources) {
+        if (!global.room[this.name].resources || !(Game.time % 100)) {
             let resources = this.find(FIND_DROPPED_RESOURCES)
             global.room[this.name].resources = resources
            

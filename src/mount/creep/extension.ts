@@ -205,12 +205,21 @@ export default class CreepExtension extends Creep {
             return true
         }
         this.say("🫳偷拿资源")
+        if (!this.store.getFreeCapacity()) {
+            const targetRole = this.memory.oldRole ?? this.memory.role
+            if (targetRole) {
+                this.changeRole(targetRole)
+            } else {
+                this.remember()
+            }
+            delete this.memory.oldRole
+            return true
+        }
         const res = this.withdraw(structure, energyType)
         if (res == ERR_NOT_IN_RANGE) {
             this.moveTo(structure, {visualizePathStyle: {stroke: '#ffff00'}})
             return false
         } else if (res == OK) {
-            // this.releaseCurrentWork()
             const targetRole = this.memory.oldRole
             if (targetRole) {
                 this.changeRole(targetRole)
@@ -220,7 +229,16 @@ export default class CreepExtension extends Creep {
             delete this.memory.oldRole
             return true
         } else if (res == ERR_NOT_ENOUGH_RESOURCES) {
-            // this.releaseCurrentWork()
+            this.releaseCurrentWork()
+            return true
+        } else if (res == ERR_FULL) {
+            const targetRole = this.memory.oldRole ?? this.memory.role
+            if (targetRole) {
+                this.changeRole(targetRole)
+            } else {
+                this.remember()
+            }
+            delete this.memory.oldRole
             return true
         }
         return false
