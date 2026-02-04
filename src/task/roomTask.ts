@@ -78,7 +78,7 @@ export function getResourceEnergy(room: Room): MyTask[] {
             taskFunc: 'collectEnergy',
             priority: 1,
             taskParam: [resource.id],
-            capacity: 1
+            capacity: 3
         }))
     }
 }
@@ -104,13 +104,17 @@ export function getTombstoneEnergy(room: Room): MyTask[] {
     if (!tombstones) {
         return []
     } else {
-        return tombstones.map(tombstone => ({
-            taskType: 'energyTask',
-            taskFunc: 'getEnergyFromStructure',
-            priority:3, 
-            taskParam: [tombstone.id, RESOURCE_ENERGY],
-            capacity: 1
-        }))
+        return tombstones.map(tombstone => {
+            if(tombstone.store['energy']){
+                return {
+                    taskType: 'energyTask',
+                    taskFunc: 'getEnergyFromStructure',
+                    priority:3, 
+                    taskParam: [tombstone.id, RESOURCE_ENERGY],
+                    capacity: 1
+                }
+            }
+        })
     }
 }
 

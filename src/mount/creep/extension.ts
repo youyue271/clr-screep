@@ -56,6 +56,7 @@ export default class CreepExtension extends Creep {
         if (!room.memory.creepTask) {
             return false
         }
+        console.log(this.memory.role)
         if (this.memory.role === 'emptyWorker' && room.memory.lastEnergyTaskTick !== Game.time) {
             const energyBuckets = room.normalizeTaskBuckets('energyTask')
             let hasEnergyTask = false
