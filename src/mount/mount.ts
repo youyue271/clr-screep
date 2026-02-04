@@ -19,7 +19,8 @@ export default function():void {
 
 export function globalInit(){
     global.room = {}
-    for(const roomName in Game.rooms){
+    delete Memory.rooms
+    for(const roomName in Game.rooms){        
         Game.rooms[roomName].init()
     }
 }

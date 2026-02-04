@@ -3246,6 +3246,176 @@ const errorMapper = function (next) {
     }
 };
 
+const spawnPercent = 0.6;
+const spawnTable = {
+    //               0, 1, 2, 3, 4, 5, 6, 7, 8
+    'harvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    'carrier': [0, 1, 3, 5, 5, 5, 5, 5, 5],
+    'worker': [0, 11, 11, 9, 9, 7, 7, 7, 3],
+    'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
+};
+const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1];
+
+// 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
+/**
+ * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
+ * @param room
+ */
+function harvestSource(room) {
+    const sources = room.sources();
+    // TODO: 这里的containerPos是直接返回的数组，需要找到最近的container，大概是一个不超过4的for循环，但是也可以再优化
+    const containerPos = room.containerPos().map(item => {
+        return room.getPositionAt(item[0], item[1]);
+    });
+    let tasks = [];
+    for (const sourceId of sources) {
+        const source = Game.getObjectById(sourceId);
+        if (!source) {
+            continue;
+        }
+        const pos = source.pos.findInRange(containerPos, 1);
+        const targetPos = pos[0];
+        tasks.push({
+            taskType: 'harvestTask',
+            taskFunc: 'harvestSource',
+            taskParam: [sourceId, targetPos.x, targetPos.y]
+        });
+    }
+    return tasks;
+}
+function upgrade(room) {
+    const capacity = upgradeTaskCapacity[room.controller.level];
+    if (!capacity) {
+        return [];
+    }
+    return [{
+            taskType: 'upgradeTask',
+            taskFunc: 'upgrade',
+            taskParam: [room.controller.id],
+            capacity: capacity,
+            persistent: true,
+            targetId: room.controller.id
+        }];
+}
+function construct(ConstructionSiteId) {
+    return [{
+            taskType: 'constructTask',
+            taskFunc: 'construct',
+            taskParam: [ConstructionSiteId]
+        }];
+}
+function getContainerEnergy(room) {
+    const containerIds = room.getContainer();
+    if (!containerIds) {
+        return [];
+    }
+    else {
+        return containerIds.map(containerId => ({
+            taskType: 'energyTask',
+            taskFunc: 'getEnergyFromStructure',
+            priority: 2,
+            taskParam: [containerId, RESOURCE_ENERGY]
+        }));
+    }
+}
+function getResourceEnergy(room) {
+    const resources = room.getResources();
+    if (!resources) {
+        return [];
+    }
+    else {
+        return resources.map(resource => ({
+            taskType: 'energyTask',
+            taskFunc: 'collectEnergy',
+            priority: 1,
+            taskParam: [resource.id]
+        }));
+    }
+}
+function getStorageEnergy(room) {
+    const storage = room.storage;
+    console.log(room.storage);
+    if (!storage) {
+        return [];
+    }
+    else {
+        return [{
+                taskType: 'energyTask',
+                taskFunc: 'getEnergyFromStructure',
+                priority: 3,
+                taskParam: [storage.id, RESOURCE_ENERGY]
+            }];
+    }
+}
+function getTombstoneEnergy(room) {
+    const tombstones = room.find(FIND_TOMBSTONES);
+    if (!tombstones) {
+        return [];
+    }
+    else {
+        return tombstones.map(tombstone => ({
+            taskType: 'energyTask',
+            taskFunc: 'getEnergyFromStructure',
+            priority: 3,
+            taskParam: [tombstone.id, RESOURCE_ENERGY]
+        }));
+    }
+}
+function getEnergyTask(room) {
+    let containTasks = getContainerEnergy(room);
+    let resourceTasks = getResourceEnergy(room);
+    let storageTasks = getStorageEnergy(room);
+    let tombstonesTasks = getTombstoneEnergy(room);
+    return [...containTasks, ...resourceTasks, ...storageTasks, ...tombstonesTasks];
+}
+// export function getEnergyWithStorage(room: Room): MyTask[] {
+//     let tasks = getContainerEnergy(room)
+//     if (tasks.length) {
+//         return tasks
+//     }
+//     tasks = getResourceEnergy(room)
+//     if (tasks.length) {
+//         return tasks
+//     }
+//     tasks = getStorageEnergy(room)
+//     if (tasks.length) {
+//         return tasks
+//     }
+//     return []
+// }
+// export function getEnergyWithoutStorage(room:Room): MyTask[] {
+//     let tasks = getContainerEnergy(room)
+//     if (tasks.length) {
+//         return tasks
+//     }
+//     tasks = getResourceEnergy(room)
+//     if (tasks.length) {
+//         return tasks
+//     }
+// }
+function getCarryList(targetList, resourceType) {
+    return targetList.map(item => {
+        return {
+            taskType: 'carryTask',
+            taskFunc: "carryEnergy",
+            taskParam: [item.id, resourceType],
+            priority: 1,
+            capacity: 1,
+            persistent: true,
+            targetId: item.id
+        };
+    });
+}
+function createBuildTask(targetList) {
+    return targetList.map(item => {
+        return {
+            taskType: 'constructTask',
+            taskFunc: "buildConstructionSite",
+            taskParam: [item.id]
+        };
+    });
+}
+
 class logger {
     constructor() {
         this.levels = {
@@ -3309,141 +3479,7 @@ const colors = {
 };
 const loggerInstance = new logger();
 
-const spawnPercent = 0.6;
-const spawnTable = {
-    //               0, 1, 2, 3, 4, 5, 6, 7, 8
-    'harvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
-    'carrier': [0, 1, 3, 5, 5, 5, 5, 5, 5],
-    'worker': [0, 11, 11, 9, 9, 7, 7, 7, 3],
-    'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
-};
-const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1];
-
-// 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
-/**
- * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
- * @param room
- */
-function harvestSource(room) {
-    const sources = room.sources();
-    // TODO: 这里的containerPos是直接返回的数组，需要找到最近的container，大概是一个不超过4的for循环，但是也可以再优化
-    const containerPos = room.containerPos().map(item => {
-        return room.getPositionAt(item[0], item[1]);
-    });
-    let tasks = [];
-    for (const sourceId of sources) {
-        const source = Game.getObjectById(sourceId);
-        if (!source) {
-            continue;
-        }
-        const pos = source.pos.findInRange(containerPos, 1);
-        const targetPos = pos.length ? pos[0] : source.pos;
-        tasks.push({
-            taskType: 'harvestTask',
-            taskFunc: 'harvestSource',
-            taskParam: [sourceId, targetPos.x, targetPos.y]
-        });
-    }
-    return tasks;
-}
-function upgrade(room) {
-    const capacity = upgradeTaskCapacity[room.controller.level];
-    if (!capacity) {
-        return [];
-    }
-    return [{
-            taskType: 'upgradeTask',
-            taskFunc: 'upgrade',
-            taskParam: [room.controller.id],
-            capacity: capacity,
-            persistent: true,
-            targetId: room.controller.id
-        }];
-}
-function construct(ConstructionSiteId) {
-    return [{
-            taskType: 'constructTask',
-            taskFunc: 'construct',
-            taskParam: [ConstructionSiteId]
-        }];
-}
-function getContainerEnergy(room) {
-    const containerId = room.getContainer();
-    if (!containerId) {
-        return [];
-    }
-    else {
-        return [{
-                taskType: 'energyTask',
-                taskFunc: 'getEnergyFromStructure',
-                taskParam: [containerId, RESOURCE_ENERGY]
-            }];
-    }
-}
-function getResourceEnergy(room) {
-    const resource = room.getResources();
-    if (!resource) {
-        return [];
-    }
-    else {
-        return [{
-                taskType: 'energyTask',
-                taskFunc: 'collectEnergy',
-                taskParam: [resource.id]
-            }];
-    }
-}
-function getStorageEnergy(room) {
-    const storage = room.storage;
-    if (!storage) {
-        return [];
-    }
-    else {
-        return [{
-                taskType: 'energyTask',
-                taskFunc: 'getEnergyFromStructure',
-                taskParam: [storage.id, RESOURCE_ENERGY]
-            }];
-    }
-}
-function getEnergyWithStorage(room) {
-    let tasks = getContainerEnergy(room);
-    if (tasks.length) {
-        return tasks;
-    }
-    tasks = getResourceEnergy(room);
-    if (tasks.length) {
-        return tasks;
-    }
-    tasks = getStorageEnergy(room);
-    if (tasks.length) {
-        return tasks;
-    }
-    return [];
-}
-function getCarryList(targetList, resourceType) {
-    return targetList.map(item => {
-        return {
-            taskType: 'carryTask',
-            taskFunc: "carryEnergy",
-            taskParam: [item.id, resourceType],
-            priority: 1,
-            capacity: 1,
-            persistent: true,
-            targetId: item.id
-        };
-    });
-}
-function createBuildTask(targetList) {
-    return targetList.map(item => {
-        return {
-            taskType: 'constructTask',
-            taskFunc: "buildConstructionSite",
-            taskParam: [item.id]
-        };
-    });
-}
-
+// import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 const roleToTask = {
     'harvester': ['harvestTask'],
     'worker': ['upgradeTask', 'constructTask'],
@@ -3463,47 +3499,56 @@ class CreepExtension extends Creep {
             // console.log(this.ticksToLive)
             return;
         }
-        if (!this.memory.role) {
-            loggerInstance.error(this.name + " ERROR!");
-            this.remember();
-            return;
-        }
-        if (!this.memory.working) {
-            if (!this.getWork()) {
-                // no work in workList, try change role
-                if (this.memory.oldRole) {
-                    this.changeRole(this.memory.oldRole);
-                    delete this.memory.oldRole;
-                }
+        let loop = 0;
+        while (loop < 4) {
+            if (!this.memory.role) {
+                loggerInstance.error(this.name + " ERROR!");
+                this.remember();
                 return;
             }
-        }
-        // already get work, now working
-        const res = this[this.memory.currentWork.taskFunc](...this.memory.currentWork.taskParam);
-        // console.log(res, this.memory.currentWork.taskFunc, ...this.memory.currentWork.taskParam)
-        if (!res) {
-            // still working
-            return;
-        }
-        else {
-            // work over, get another work
+            if (!this.memory.working) {
+                if (!this.getWork()) {
+                    this.say('🤓 没活辣,随便走走');
+                    const directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT];
+                    const randIndex = Math.floor(Math.random() * directions.length);
+                    this.move(directions[randIndex]);
+                    return;
+                }
+            }
+            const res = this[this.memory.currentWork.taskFunc](...this.memory.currentWork.taskParam);
+            if (!res) {
+                // false return , true not
+                return;
+            }
             this.releaseCurrentWork();
-            this.memory.working = false;
-            this.memory.currentWork = undefined;
-            this.memory.currentWorkType = undefined;
-            this.work();
-            return;
+            loop += 1;
         }
+        return;
     }
     getWork() {
+        var _a;
         const room = this.room;
         if (!room.memory.creepTask) {
             return false;
         }
+        if (this.memory.role === 'emptyWorker' && room.memory.lastEnergyTaskTick !== Game.time) {
+            const energyBuckets = room.normalizeTaskBuckets('energyTask');
+            let hasEnergyTask = false;
+            for (const key in energyBuckets) {
+                if ((_a = energyBuckets[key]) === null || _a === void 0 ? void 0 : _a.length) {
+                    hasEnergyTask = true;
+                    break;
+                }
+            }
+            if (!hasEnergyTask) {
+                room.registTask(getEnergyTask(room));
+            }
+            room.memory.lastEnergyTaskTick = Game.time;
+        }
         const TaskList = roleToTask[this.memory.role];
         const now = Game.time;
         for (const taskType of TaskList) {
-            const buckets = room.memory.creepTask[taskType];
+            const buckets = room.normalizeTaskBuckets(taskType);
             if (!buckets) {
                 continue;
             }
@@ -3524,7 +3569,6 @@ class CreepExtension extends Creep {
                     if (!task.reservedBy) {
                         task.reservedBy = [];
                     }
-                    task.reservedBy = task.reservedBy.filter(item => Game.creeps[item.name]);
                     const existing = task.reservedBy.find(item => item.name === this.name);
                     if (existing) {
                         existing.lastTick = now;
@@ -3545,30 +3589,12 @@ class CreepExtension extends Creep {
         return false;
     }
     changeRole(role) {
-        var _a;
         if (!role) {
             return false;
         }
-        if (this.memory.currentWorkType && this.memory.currentWork) {
-            // 被丢下的工作放在队列最前面, 优先被其他creep选取
-            this.releaseCurrentWork();
-            if (!this.memory.currentWork.persistent) {
-                const buckets = this.room.memory.creepTask[this.memory.currentWorkType];
-                const key = String((_a = this.memory.currentWork.priority) !== null && _a !== void 0 ? _a : 1);
-                if (!buckets[key]) {
-                    buckets[key] = [];
-                }
-                buckets[key].unshift(this.memory.currentWork);
-            }
-            this.memory.currentWorkType = undefined;
-            this.memory.currentWork = undefined;
-        }
-        else if (this.memory.currentWorkType) {
-            this.memory.currentWorkType = undefined;
-        }
+        this.releaseCurrentWork();
         this.memory.oldRole = this.memory.role;
         this.memory.role = role;
-        this.memory.working = false;
         return true;
     }
     releaseCurrentWork() {
@@ -3576,20 +3602,23 @@ class CreepExtension extends Creep {
         if (task && task.reservedBy) {
             task.reservedBy = task.reservedBy.filter(item => item.name !== this.name);
         }
+        this.memory.working = false;
+        this.memory.currentWork = undefined;
+        this.memory.currentWorkType = undefined;
     }
     removeCurrentWorkFromQueue() {
-        var _a, _b, _c;
+        var _a, _b;
         const task = this.memory.currentWork;
         const taskType = this.memory.currentWorkType;
         if (!taskType || !task) {
             return;
         }
-        const buckets = (_a = this.room.memory.creepTask) === null || _a === void 0 ? void 0 : _a[taskType];
+        const buckets = this.room.normalizeTaskBuckets(taskType);
         if (!buckets) {
             return;
         }
         const taskId = task.id;
-        const taskTargetId = (_b = task.targetId) !== null && _b !== void 0 ? _b : (_c = task.taskParam) === null || _c === void 0 ? void 0 : _c[0];
+        const taskTargetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
         for (const key in buckets) {
             const queue = buckets[key];
             if (!queue || !queue.length) {
@@ -3625,12 +3654,11 @@ class CreepExtension extends Creep {
         return false;
     }
     getEnergyFromStructure(id, energyType) {
-        var _a, _b;
+        var _a;
         const structure = Game.getObjectById(id);
         if (!structure) {
+            this.removeCurrentWorkFromQueue();
             this.releaseCurrentWork();
-            delete this.memory.currentWorkType;
-            delete this.memory.currentWork;
             const targetRole = (_a = this.memory.oldRole) !== null && _a !== void 0 ? _a : this.memory.role;
             if (targetRole) {
                 this.changeRole(targetRole);
@@ -3645,29 +3673,11 @@ class CreepExtension extends Creep {
         const res = this.withdraw(structure, energyType);
         if (res == ERR_NOT_IN_RANGE) {
             this.moveTo(structure, { visualizePathStyle: { stroke: '#ffff00' } });
+            return false;
         }
         else if (res == OK) {
-            delete this.memory.currentWorkType;
-            delete this.memory.currentWork;
-            const targetRole = (_b = this.memory.oldRole) !== null && _b !== void 0 ? _b : this.memory.role;
-            if (targetRole) {
-                this.changeRole(targetRole);
-            }
-            else {
-                this.remember();
-            }
-            delete this.memory.oldRole;
-        }
-        return false;
-    }
-    collectEnergy(id) {
-        var _a, _b;
-        const resource = Game.getObjectById(id);
-        if (!resource) {
             this.releaseCurrentWork();
-            delete this.memory.currentWorkType;
-            delete this.memory.currentWork;
-            const targetRole = (_a = this.memory.oldRole) !== null && _a !== void 0 ? _a : this.memory.role;
+            const targetRole = this.memory.oldRole;
             if (targetRole) {
                 this.changeRole(targetRole);
             }
@@ -3677,23 +3687,41 @@ class CreepExtension extends Creep {
             delete this.memory.oldRole;
             return true;
         }
+        else if (res == ERR_NOT_ENOUGH_RESOURCES) {
+            this.releaseCurrentWork();
+            return true;
+        }
+        return false;
+    }
+    collectEnergy(id) {
+        const resource = Game.getObjectById(id);
+        if (!resource) {
+            this.removeCurrentWorkFromQueue();
+            return true;
+        }
         this.say("🫳捡资源去");
         const res = this.pickup(resource);
-        // console.log(res)
         if (res == ERR_NOT_IN_RANGE) {
             this.moveTo(resource, { visualizePathStyle: { stroke: '#ffff00' } });
             return false;
         }
         else if (res == OK) {
-            if (resource.amount > 150) {
-                if (!global.room[this.room.name].resources) {
-                    global.room[this.room.name].resources = [];
+            if (!this.store.getFreeCapacity()) {
+                // console.log(this.store.getFreeCapacity())
+                const targetRole = this.memory.oldRole;
+                if (targetRole) {
+                    this.changeRole(targetRole);
                 }
-                global.room[this.room.name].resources.unshift(resource);
+                else {
+                    this.remember();
+                }
+                delete this.memory.oldRole;
             }
-            delete this.memory.currentWorkType;
-            delete this.memory.currentWork;
-            const targetRole = (_b = this.memory.oldRole) !== null && _b !== void 0 ? _b : this.memory.role;
+            return true;
+        }
+        else if (res == ERR_FULL) {
+            // console.log(this.store.getFreeCapacity())
+            const targetRole = this.memory.oldRole;
             if (targetRole) {
                 this.changeRole(targetRole);
             }
@@ -3701,6 +3729,7 @@ class CreepExtension extends Creep {
                 this.remember();
             }
             delete this.memory.oldRole;
+            return true;
         }
         return false;
     }
@@ -3713,11 +3742,11 @@ class CreepExtension extends Creep {
             this.say("⚡升本!");
             if (this.upgradeController(controller) == ERR_NOT_IN_RANGE) {
                 this.moveTo(controller, { visualizePathStyle: { stroke: '#ffffff' } });
+                return false;
             }
         }
         else {
             this.changeRole('emptyWorker');
-            this.room.registTask(getEnergyWithStorage(this.room));
             return true;
         }
         return false;
@@ -3731,23 +3760,18 @@ class CreepExtension extends Creep {
         // console.log(name)
     }
     carryEnergy(targetId, resourceType) {
-        var _a, _b, _c, _d, _e;
         if (this.store['energy']) {
             const target = Game.getObjectById(targetId);
             if (!target) {
                 this.say("⚡找不到目标");
-                this.releaseCurrentWork();
                 this.removeCurrentWorkFromQueue();
-                delete this.memory.currentWorkType;
-                delete this.memory.currentWork;
-                const targetRole = (_a = this.memory.oldRole) !== null && _a !== void 0 ? _a : this.memory.role;
-                if (targetRole) {
-                    this.changeRole(targetRole);
-                }
-                else {
-                    this.remember();
-                }
-                delete this.memory.oldRole;
+                // const targetRole = this.memory.oldRole ?? this.memory.role
+                // if (targetRole) {
+                //     this.changeRole(targetRole)
+                // } else {
+                //     this.remember()
+                // }
+                // delete this.memory.oldRole
                 return true;
             }
             const addToEnergyList = () => {
@@ -3762,20 +3786,18 @@ class CreepExtension extends Creep {
             if (!target.store.getFreeCapacity(resourceType)) {
                 this.say("⚡目标已满");
                 addToEnergyList();
-                this.releaseCurrentWork();
                 this.removeCurrentWorkFromQueue();
-                delete this.memory.currentWorkType;
-                delete this.memory.currentWork;
-                const targetRole = (_b = this.memory.oldRole) !== null && _b !== void 0 ? _b : this.memory.role;
-                if (targetRole) {
-                    this.changeRole(targetRole);
-                }
-                else {
-                    this.remember();
-                }
-                delete this.memory.oldRole;
+                // this.releaseCurrentWork()
+                // const targetRole = this.memory.oldRole ?? this.memory.role
+                // if (targetRole) {
+                //     this.changeRole(targetRole)
+                // } else {
+                //     this.remember()
+                // }
+                // delete this.memory.oldRole
                 return true;
             }
+            // 目标没满
             this.say("⚡运输中");
             const res = this.transfer(target, resourceType);
             if (res == ERR_NOT_IN_RANGE) {
@@ -3783,20 +3805,18 @@ class CreepExtension extends Creep {
                 return false;
             }
             else if (res == OK) {
-                if (((_c = this.memory.currentWork) === null || _c === void 0 ? void 0 : _c.persistent) && !target.store.getFreeCapacity(resourceType)) {
+                // 这个persistent不知道是用来干什么的，先不删了
+                // if (this.memory.currentWork?.persistent && !target.store.getFreeCapacity(resourceType)) {
+                if (!target.store.getFreeCapacity(resourceType)) {
                     addToEnergyList();
-                    this.releaseCurrentWork();
                     this.removeCurrentWorkFromQueue();
-                    delete this.memory.currentWorkType;
-                    delete this.memory.currentWork;
-                    const targetRole = (_d = this.memory.oldRole) !== null && _d !== void 0 ? _d : this.memory.role;
-                    if (targetRole) {
-                        this.changeRole(targetRole);
-                    }
-                    else {
-                        this.remember();
-                    }
-                    delete this.memory.oldRole;
+                    // const targetRole = this.memory.oldRole ?? this.memory.role
+                    // if (targetRole) {
+                    //     this.changeRole(targetRole)
+                    // } else {
+                    //     this.remember()
+                    // }
+                    // delete this.memory.oldRole
                     return true;
                 }
                 return false;
@@ -3804,45 +3824,37 @@ class CreepExtension extends Creep {
             else if (res == ERR_FULL) {
                 this.say("⚡目标已满");
                 addToEnergyList();
-                this.releaseCurrentWork();
                 this.removeCurrentWorkFromQueue();
-                delete this.memory.currentWorkType;
-                delete this.memory.currentWork;
-                const targetRole = (_e = this.memory.oldRole) !== null && _e !== void 0 ? _e : this.memory.role;
-                if (targetRole) {
-                    this.changeRole(targetRole);
-                }
-                else {
-                    this.remember();
-                }
-                delete this.memory.oldRole;
+                // const targetRole = this.memory.oldRole ?? this.memory.role
+                // if (targetRole) {
+                //     this.changeRole(targetRole)
+                // } else {
+                //     this.remember()
+                // }
+                // delete this.memory.oldRole
                 return true;
             }
         }
         else {
             this.changeRole('emptyWorker');
-            this.room.registTask(getEnergyWithStorage(this.room));
+            // this.room.registTask(getEnergyWithStorage(this.room))
             return true;
         }
         return false;
     }
     buildConstructionSite(constructionId) {
-        var _a;
         if (this.store['energy']) {
             this.say("⚡建造中");
             const target = Game.getObjectById(constructionId);
             if (!target) {
-                this.releaseCurrentWork();
-                delete this.memory.currentWorkType;
-                delete this.memory.currentWork;
-                const targetRole = (_a = this.memory.oldRole) !== null && _a !== void 0 ? _a : this.memory.role;
-                if (targetRole) {
-                    this.changeRole(targetRole);
-                }
-                else {
-                    this.remember();
-                }
-                delete this.memory.oldRole;
+                // this.releaseCurrentWork()
+                // const targetRole = this.memory.oldRole ?? this.memory.role
+                // if (targetRole) {
+                //     this.changeRole(targetRole)
+                // } else {
+                //     this.remember()
+                // }
+                // delete this.memory.oldRole
                 return true;
             }
             const res = this.build(target);
@@ -3860,13 +3872,15 @@ class CreepExtension extends Creep {
                 return false;
             }
             else {
+                this.removeCurrentWorkFromQueue();
+                // this.releaseCurrentWork()   
                 this.room.buildOver(target.pos.x, target.pos.y);
                 return true;
             }
         }
         else {
             this.changeRole('emptyWorker');
-            this.room.registTask(getEnergyWithStorage(this.room));
+            // this.room.registTask(getEnergyWithStorage(this.room))
             return true;
         }
     }
@@ -4299,11 +4313,13 @@ class RoomExtension extends Room {
             this.initSpawn(this.controller.level);
             this.initTask(this.controller.level);
             this.initCarryList();
+            this.initCreepRecycle();
         }
         this.initResource();
         this.registEvent(checkRoomLevelEvent(Game.time + 1));
     }
     initBuildList() {
+        delete this.memory.creepTask['constructTask'];
         this.construct(this.controller.level);
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES);
         this.registTask(createBuildTask(constructionSites));
@@ -4311,6 +4327,26 @@ class RoomExtension extends Room {
     initResource() {
         const resources = this.find(FIND_DROPPED_RESOURCES);
         global.room[this.name].resources = resources;
+    }
+    initCreepRecycle() {
+        for (const creep of this.find(FIND_MY_CREEPS)) {
+            this.registEvent({
+                triggerTime: Game.time + creep.ticksToLive + 1,
+                triggerFunc: "creepRecycle",
+                param: []
+            });
+        }
+    }
+    normalizeTaskBuckets(taskType) {
+        if (!this.memory.creepTask) {
+            return {};
+        }
+        let buckets = this.memory.creepTask[taskType];
+        if (!buckets) {
+            buckets = {};
+            this.memory.creepTask[taskType] = buckets;
+        }
+        return buckets;
     }
     initCarryList() {
         if (!this.memory.creepTask) {
@@ -4338,6 +4374,7 @@ class RoomExtension extends Room {
                 }
             }
         });
+        // console.log(structureList)
         this.registTask(getCarryList(structureList, RESOURCE_ENERGY));
     }
     refreshEnergyCarryTasks() {
@@ -4357,7 +4394,7 @@ class RoomExtension extends Room {
                 return object.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
             }
         });
-        const carryBuckets = this.memory.creepTask['carryTask'] || {};
+        const carryBuckets = this.normalizeTaskBuckets('carryTask');
         const neededIds = new Set(structureList.map(item => item.id));
         const existingIds = new Set();
         for (const key in carryBuckets) {
@@ -4396,7 +4433,7 @@ class RoomExtension extends Room {
         if (!this.memory.creepTask) {
             return;
         }
-        const carryBuckets = this.memory.creepTask['carryTask'] || {};
+        const carryBuckets = this.normalizeTaskBuckets('carryTask');
         const existingIds = new Set();
         for (const key in carryBuckets) {
             const bucket = carryBuckets[key];
@@ -4444,6 +4481,7 @@ class RoomExtension extends Room {
      * Spawn相关
      */
     initSpawn(level) {
+        console.log("Global init Spawn");
         let spawnNum = {
             'harvester': this.find(FIND_SOURCES).length,
             'carrier': spawnTable['carrier'][level],
@@ -4452,7 +4490,9 @@ class RoomExtension extends Room {
         };
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName];
+            // console.log(creepName, creep, creep.memory.spawnRoom)
             if (creep.memory.spawnRoom == this.name) {
+                // console.log(1)
                 delete Memory.creeps[creepName];
                 creep.remember();
                 const role = creep.memory.role;
@@ -4477,7 +4517,7 @@ class RoomExtension extends Room {
         if (!this.memory.creepTask) {
             return;
         }
-        const spawnBuckets = this.memory.creepTask['spawnTask'];
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         if (!spawnBuckets) {
             return;
         }
@@ -4485,7 +4525,7 @@ class RoomExtension extends Room {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
             taskParam: [role, getBody(role, this)],
-            priority: role == 'harvester' || role == 'carrier' ? 0 : 1,
+            priority: role == 'harvester' ? 0 : role == 'carrier' ? 1 : 2,
             capacity: 1,
             persistent: false,
             reservedBy: []
@@ -4509,26 +4549,25 @@ class RoomExtension extends Room {
             if (!Game.creeps[creepName]) {
                 // creep 已经死了
                 const memory = Memory.creeps[creepName];
+                const room = Game.rooms[memory.spawnRoom];
+                if (memory.currentWorkType) {
+                    const task = memory.currentWork;
+                    if (task && task.reservedBy) {
+                        // 如果在干活， 就把自己去掉
+                        task.reservedBy = task.reservedBy.filter(item => item.name != creepName);
+                        if (task.reservedBy.length == 0 && !task.persistent) {
+                            const buckets = room.normalizeTaskBuckets(memory.currentWorkType);
+                            const key = String((_a = task.priority) !== null && _a !== void 0 ? _a : 1);
+                            if (!buckets[key]) {
+                                buckets[key] = [];
+                            }
+                            room.memory.creepTask[memory.currentWorkType] = buckets;
+                        }
+                    }
+                }
                 if (memory.spawnRoom && memory.reSpawn) {
-                    const room = Game.rooms[memory.spawnRoom];
                     if (memory.oldRole) {
                         memory.role = memory.oldRole;
-                    }
-                    if (memory.currentWorkType) {
-                        const task = memory.currentWork;
-                        if (task && task.reservedBy) {
-                            // 如果在干活， 就把自己去掉
-                            task.reservedBy = task.reservedBy.filter(item => item.name !== creepName);
-                            if (task.reservedBy.length == 0 && !task.persistent) {
-                                const buckets = room.memory.creepTask[memory.currentWorkType] || {};
-                                const key = String((_a = task.priority) !== null && _a !== void 0 ? _a : 1);
-                                if (!buckets[key]) {
-                                    buckets[key] = [];
-                                }
-                                buckets[key].push(task);
-                                room.memory.creepTask[memory.currentWorkType] = buckets;
-                            }
-                        }
                     }
                     room.addToSpawnList(memory.role);
                 }
@@ -4563,11 +4602,30 @@ class RoomExtension extends Room {
         delete this.memory.timer[Game.time];
     }
     calSpawningTime(SpawnId) {
-        const spawn = Game.getObjectById(SpawnId);
+        const thisSpawn = Game.getObjectById(SpawnId);
+        const nextEnergyList = [];
+        for (const id of thisSpawn.room.energyList()) {
+            const extension = Game.getObjectById(id);
+            if (!extension) {
+                continue;
+            }
+            if (extension.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                thisSpawn.room.registTask(getCarryList([extension], RESOURCE_ENERGY));
+            }
+            else {
+                nextEnergyList.push(id);
+            }
+        }
+        for (const spawn of thisSpawn.room.find(FIND_MY_SPAWNS)) {
+            if (spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                spawn.room.registTask(getCarryList([spawn], RESOURCE_ENERGY));
+            }
+        }
+        thisSpawn.room.memory.energyList = nextEnergyList;
         this.registEvent({
-            triggerTime: Game.time + spawn.spawning.remainingTime + 1,
+            triggerTime: Game.time + thisSpawn.spawning.remainingTime + 1,
             triggerFunc: "calRecycleTime",
-            param: [spawn.spawning.name]
+            param: [thisSpawn.spawning.name]
         });
     }
     calRecycleTime(creepName) {
@@ -4642,7 +4700,7 @@ class RoomExtension extends Room {
         var _a, _b, _c, _d;
         for (const task of tasks) {
             const bucketKey = String((_a = task.priority) !== null && _a !== void 0 ? _a : 2);
-            const buckets = this.memory.creepTask[task.taskType];
+            const buckets = this.normalizeTaskBuckets(task.taskType);
             if (!buckets[bucketKey]) {
                 buckets[bucketKey] = [];
             }
@@ -4704,11 +4762,10 @@ class RoomExtension extends Room {
     }
     getResources() {
         if (!global.room[this.name].resources) {
-            return;
+            let resources = this.find(FIND_DROPPED_RESOURCES);
+            global.room[this.name].resources = resources;
         }
-        else {
-            return global.room[this.name].resources.pop();
-        }
+        return global.room[this.name].resources;
     }
     getContainer() {
         if (!global.room[this.name].container) {
@@ -4725,8 +4782,9 @@ class RoomExtension extends Room {
             }
             global.room[this.name].container = containers;
         }
-        global.room[this.name].containerCount = (global.room[this.name].containerCount + 1) % global.room[this.name].container.length;
-        return global.room[this.name].container[global.room[this.name].containerCount];
+        // global.room[this.name].containerCount = (global.room[this.name].containerCount + 1) % global.room[this.name].container.length
+        // return global.room[this.name].container[global.room[this.name].containerCount]
+        return global.room[this.name].container;
     }
     sources() {
         if (!global.room[this.name].sources) {
@@ -5215,7 +5273,7 @@ var mountRoom = () => {
     assignPrototype(Room, RoomExtension);
 };
 
-class ControllerExtension extends StructureController {
+class ControllerExtension$1 extends StructureController {
     checkLevel() {
         return true;
     }
@@ -5240,7 +5298,7 @@ class SpawnExtension extends Spawn {
      * 如果孵化出现问题,refresh carrierList,并将
      */
     work() {
-        var _a, _b, _c;
+        var _a, _b;
         // log.debug("spawn working")
         if (this.spawning) {
             // 孵化可视化
@@ -5249,7 +5307,7 @@ class SpawnExtension extends Spawn {
             return;
         }
         else {
-            const spawnBuckets = ((_a = this.room.memory.creepTask) === null || _a === void 0 ? void 0 : _a['spawnTask']) || {};
+            const spawnBuckets = this.room.normalizeTaskBuckets('spawnTask');
             const bucketKeys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b);
             let spawnQueue;
             let activeKey;
@@ -5266,8 +5324,8 @@ class SpawnExtension extends Spawn {
             }
             else {
                 const task = spawnQueue[0];
-                const role = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
-                const rolePart = (_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[1];
+                const role = (_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0];
+                const rolePart = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[1];
                 if (!role || !rolePart) {
                     spawnQueue.shift();
                     if (activeKey && spawnQueue.length === 0) {
@@ -5308,20 +5366,6 @@ class SpawnExtension extends Spawn {
                         if (activeKey && spawnQueue.length === 0) {
                             delete spawnBuckets[activeKey];
                         }
-                        this.room.memory.energyList = this.room.energyList().map(id => {
-                            const extension = Game.getObjectById(id);
-                            if (extension.store.getFreeCapacity(RESOURCE_ENERGY) != 0) {
-                                this.room.registTask(getCarryList([extension], RESOURCE_ENERGY));
-                            }
-                            if (extension.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                                return id;
-                            }
-                        });
-                        this.room.find(FIND_MY_SPAWNS).map(spawn => {
-                            if (spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                                this.room.registTask(getCarryList([spawn], RESOURCE_ENERGY));
-                            }
-                        });
                         this.room.registEvent({
                             triggerTime: Game.time + 1,
                             triggerFunc: "calSpawningTime",
@@ -5343,6 +5387,12 @@ class SpawnExtension extends Spawn {
     }
 }
 
+class ControllerExtension extends StructureController {
+    onbuild() {
+        this.room.registTask(getCarryList([this], RESOURCE_ENERGY));
+    }
+}
+
 // import TowerExtension from './tower'
 // import { LinkExtension, LinkConsole } from './link'
 // import ExtractorExtension from './extractor'
@@ -5357,8 +5407,9 @@ class SpawnExtension extends Spawn {
 // import StructureExtension from './structure'
 const assignMap = [
     // [ Structure, StructureExtension ],
-    [StructureController, ControllerExtension],
+    [StructureController, ControllerExtension$1],
     [StructureSpawn, SpawnExtension],
+    [StructureExtension, ControllerExtension],
     // [ StructureTower, TowerExtension ],
     // [StructureExtractor, RampartExtension],
     // [ StructureLink, LinkExtension ],
@@ -5495,9 +5546,8 @@ const GlobalNodes = [
         alias: "init",
         exec: function () {
             console.log("清理全局room缓存");
-            for (const memory in Memory) {
-                delete Memory[memory];
-            }
+            global.room = {};
+            delete Memory.rooms;
             for (const room in Game.rooms) {
                 Game.rooms[room].init();
             }
@@ -5617,7 +5667,7 @@ const RoomNodes = [
             }
             let txt = "";
             txt += "> spawnTask:\n\t";
-            const spawnBuckets = global.currentRoom.memory.creepTask['spawnTask'];
+            const spawnBuckets = global.currentRoom.normalizeTaskBuckets('spawnTask');
             if (spawnBuckets) {
                 const keys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b);
                 for (const key of keys) {
@@ -5641,7 +5691,7 @@ const RoomNodes = [
                 'energyTask',
                 'spawnTask'];
             for (const type of TaskType) {
-                const buckets = global.currentRoom.memory.creepTask[type];
+                const buckets = global.currentRoom.normalizeTaskBuckets(type);
                 let size = 0;
                 if (buckets) {
                     for (const key in buckets) {
@@ -6451,6 +6501,7 @@ function mount () {
 }
 function globalInit() {
     global.room = {};
+    delete Memory.rooms;
     for (const roomName in Game.rooms) {
         Game.rooms[roomName].init();
     }
@@ -6490,10 +6541,10 @@ const loop = errorMapper(() => {
     mount();
     loggerInstance.warning("+----------------------------" + Game.time + "------------------------------+");
     stateScanner();
-    structureControl();
     // if (!(Game.time % 30)) {
     //     creepRecycle()
     // }
+    structureControl();
     creepControl();
     roomControl();
     //generatePixel()
@@ -6556,7 +6607,37 @@ function debugDump() {
         if (!room) {
             continue;
         }
-        const spawnBuckets = (_a = room.memory.creepTask) === null || _a === void 0 ? void 0 : _a['spawnTask'];
+        const timer = room.memory.timer;
+        if (timer) {
+            const ticks = Object.keys(timer).map(Number).sort((a, b) => a - b);
+            if (ticks.length) {
+                const eventSamples = [];
+                let eventCount = 0;
+                for (const tick of ticks) {
+                    const events = timer[tick];
+                    if (!events || !events.length) {
+                        continue;
+                    }
+                    eventCount += events.length;
+                    if (eventSamples.length < 3) {
+                        for (const item of events) {
+                            if (!item) {
+                                continue;
+                            }
+                            const func = (_a = item[0]) !== null && _a !== void 0 ? _a : "unknown";
+                            eventSamples.push(`${func}@${tick}`);
+                            if (eventSamples.length >= 3) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (eventCount) {
+                    lines.push(`event:${eventCount}:${eventSamples.join(";")}`);
+                }
+            }
+        }
+        const spawnBuckets = room.normalizeTaskBuckets('spawnTask');
         if (spawnBuckets) {
             const roles = [];
             const keys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b);
@@ -6574,7 +6655,7 @@ function debugDump() {
         const creepTask = room.memory.creepTask;
         if (creepTask) {
             for (const taskType in creepTask) {
-                const buckets = creepTask[taskType] || {};
+                const buckets = room.normalizeTaskBuckets(taskType);
                 let size = 0;
                 let detail = "";
                 const sampleTasks = [];

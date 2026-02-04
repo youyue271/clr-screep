@@ -83,12 +83,14 @@ export default class RoomExtension extends Room {
             this.initSpawn(this.controller.level)
             this.initTask(this.controller.level)
             this.initCarryList()
+            this.initCreepRecycle()
         }
         this.initResource()
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
 
     initBuildList() {
+        delete this.memory.creepTask['constructTask']
         this.construct(this.controller.level)
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES)
         this.registTask(createBuildTask(constructionSites))
@@ -97,6 +99,28 @@ export default class RoomExtension extends Room {
     initResource() {
         const resources = this.find(FIND_DROPPED_RESOURCES)
         global.room[this.name].resources = resources
+    }
+
+    initCreepRecycle(): void {
+        for(const creep of this.find(FIND_MY_CREEPS)){
+            this.registEvent({
+            triggerTime: Game.time + creep.ticksToLive + 1,
+            triggerFunc: "creepRecycle",
+            param: []
+        })
+        }
+    }
+
+    normalizeTaskBuckets(taskType: TaskType): TaskBucket {
+        if (!this.memory.creepTask) {
+            return {}
+        }
+        let buckets = this.memory.creepTask[taskType] as TaskBucket | undefined
+        if (!buckets) {
+            buckets = {}
+            this.memory.creepTask[taskType] = buckets
+        }
+        return buckets
     }
 
     initCarryList() {
@@ -123,6 +147,7 @@ export default class RoomExtension extends Room {
                 }
             }
         })
+        // console.log(structureList)
         this.registTask(getCarryList(structureList, RESOURCE_ENERGY))
     }
 
@@ -142,7 +167,7 @@ export default class RoomExtension extends Room {
                 return object.store.getFreeCapacity(RESOURCE_ENERGY) > 0
             }
         }) as (StructureExtension | StructureSpawn)[]
-        const carryBuckets = this.memory.creepTask['carryTask'] || {}
+        const carryBuckets = this.normalizeTaskBuckets('carryTask')
         const neededIds = new Set(structureList.map(item => item.id))
         const existingIds = new Set<string>()
         for (const key in carryBuckets) {
@@ -180,7 +205,7 @@ export default class RoomExtension extends Room {
         if (!this.memory.creepTask) {
             return
         }
-        const carryBuckets = this.memory.creepTask['carryTask'] || {}
+        const carryBuckets = this.normalizeTaskBuckets('carryTask')
         const existingIds = new Set<string>()
         for (const key in carryBuckets) {
             const bucket = carryBuckets[key]
@@ -230,6 +255,7 @@ export default class RoomExtension extends Room {
      * Spawn相关
      */
     initSpawn(level: number) {
+        console.log("Global init Spawn")
         let spawnNum: { [role in Role]: number } = {
             'harvester': this.find(FIND_SOURCES).length,
             'carrier': spawnTable['carrier'][level],
@@ -238,10 +264,13 @@ export default class RoomExtension extends Room {
         }
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName]
+            // console.log(creepName, creep, creep.memory.spawnRoom)
             if (creep.memory.spawnRoom == this.name) {
+                // console.log(1)
                 delete Memory.creeps[creepName]
                 creep.remember()
                 const role = creep.memory.role
+                
                 // 还需要孵化, 那就直接拿现成的, 把任务扔掉就行
                 if (spawnNum[role]) {
                     spawnNum[role] -= 1
@@ -263,7 +292,7 @@ export default class RoomExtension extends Room {
         if (!this.memory.creepTask) {
             return
         }
-        const spawnBuckets = this.memory.creepTask['spawnTask']
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
         if (!spawnBuckets) {
             return
         }
@@ -271,7 +300,7 @@ export default class RoomExtension extends Room {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
             taskParam: [role, getBody(role, this)],
-            priority: role == 'harvester' || role == 'carrier' ? 0 : 1,
+            priority: role == 'harvester' ? 0 : role == 'carrier' ? 1 : 2,
             capacity: 1,
             persistent: false, 
             reservedBy: []
@@ -295,26 +324,25 @@ export default class RoomExtension extends Room {
             if (!Game.creeps[creepName]) {
                 // creep 已经死了
                 const memory = Memory.creeps[creepName]
+                const room = Game.rooms[memory.spawnRoom]
+                if (memory.currentWorkType) {
+                    const task = memory.currentWork
+                    if (task && task.reservedBy) {
+                        // 如果在干活， 就把自己去掉
+                        task.reservedBy = task.reservedBy.filter(item => item.name != creepName)
+                        if(task.reservedBy.length == 0 && !task.persistent){
+                            const buckets = room.normalizeTaskBuckets(memory.currentWorkType)
+                            const key = String(task.priority ?? 1)
+                            if (!buckets[key]) {
+                                buckets[key] = []
+                            }
+                            room.memory.creepTask[memory.currentWorkType] = buckets
+                        }
+                    }
+                }
                 if (memory.spawnRoom && memory.reSpawn) {
-                    const room = Game.rooms[memory.spawnRoom]
                     if (memory.oldRole) {
                         memory.role = memory.oldRole
-                    }
-                    if (memory.currentWorkType) {
-                        const task = memory.currentWork
-                        if (task && task.reservedBy) {
-                            // 如果在干活， 就把自己去掉
-                            task.reservedBy = task.reservedBy.filter(item => item.name !== creepName)
-                            if(task.reservedBy.length == 0 && !task.persistent){
-                                const buckets = room.memory.creepTask[memory.currentWorkType] || {}
-                                const key = String(task.priority ?? 1)
-                                if (!buckets[key]) {
-                                    buckets[key] = []
-                                }
-                                buckets[key].push(task)
-                                room.memory.creepTask[memory.currentWorkType] = buckets
-                            }
-                        }
                     }
                     room.addToSpawnList(memory.role)
                 }
@@ -355,11 +383,29 @@ export default class RoomExtension extends Room {
     }
 
     calSpawningTime(SpawnId: Id<StructureSpawn>) {
-        const spawn = Game.getObjectById(SpawnId)
+        const thisSpawn = Game.getObjectById(SpawnId)
+        const nextEnergyList: Id<StructureExtension | StructureSpawn>[] = []
+        for (const id of thisSpawn.room.energyList()) {
+            const extension = Game.getObjectById(id)
+            if (!extension) {
+                continue
+            }
+            if (extension.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                thisSpawn.room.registTask(getCarryList([extension], RESOURCE_ENERGY))
+            } else {
+                nextEnergyList.push(id)
+            }
+        }
+        for (const spawn of thisSpawn.room.find(FIND_MY_SPAWNS)) {
+            if (spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                spawn.room.registTask(getCarryList([spawn], RESOURCE_ENERGY))
+            }
+        }
+        thisSpawn.room.memory.energyList = nextEnergyList
         this.registEvent({
-            triggerTime: Game.time + spawn.spawning.remainingTime + 1,
+            triggerTime: Game.time + thisSpawn.spawning.remainingTime + 1,
             triggerFunc: "calRecycleTime",
-            param: [spawn.spawning.name]
+            param: [thisSpawn.spawning.name]
         })
     }
 
@@ -440,7 +486,7 @@ export default class RoomExtension extends Room {
     registTask(tasks: MyTask[]) {
         for (const task of tasks) {
             const bucketKey = String(task.priority ?? 2)
-            const buckets = this.memory.creepTask[task.taskType]
+            const buckets = this.normalizeTaskBuckets(task.taskType)
             if (!buckets[bucketKey]) {
                 buckets[bucketKey] = []
             }
@@ -505,13 +551,14 @@ export default class RoomExtension extends Room {
 
     getResources() {
         if (!global.room[this.name].resources) {
-            return
-        } else {
-            return global.room[this.name].resources.pop()
-        }
+            let resources = this.find(FIND_DROPPED_RESOURCES)
+            global.room[this.name].resources = resources
+           
+        } 
+        return global.room[this.name].resources
     }
 
-    getContainer(): Id<StructureContainer> {
+    getContainer(): Id<StructureContainer>[] {
         if (!global.room[this.name].container) {
             global.room[this.name].containerCount = 0
             const containers = []
@@ -526,8 +573,9 @@ export default class RoomExtension extends Room {
             }
             global.room[this.name].container = containers
         }
-        global.room[this.name].containerCount = (global.room[this.name].containerCount + 1) % global.room[this.name].container.length
-        return global.room[this.name].container[global.room[this.name].containerCount]
+        // global.room[this.name].containerCount = (global.room[this.name].containerCount + 1) % global.room[this.name].container.length
+        // return global.room[this.name].container[global.room[this.name].containerCount]
+        return global.room[this.name].container
     }
 
     sources(): Id<Source> [] {

@@ -29,7 +29,7 @@ export default class SpawnExtension extends Spawn {
                 {align: 'left', opacity: 0.8})
             return
         } else {
-            const spawnBuckets = this.room.memory.creepTask?.['spawnTask'] || {}
+            const spawnBuckets = this.room.normalizeTaskBuckets('spawnTask')
             const bucketKeys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b)
             let spawnQueue: TaskEntity[] | undefined
             let activeKey: string | undefined
@@ -98,20 +98,7 @@ export default class SpawnExtension extends Spawn {
                         if (activeKey && spawnQueue.length === 0) {
                             delete spawnBuckets[activeKey]
                         }
-                        this.room.memory.energyList = this.room.energyList().map(id=>{
-                            const extension = Game.getObjectById(id)
-                            if (extension.store.getFreeCapacity(RESOURCE_ENERGY) != 0) {
-                                this.room.registTask(getCarryList([extension], RESOURCE_ENERGY))
-                            } 
-                            if (extension.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                                return id
-                            }
-                        })
-                        this.room.find(FIND_MY_SPAWNS).map(spawn=>{
-                            if (spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                                this.room.registTask(getCarryList([spawn], RESOURCE_ENERGY))
-                            }
-                        })
+                        
                         this.room.registEvent({
                             triggerTime: Game.time + 1,
                             triggerFunc: "calSpawningTime",

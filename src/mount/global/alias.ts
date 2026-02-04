@@ -117,9 +117,8 @@ const GlobalNodes: myNode[] = [
         alias: "init",
         exec: function () {
             console.log("清理全局room缓存")
-            for (const memory in Memory) {
-                delete Memory[memory]
-            }
+            global.room = {}
+            delete Memory.rooms
             for (const room in Game.rooms) {
                 Game.rooms[room].init()
             }
@@ -240,7 +239,7 @@ const RoomNodes: myNode[] = [
             }
             let txt = ""
             txt += "> spawnTask:\n\t"
-            const spawnBuckets = global.currentRoom.memory.creepTask['spawnTask']
+            const spawnBuckets = global.currentRoom.normalizeTaskBuckets('spawnTask')
             if (spawnBuckets) {
                 const keys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b)
                 for (const key of keys) {
@@ -263,7 +262,7 @@ const RoomNodes: myNode[] = [
                 , 'energyTask'
                 , 'spawnTask']
             for (const type of TaskType) {
-                const buckets = global.currentRoom.memory.creepTask[type]
+                const buckets = global.currentRoom.normalizeTaskBuckets(type as TaskType)
                 let size = 0
                 if (buckets) {
                     for (const key in buckets) {

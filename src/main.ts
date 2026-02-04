@@ -10,10 +10,11 @@ export const loop = errorMapper(() => {
     mount()
     log.warning("+----------------------------" + Game.time + "------------------------------+")
     stateScanner()
-    structureControl()
+    
     // if (!(Game.time % 30)) {
     //     creepRecycle()
     // }
+    structureControl()
     creepControl()
     roomControl()
     //generatePixel()
@@ -88,7 +89,37 @@ function debugDump() {
         if (!room) {
             continue
         }
-        const spawnBuckets = room.memory.creepTask?.['spawnTask']
+        const timer = room.memory.timer
+        if (timer) {
+            const ticks = Object.keys(timer).map(Number).sort((a, b) => a - b)
+            if (ticks.length) {
+                const eventSamples: string[] = []
+                let eventCount = 0
+                for (const tick of ticks) {
+                    const events = timer[tick]
+                    if (!events || !events.length) {
+                        continue
+                    }
+                    eventCount += events.length
+                    if (eventSamples.length < 3) {
+                        for (const item of events) {
+                            if (!item) {
+                                continue
+                            }
+                            const func = item[0] ?? "unknown"
+                            eventSamples.push(`${func}@${tick}`)
+                            if (eventSamples.length >= 3) {
+                                break
+                            }
+                        }
+                    }
+                }
+                if (eventCount) {
+                    lines.push(`event:${eventCount}:${eventSamples.join(";")}`)
+                }
+            }
+        }
+        const spawnBuckets = room.normalizeTaskBuckets('spawnTask')
         if (spawnBuckets) {
             const roles: string[] = []
             const keys = Object.keys(spawnBuckets).map(Number).sort((a, b) => a - b)
@@ -106,7 +137,7 @@ function debugDump() {
         const creepTask = room.memory.creepTask
         if (creepTask) {
             for (const taskType in creepTask) {
-                const buckets = creepTask[taskType as TaskType] || {}
+                const buckets = room.normalizeTaskBuckets(taskType as TaskType)
                 let size = 0
                 let detail = ""
                 const sampleTasks: TaskEntity[] = []
@@ -135,5 +166,6 @@ function debugDump() {
             }
         }
     }
+
     log.debug(lines.join("\n"))
 }

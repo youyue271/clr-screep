@@ -8,6 +8,7 @@ interface RoomMemory {
     }
 
     energyList?: Id<StructureExtension | StructureSpawn>[]
+    lastEnergyTaskTick?: number
 
     roomPlanType?: number
     roomType?: number
@@ -32,7 +33,11 @@ interface Room {
 
     initResource(): void
 
+    initCreepRecycle(): void
+
     globalReset(): void
+
+    normalizeTaskBuckets(taskType: TaskType): TaskBucket
 
     energyList(): Id<StructureExtension | StructureSpawn>[]
 
@@ -77,9 +82,9 @@ interface Room {
 
     sources(): any[]
 
-    getResources(): Resource
+    getResources(): Resource[]
 
-    getContainer(): Id<StructureContainer>
+    getContainer(): Id<StructureContainer>[]
 
     containerPos(): any[]
 

@@ -1,6 +1,7 @@
 import { assignPrototype } from "@/util/utils"
 import ControllerExtension from './controller'
 import SpawnExtension from './spawn'
+import ExtensionExtension from './extension'
 // import TowerExtension from './tower'
 // import { LinkExtension, LinkConsole } from './link'
 // import ExtractorExtension from './extractor'
@@ -17,6 +18,7 @@ const assignMap = [
     // [ Structure, StructureExtension ],
     [ StructureController, ControllerExtension ],
     [ StructureSpawn, SpawnExtension ],
+    [StructureExtension, ExtensionExtension],
     // [ StructureTower, TowerExtension ],
     // [StructureExtractor, RampartExtension],
     // [ StructureLink, LinkExtension ],
