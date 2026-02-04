@@ -2,7 +2,6 @@
  * 试了好几遍还是不知道怎么在tick内传函数,干脆传函数名,统一挂载在room下得了
  * @constructor
  */
-import {totalCluster1} from "@/global/autoplan/autoplan";
 
 function RoomLevel1Init() {
 

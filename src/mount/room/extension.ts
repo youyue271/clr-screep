@@ -1,5 +1,5 @@
 import {getBody, initializeArray} from "@/util/utils";
-import {mapping, totalCluster1, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
+import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {spawnTable} from "@/setting";
 import {construct, createBuildTask, getCarryList, harvestSource, upgrade} from "@/task/roomTask";
@@ -332,9 +332,17 @@ export default class RoomExtension extends Room {
                         task.reservedBy = task.reservedBy.filter(item => item.name != creepName)
                         if(task.reservedBy.length == 0 && !task.persistent){
                             const buckets = room.normalizeTaskBuckets(memory.currentWorkType)
-                            const key = String(task.priority ?? 1)
-                            if (!buckets[key]) {
-                                buckets[key] = []
+                            for (const key in buckets) {
+                                const queue = buckets[key]
+                                if (!queue || !queue.length) {
+                                    continue
+                                }
+                                for (const task of queue) {
+                                    if (!task || !task.reservedBy) {
+                                        continue
+                                    }
+                                    task.reservedBy = task.reservedBy.filter(item => item.name !== creepName)
+                                }
                             }
                             room.memory.creepTask[memory.currentWorkType] = buckets
                         }
@@ -981,7 +989,7 @@ export default class RoomExtension extends Room {
         } else {
             if (!this.memory.plan1Pos) return
             const [xx, yy] = this.memory.plan1Pos
-            this.visualize_plan1(totalCluster1, xx, yy, level)
+            this.visualize_plan1(plan1, xx, yy, level)
         }
     }
 

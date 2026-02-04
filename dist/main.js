@@ -3408,10 +3408,23 @@ function getCarryList(targetList, resourceType) {
 }
 function createBuildTask(targetList) {
     return targetList.map(item => {
+        let constructionType = item.structureType;
+        let priority = 3;
+        if (constructionType in [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER]) {
+            priority = 1;
+        }
+        else if (constructionType in [STRUCTURE_TOWER]) {
+            priority = 2;
+        }
+        else if (constructionType in [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]) {
+            priority = 4;
+        }
         return {
             taskType: 'constructTask',
             taskFunc: "buildConstructionSite",
-            taskParam: [item.id]
+            taskParam: [item.id],
+            priority: priority,
+            capacity: 5
         };
     });
 }
@@ -4127,11 +4140,11 @@ var mountCreep = () => {
 
 const plan1 = [
     "e5 e5 e5 e4 e4 r4 e4 e4 e3 e3 e3",
-    "e5 r5 r5 e5 r5 e4 r4 e4 e3 r3 e3",
-    "e5 e5 e5 r5 s7 n8 t5 r4 e2 r3 e2",
-    "e6 e5 r5 e5 r5 e4 t7 t3 r2 e2 e2",
-    "e6 r6 e6 e6 T6 r4 e4 r4 s1 r2 e2",
-    "r6 e6 e6 p8 r6 S4 r4 e4 l6 l6 r2",
+    "e5 r5 r5 e5 r5 e4 r4 e4 e3 r4 e3",
+    "e5 e5 e5 r5 s7 n8 t5 r4 e2 r4 e2",
+    "e6 e5 r5 e5 r5 e4 t7 t3 r4 e2 e2",
+    "e6 r6 e6 e6 T6 r4 e4 r4 s1 r4 e2",
+    "r6 e6 e6 p8 r6 S4 r4 e4 l6 l6 r4",
     "e6 r6 e6 r6 f7 r5 e4 l8 l6 r6 l7",
     "e7 e7 r6 e6 e6 L5 r6 l8 r6 l7 l7",
     "e7 r6 e7 r6 t8 t8 s8 r6 l8 l8 e8",
@@ -4141,19 +4154,19 @@ const plan1 = [
 /**
  * 11*11 基地集群
  */
-const totalCluster1 = [
-    "e5 e5 e5 e4 e4 r4 e4 e4 e3 e3 e3",
-    "e5 r5 r5 t7 r4 e4 r4 e4 e3 r3 e2",
-    "e5 e5 e5 r4 e4 e4 t5 r3 e3 r3 e2",
-    "e6 e5 r5 e5 r4 n8 e4 e4 r3 t3 e2",
-    "e6 r5 e6 e5 T6 r4 s7 r3 e2 r2 e2",
-    "r5 e6 e6 L5 r5 S4 r4 s1 l8 l8 r2",
-    "e6 r6 e6 r6 f7 r5 s8 l7 l7 r4 l8",
-    "e6 t8 r6 e7 e7 p8 r5 l6 r4 l7 l8",
-    "e6 r6 e7 r6 t8 e8 e8 r5 l6 l6 e8",
-    "e6 r6 e7 e7 r6 e8 r6 t8 r6 r6 e8",
-    "e7 e7 e7 e7 e7 r6 e8 e8 e8 e8 e8"
-];
+// export const totalCluster1 = [
+//     "e5 e5 e5 e4 e4 r4 e4 e4 e3 e3 e3",
+//     "e5 r5 r5 t7 r4 e4 r4 e4 e3 r3 e2",
+//     "e5 e5 e5 r4 e4 e4 t5 r3 e3 r3 e2",
+//     "e6 e5 r5 e5 r4 n8 e4 e4 r3 t3 e2",
+//     "e6 r5 e6 e5 T6 r4 s7 r3 e2 r2 e2",
+//     "r5 e6 e6 L5 r5 S4 r4 s1 l8 l8 r2",
+//     "e6 r6 e6 r6 f7 r5 s8 l7 l7 r4 l8",
+//     "e6 t8 r6 e7 e7 p8 r5 l6 r4 l7 l8",
+//     "e6 r6 e7 r6 t8 e8 e8 r5 l6 l6 e8",
+//     "e6 r6 e7 e7 r6 e8 r6 t8 r6 r6 e8",
+//     "e7 e7 e7 e7 e7 r6 e8 e8 e8 e8 e8"
+// ]
 const plan2_Core = [
     "r5 e2 r5 t5 r5 e2 r5",
     "e2 r5 e2 r5 e2 r5 p8",
@@ -4205,6 +4218,10 @@ const mapping = {
     N: "Null"
 };
 
+/**
+ * 试了好几遍还是不知道怎么在tick内传函数,干脆传函数名,统一挂载在room下得了
+ * @constructor
+ */
 function showRoomPlanEvent(time, level) {
     return {
         triggerTime: time,
@@ -4537,7 +4554,6 @@ class RoomExtension extends Room {
         spawnBuckets[key].push(task);
     }
     creepRecycle() {
-        var _a;
         const currentTimestamp = Game.time;
         // 检查上次调用时间
         const lastRecycleTimestamp = global.lastRecycleTime;
@@ -4557,9 +4573,17 @@ class RoomExtension extends Room {
                         task.reservedBy = task.reservedBy.filter(item => item.name != creepName);
                         if (task.reservedBy.length == 0 && !task.persistent) {
                             const buckets = room.normalizeTaskBuckets(memory.currentWorkType);
-                            const key = String((_a = task.priority) !== null && _a !== void 0 ? _a : 1);
-                            if (!buckets[key]) {
-                                buckets[key] = [];
+                            for (const key in buckets) {
+                                const queue = buckets[key];
+                                if (!queue || !queue.length) {
+                                    continue;
+                                }
+                                for (const task of queue) {
+                                    if (!task || !task.reservedBy) {
+                                        continue;
+                                    }
+                                    task.reservedBy = task.reservedBy.filter(item => item.name !== creepName);
+                                }
                             }
                             room.memory.creepTask[memory.currentWorkType] = buckets;
                         }
@@ -5158,7 +5182,7 @@ class RoomExtension extends Room {
             if (!this.memory.plan1Pos)
                 return;
             const [xx, yy] = this.memory.plan1Pos;
-            this.visualize_plan1(totalCluster1, xx, yy, level);
+            this.visualize_plan1(plan1, xx, yy, level);
         }
     }
     visualize_plan1(map, xx, yy, level = 0) {

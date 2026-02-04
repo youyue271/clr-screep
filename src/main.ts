@@ -2,7 +2,7 @@ import {errorMapper} from './modules/errorMapper'
 import mount from './mount/mount'
 import log from "@/util/log";
 import {stateScanner} from "@/statistic/statistic";
-import {totalCluster1} from "@/global/autoplan/autoplan";
+// import {totalCluster1} from "@/global/autoplan/autoplan";
 import room from "@/mount/room";
 import {testEvent} from "@/event/roomEvent";
 

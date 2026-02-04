@@ -162,12 +162,23 @@ export function getCarryList(targetList:Structure[], resourceType:ResourceConsta
     })
 }
 
-export function createBuildTask(targetList:any[]): MyTask[]{
+export function createBuildTask(targetList:ConstructionSite[]): MyTask[]{
     return targetList.map(item => {
+        let constructionType = item.structureType
+        let priority = 3
+        if (constructionType in [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER]) {
+            priority = 1
+        } else if (constructionType in [STRUCTURE_TOWER]) {
+            priority = 2
+        } else if (constructionType in [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]) {
+            priority = 4
+        }
         return {
             taskType: 'constructTask',
             taskFunc: "buildConstructionSite",
-            taskParam: [item.id]
+            taskParam: [item.id],
+            priority: priority,
+            capacity: 5
         }
     })
 } 
