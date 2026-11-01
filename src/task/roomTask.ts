@@ -23,7 +23,8 @@ export function harvestSource(room: Room) {
         tasks.push({
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
-            taskParam: [sourceId, targetPos.x, targetPos.y]
+            // 找不到 source 旁的 container / 工地时退化为直接走到 source 旁边采集
+            taskParam: targetPos ? [sourceId, targetPos.x, targetPos.y] : [sourceId, null, null]
         })
     }
     return tasks
@@ -85,7 +86,6 @@ export function getResourceEnergy(room: Room): MyTask[] {
 
 export function getStorageEnergy(room: Room): MyTask[] {
     const storage = room.storage
-    console.log(room.storage)
     if (!storage) {
         return []
     } else {
@@ -173,11 +173,15 @@ export function createBuildTask(targetList:ConstructionSite[]): MyTask[]{
     return targetList.map(item => {
         let constructionType = item.structureType
         let priority = 3
-        if (constructionType in [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER]) {
+        // 注意：这里必须用 includes，in 判断的是数组下标而不是元素
+        const priority1Structures: StructureConstant[] = [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER]
+        const priority2Structures: StructureConstant[] = [STRUCTURE_TOWER]
+        const priority4Structures: StructureConstant[] = [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]
+        if (priority1Structures.includes(constructionType)) {
             priority = 1
-        } else if (constructionType in [STRUCTURE_TOWER]) {
+        } else if (priority2Structures.includes(constructionType)) {
             priority = 2
-        } else if (constructionType in [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]) {
+        } else if (priority4Structures.includes(constructionType)) {
             priority = 4
         }
         return {

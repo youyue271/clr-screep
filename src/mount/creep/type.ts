@@ -38,7 +38,7 @@ interface Creep {
      * @param containerPosX
      * @param ContainerPosY
      */
-    harvestSource(sourceId: Id<any>, containerPosX:number, ContainerPosY:number): boolean
+    harvestSource(sourceId: Id<any>, containerPosX?:number, ContainerPosY?:number): boolean
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant): boolean
     collectEnergy(id: Id<any>): boolean
     upgrade(controllerId: Id<StructureController>): boolean
