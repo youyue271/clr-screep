@@ -6,7 +6,7 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'harvester': ['harvestTask'],
     // 维修排在升级前，但维修任务总量受 repairSetting.maxTasks 限制，
     // 只有少数 worker 会短暂转去维修，修完后自动回来升级
-    'worker': ['repairTask', 'upgradeTask', 'constructTask'],
+    'worker': ['repairTask', 'wallRepairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
     'carrier': ['carryTask'],
 }
@@ -409,9 +409,10 @@ export default class CreepExtension extends Creep {
         return false
     }
 
-    repairStructure(targetId: Id<Structure>) {
+    repairStructure(targetId: Id<Structure>, targetHits?: number) {
         const target = Game.getObjectById<Structure>(targetId)
-        if (!target || target.hits >= target.hitsMax) {
+        const goalHits = targetHits ?? target?.hitsMax ?? 0
+        if (!target || target.hits >= goalHits) {
             // 目标已经修好/消失，把任务移出队列
             this.removeCurrentWorkFromQueue()
             this.releaseCurrentWork()

@@ -3280,6 +3280,20 @@ function repairPriority(type) {
     var _a;
     return (_a = repairPriorityMap[type]) !== null && _a !== void 0 ? _a : 2;
 }
+const wallSetting = {
+    // 墙体/防御墙扫描间隔，比普通维修低得多
+    scanInterval: 50,
+    // 同时存在的墙体维修任务上限
+    maxTasks: 2,
+    // 单个墙体维修任务允许几个 creep
+    capacity: 1,
+    // 每次扫描最多放进队列的目标数
+    queueSize: 10,
+    // 目标血量按 controller level 取，0 表示不维护
+    targetHits: [0, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 300000],
+    // storage 能量达到该值以上才开始维护，避免前期把能量全填进墙里
+    minStorageEnergy: 50000,
+};
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
     threatScanInterval: 5,
@@ -3469,6 +3483,22 @@ function getRepairTasks(targetList) {
         taskParam: [item.id],
     }));
 }
+/**
+ * 墙体/防御墙维护任务。和普通维修共用 repairStructure，
+ * 但单独放在 wallRepairTask 桶里，数量受 wallSetting.maxTasks 限制。
+ */
+function getWallRepairTasks(targetList, targetHits) {
+    return targetList.map(item => ({
+        taskType: 'wallRepairTask',
+        taskFunc: 'repairStructure',
+        priority: item.structureType == STRUCTURE_RAMPART ? 1 : 2,
+        capacity: wallSetting.capacity,
+        persistent: true,
+        targetId: item.id,
+        // 第二个参数是维护目标血量：墙/rampart 的 hitsMax 是 3 亿，不能修到满
+        taskParam: [item.id, targetHits],
+    }));
+}
 function createBuildTask(targetList) {
     return targetList.map(item => {
         let constructionType = item.structureType;
@@ -3564,7 +3594,7 @@ const roleToTask = {
     'harvester': ['harvestTask'],
     // 维修排在升级前，但维修任务总量受 repairSetting.maxTasks 限制，
     // 只有少数 worker 会短暂转去维修，修完后自动回来升级
-    'worker': ['repairTask', 'upgradeTask', 'constructTask'],
+    'worker': ['repairTask', 'wallRepairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
     'carrier': ['carryTask'],
 };
@@ -3973,9 +4003,11 @@ class CreepExtension extends Creep {
         }
         return false;
     }
-    repairStructure(targetId) {
+    repairStructure(targetId, targetHits) {
+        var _a;
         const target = Game.getObjectById(targetId);
-        if (!target || target.hits >= target.hitsMax) {
+        const goalHits = (_a = targetHits !== null && targetHits !== void 0 ? targetHits : target === null || target === void 0 ? void 0 : target.hitsMax) !== null && _a !== void 0 ? _a : 0;
+        if (!target || target.hits >= goalHits) {
             // 目标已经修好/消失，把任务移出队列
             this.removeCurrentWorkFromQueue();
             this.releaseCurrentWork();
@@ -4422,6 +4454,7 @@ class RoomExtension extends Room {
             'upgradeTask': {},
             'constructTask': {},
             'repairTask': {},
+            'wallRepairTask': {},
             'energyTask': {},
             'spawnTask': {}
         };
@@ -4627,19 +4660,40 @@ class RoomExtension extends Room {
     }
     /**
      * 把扫描缓存里的维修队列同步成 worker 任务。
-     * 只补到 repairSetting.maxTasks 个，已经有人领取的任务不会重复登记。
      * 由 scan() 每 repairScanInterval tick 调用一次。
      */
     syncRepairTasks() {
-        var _a, _b;
-        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
-            return;
-        }
         const cache = global.room[this.name];
         if (!cache || !cache.repairQueue) {
             return;
         }
-        const buckets = this.normalizeTaskBuckets('repairTask');
+        this.syncTaskQueue('repairTask', cache.repairQueue, repairSetting.maxTasks, getRepairTasks);
+    }
+    /**
+     * 同步墙体/防御墙维护任务，数量受 wallSetting.maxTasks 限制。
+     */
+    syncWallRepairTasks() {
+        var _a;
+        const cache = global.room[this.name];
+        if (!cache || !cache.maintenanceQueue || !this.controller) {
+            return;
+        }
+        const targetHits = (_a = wallSetting.targetHits[this.controller.level]) !== null && _a !== void 0 ? _a : 0;
+        if (!targetHits) {
+            return;
+        }
+        this.syncTaskQueue('wallRepairTask', cache.maintenanceQueue, wallSetting.maxTasks, targets => getWallRepairTasks(targets, targetHits));
+    }
+    /**
+     * 通用任务同步：清理失效任务，再从队列头部补足到 maxTasks。
+     * 已经有人领取的任务保留，等 worker 自己释放。
+     */
+    syncTaskQueue(taskType, sourceIds, maxTasks, factory) {
+        var _a, _b, _c;
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return;
+        }
+        const buckets = this.normalizeTaskBuckets(taskType);
         const knownTargets = new Set();
         for (const key in buckets) {
             const queue = buckets[key];
@@ -4655,8 +4709,12 @@ class RoomExtension extends Room {
                 const targetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
                 const target = targetId ? Game.getObjectById(targetId) : null;
                 const reserved = !!(task.reservedBy && task.reservedBy.length);
+                // 目标血量可能是任务参数里的维护目标（墙/rampart），没有则修到 hitsMax
+                const goalHits = target
+                    ? (typeof ((_c = task.taskParam) === null || _c === void 0 ? void 0 : _c[1]) === 'number' ? task.taskParam[1] : target.hitsMax)
+                    : 0;
                 // 已经修好/消失且没人在修的任务直接删掉；有人在修的等 worker 自己释放
-                if ((!target || target.hits >= target.hitsMax) && !reserved) {
+                if ((!target || target.hits >= goalHits) && !reserved) {
                     continue;
                 }
                 if (targetId) {
@@ -4672,12 +4730,12 @@ class RoomExtension extends Room {
             }
         }
         let taskCount = knownTargets.size;
-        if (taskCount >= repairSetting.maxTasks) {
+        if (taskCount >= maxTasks) {
             return;
         }
         const toAdd = [];
-        for (const id of cache.repairQueue) {
-            if (taskCount + toAdd.length >= repairSetting.maxTasks) {
+        for (const id of sourceIds) {
+            if (taskCount + toAdd.length >= maxTasks) {
                 break;
             }
             if (knownTargets.has(id)) {
@@ -4690,7 +4748,7 @@ class RoomExtension extends Room {
             toAdd.push(structure);
         }
         if (toAdd.length) {
-            this.registTask(getRepairTasks(toAdd));
+            this.registTask(factory(toAdd));
         }
     }
     /**
@@ -5543,6 +5601,12 @@ class RoomScanExtension extends Room {
             // 维修队列刷新后同步 worker 的维修任务，次数与扫描同频（15 tick 一次）
             this.syncRepairTasks();
         }
+        if (cache.lastMaintenanceScan === undefined
+            || now - cache.lastMaintenanceScan >= wallSetting.scanInterval) {
+            cache.lastMaintenanceScan = now;
+            this.refreshMaintenanceQueue(cache);
+            this.syncWallRepairTasks();
+        }
     }
     refreshThreat(cache) {
         var _a;
@@ -5591,6 +5655,44 @@ class RoomScanExtension extends Room {
             return a.hits / a.hitsMax - b.hits / b.hitsMax;
         });
         cache.repairQueue = damaged.map(structure => structure.id);
+    }
+    /**
+     * 墙体/防御墙维护队列。只有 storage 能量充足时才扫描，
+     * 目标血量按 controller level 从 wallSetting.targetHits 取。
+     */
+    refreshMaintenanceQueue(cache) {
+        var _a;
+        const storage = this.storage;
+        const targetHits = this.controller
+            ? (_a = wallSetting.targetHits[this.controller.level]) !== null && _a !== void 0 ? _a : 0
+            : 0;
+        if (!storage || storage.store[RESOURCE_ENERGY] < wallSetting.minStorageEnergy || !targetHits) {
+            cache.maintenanceQueue = [];
+            return;
+        }
+        const damaged = this.find(FIND_STRUCTURES, {
+            filter: (object) => {
+                if (object.structureType != STRUCTURE_WALL && object.structureType != STRUCTURE_RAMPART) {
+                    return false;
+                }
+                if (object.owner && !object.my) {
+                    return false;
+                }
+                return object.hits < targetHits;
+            }
+        });
+        damaged.sort((a, b) => {
+            // 先修 rampart（保护站在上面的 creep），同类型优先修血量最低的
+            const priorityA = a.structureType == STRUCTURE_RAMPART ? 0 : 1;
+            const priorityB = b.structureType == STRUCTURE_RAMPART ? 0 : 1;
+            if (priorityA != priorityB) {
+                return priorityA - priorityB;
+            }
+            return a.hits - b.hits;
+        });
+        cache.maintenanceQueue = damaged
+            .slice(0, wallSetting.queueSize)
+            .map(structure => structure.id);
     }
     dropRepairTarget(id) {
         const cache = global.room[this.name];

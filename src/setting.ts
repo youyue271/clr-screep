@@ -37,6 +37,21 @@ export function repairPriority(type: StructureConstant): number {
     return repairPriorityMap[type] ?? 2
 }
 
+export const wallSetting = {
+    // 墙体/防御墙扫描间隔，比普通维修低得多
+    scanInterval: 50,
+    // 同时存在的墙体维修任务上限
+    maxTasks: 2,
+    // 单个墙体维修任务允许几个 creep
+    capacity: 1,
+    // 每次扫描最多放进队列的目标数
+    queueSize: 10,
+    // 目标血量按 controller level 取，0 表示不维护
+    targetHits: [0, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 300000],
+    // storage 能量达到该值以上才开始维护，避免前期把能量全填进墙里
+    minStorageEnergy: 50000,
+}
+
 export const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
     threatScanInterval: 5,

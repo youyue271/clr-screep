@@ -58,6 +58,8 @@ interface Room {
 
     syncRepairTasks(): void
 
+    syncWallRepairTasks(): void
+
     /**
      * 初始化Spawn列表
      */

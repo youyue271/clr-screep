@@ -27,8 +27,10 @@ interface RoomGlobalCache {
     hostileIds?: Id<Creep>[]
     hurtCreepIds?: Id<Creep>[]
     repairQueue?: Id<Structure>[]
+    maintenanceQueue?: Id<StructureWall | StructureRampart>[]
     lastThreatScan?: number
     lastRepairScan?: number
+    lastMaintenanceScan?: number
     calmTicks?: number
     // towerId -> 上次请求补能的 tick
     refillTicks?: { [towerId: string]: number }

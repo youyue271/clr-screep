@@ -1,8 +1,8 @@
 import {getBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {repairSetting, spawnTable} from "@/setting";
-import {construct, createBuildTask, getCarryList, getRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
+import {repairSetting, spawnTable, wallSetting} from "@/setting";
+import {construct, createBuildTask, getCarryList, getRepairTasks, getWallRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 
 export default class RoomExtension extends Room {
@@ -39,6 +39,7 @@ export default class RoomExtension extends Room {
             'upgradeTask': {},
             'constructTask': {},
             'repairTask': {},
+            'wallRepairTask': {},
             'energyTask': {},
             'spawnTask': {}
         }
@@ -250,18 +251,41 @@ export default class RoomExtension extends Room {
 
     /**
      * 把扫描缓存里的维修队列同步成 worker 任务。
-     * 只补到 repairSetting.maxTasks 个，已经有人领取的任务不会重复登记。
      * 由 scan() 每 repairScanInterval tick 调用一次。
      */
     syncRepairTasks() {
-        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
-            return
-        }
         const cache = global.room[this.name]
         if (!cache || !cache.repairQueue) {
             return
         }
-        const buckets = this.normalizeTaskBuckets('repairTask')
+        this.syncTaskQueue('repairTask', cache.repairQueue, repairSetting.maxTasks, getRepairTasks)
+    }
+
+    /**
+     * 同步墙体/防御墙维护任务，数量受 wallSetting.maxTasks 限制。
+     */
+    syncWallRepairTasks() {
+        const cache = global.room[this.name]
+        if (!cache || !cache.maintenanceQueue || !this.controller) {
+            return
+        }
+        const targetHits = wallSetting.targetHits[this.controller.level] ?? 0
+        if (!targetHits) {
+            return
+        }
+        this.syncTaskQueue('wallRepairTask', cache.maintenanceQueue, wallSetting.maxTasks,
+            targets => getWallRepairTasks(targets, targetHits))
+    }
+
+    /**
+     * 通用任务同步：清理失效任务，再从队列头部补足到 maxTasks。
+     * 已经有人领取的任务保留，等 worker 自己释放。
+     */
+    private syncTaskQueue(taskType: TaskType, sourceIds: string[], maxTasks: number, factory: (targets: Structure[]) => MyTask[]) {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return
+        }
+        const buckets = this.normalizeTaskBuckets(taskType)
         const knownTargets = new Set<string>()
         for (const key in buckets) {
             const queue = buckets[key]
@@ -275,10 +299,14 @@ export default class RoomExtension extends Room {
                     continue
                 }
                 const targetId = task.targetId ?? task.taskParam?.[0]
-                const target = targetId ? Game.getObjectById<Structure>(targetId) : null
+                const target = targetId ? Game.getObjectById<Structure>(targetId as Id<Structure>) : null
                 const reserved = !!(task.reservedBy && task.reservedBy.length)
+                // 目标血量可能是任务参数里的维护目标（墙/rampart），没有则修到 hitsMax
+                const goalHits = target
+                    ? (typeof task.taskParam?.[1] === 'number' ? task.taskParam[1] : target.hitsMax)
+                    : 0
                 // 已经修好/消失且没人在修的任务直接删掉；有人在修的等 worker 自己释放
-                if ((!target || target.hits >= target.hitsMax) && !reserved) {
+                if ((!target || target.hits >= goalHits) && !reserved) {
                     continue
                 }
                 if (targetId) {
@@ -293,25 +321,25 @@ export default class RoomExtension extends Room {
             }
         }
         let taskCount = knownTargets.size
-        if (taskCount >= repairSetting.maxTasks) {
+        if (taskCount >= maxTasks) {
             return
         }
         const toAdd: Structure[] = []
-        for (const id of cache.repairQueue) {
-            if (taskCount + toAdd.length >= repairSetting.maxTasks) {
+        for (const id of sourceIds) {
+            if (taskCount + toAdd.length >= maxTasks) {
                 break
             }
             if (knownTargets.has(id)) {
                 continue
             }
-            const structure = Game.getObjectById<Structure>(id)
+            const structure = Game.getObjectById<Structure>(id as Id<Structure>)
             if (!structure) {
                 continue
             }
             toAdd.push(structure)
         }
         if (toAdd.length) {
-            this.registTask(getRepairTasks(toAdd))
+            this.registTask(factory(toAdd))
         }
     }
 

@@ -1,4 +1,4 @@
-import {repairPriority, towerSetting} from "@/setting";
+import {repairPriority, towerSetting, wallSetting} from "@/setting";
 
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
@@ -25,6 +25,12 @@ export default class RoomScanExtension extends Room {
             this.refreshRepairQueue(cache)
             // 维修队列刷新后同步 worker 的维修任务，次数与扫描同频（15 tick 一次）
             this.syncRepairTasks()
+        }
+        if (cache.lastMaintenanceScan === undefined
+            || now - cache.lastMaintenanceScan >= wallSetting.scanInterval) {
+            cache.lastMaintenanceScan = now
+            this.refreshMaintenanceQueue(cache)
+            this.syncWallRepairTasks()
         }
     }
 
@@ -77,6 +83,44 @@ export default class RoomScanExtension extends Room {
             return a.hits / a.hitsMax - b.hits / b.hitsMax
         })
         cache.repairQueue = damaged.map(structure => structure.id)
+    }
+
+    /**
+     * 墙体/防御墙维护队列。只有 storage 能量充足时才扫描，
+     * 目标血量按 controller level 从 wallSetting.targetHits 取。
+     */
+    private refreshMaintenanceQueue(cache: RoomGlobalCache): void {
+        const storage = this.storage
+        const targetHits = this.controller
+            ? wallSetting.targetHits[this.controller.level] ?? 0
+            : 0
+        if (!storage || storage.store[RESOURCE_ENERGY] < wallSetting.minStorageEnergy || !targetHits) {
+            cache.maintenanceQueue = []
+            return
+        }
+        const damaged = this.find(FIND_STRUCTURES, {
+            filter: (object: any) => {
+                if (object.structureType != STRUCTURE_WALL && object.structureType != STRUCTURE_RAMPART) {
+                    return false
+                }
+                if (object.owner && !object.my) {
+                    return false
+                }
+                return object.hits < targetHits
+            }
+        }) as (StructureWall | StructureRampart)[]
+        damaged.sort((a, b) => {
+            // 先修 rampart（保护站在上面的 creep），同类型优先修血量最低的
+            const priorityA = a.structureType == STRUCTURE_RAMPART ? 0 : 1
+            const priorityB = b.structureType == STRUCTURE_RAMPART ? 0 : 1
+            if (priorityA != priorityB) {
+                return priorityA - priorityB
+            }
+            return a.hits - b.hits
+        })
+        cache.maintenanceQueue = damaged
+            .slice(0, wallSetting.queueSize)
+            .map(structure => structure.id)
     }
 
     dropRepairTarget(id: Id<Structure>): void {

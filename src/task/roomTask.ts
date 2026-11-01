@@ -1,5 +1,5 @@
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
-import {repairPriority, repairSetting, upgradeTaskCapacity} from "@/setting";
+import {repairPriority, repairSetting, upgradeTaskCapacity, wallSetting} from "@/setting";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -182,6 +182,23 @@ export function getRepairTasks(targetList: Structure[]): MyTask[] {
         persistent: true,
         targetId: item.id,
         taskParam: [item.id],
+    }))
+}
+
+/**
+ * 墙体/防御墙维护任务。和普通维修共用 repairStructure，
+ * 但单独放在 wallRepairTask 桶里，数量受 wallSetting.maxTasks 限制。
+ */
+export function getWallRepairTasks(targetList: Structure[], targetHits: number): MyTask[] {
+    return targetList.map(item => ({
+        taskType: 'wallRepairTask',
+        taskFunc: 'repairStructure',
+        priority: item.structureType == STRUCTURE_RAMPART ? 1 : 2,
+        capacity: wallSetting.capacity,
+        persistent: true,
+        targetId: item.id,
+        // 第二个参数是维护目标血量：墙/rampart 的 hitsMax 是 3 亿，不能修到满
+        taskParam: [item.id, targetHits],
     }))
 }
 
