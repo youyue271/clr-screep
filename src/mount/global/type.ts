@@ -5,37 +5,38 @@ interface myNode {
     exec: () => string;
 }
 
+/**
+ * 房间的堆内存缓存。只存 id / 数字，不存游戏对象引用，
+ * 因为每个 tick 的对象都会重建；global 在代码更新时会整体清空，可安全丢弃。
+ */
+interface RoomGlobalCache {
+    terrainMap?:any[]
+    energyMap?:any[]
+    possibleBase?: any[]
+    sources?:any[]
+    sourceBFS?:any[]
+    controllerBFS?:any[]
+    energyExtensionList?: Id<StructureExtension | StructureSpawn>[]
+    container?:any[]
+    containerCount?: number
+    resources?:Resource[]
+    controllerProgress?: number
+
+    // 塔用缓存
+    threatMode?: 'peace' | 'defend'
+    hostileIds?: Id<Creep>[]
+    hurtCreepIds?: Id<Creep>[]
+    repairQueue?: Id<Structure>[]
+    lastThreatScan?: number
+    lastRepairScan?: number
+    calmTicks?: number
+    // towerId -> 上次请求补能的 tick
+    refillTicks?: { [towerId: string]: number }
+}
+
 declare var global: {
     room: {
-        [p:string]: {
-            terrainMap?:any[]
-            energyMap?:any[]
-            possibleBase?: any[]
-            sources?:any[]
-            sourceBFS?:any[]
-            controllerBFS?:any[]
-            energyExtensionList?: Id<StructureExtension | StructureSpawn>[]
-            container?:any[]
-            containerCount?: number
-            resources?:Resource[]
-            controllerProgress?: number
-            // /**
-            //  * dataPool用于收集creep工作用的data，由各模块打包好data以后丢进dataPool中
-            //  * 在creep free的时候，会检测dataPool是否有空的值
-            //  * 然后取出来直接调用
-            //  * 对于建筑来说，dataPool存储的是，建筑work方法用到的数据
-            //  * 对于建筑，data取出以后存储在Memory.structures中
-            //  */
-            // dataPool?: {
-            //     [role in Role]?: {
-            //         listLength: number
-            //         bitmap: number
-            //         list: {
-            //             data: TotalData
-            //         }[][]
-            //     }
-            // }
-        }
+        [p:string]: RoomGlobalCache
     }
     lastRecycleTime:number
     currentMenu:string

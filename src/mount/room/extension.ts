@@ -217,6 +217,37 @@ export default class RoomExtension extends Room {
     }
 
     /**
+     * 为单个结构登记补能任务（塔等主动请求补能用）。
+     * 已经存在指向该结构的 carryTask 时不重复登记。
+     */
+    ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>) {
+        if (!this.memory.creepTask) {
+            return
+        }
+        const structure = Game.getObjectById<AnyStoreStructure>(structureId)
+        if (!structure || !structure.store.getFreeCapacity(RESOURCE_ENERGY)) {
+            return
+        }
+        const carryBuckets = this.normalizeTaskBuckets('carryTask')
+        for (const key in carryBuckets) {
+            const bucket = carryBuckets[key]
+            if (!bucket || !bucket.length) {
+                continue
+            }
+            for (const task of bucket) {
+                if (!task) {
+                    continue
+                }
+                const taskTargetId = task.targetId ?? task.taskParam?.[0]
+                if (taskTargetId === structureId) {
+                    return
+                }
+            }
+        }
+        this.registTask(getCarryList([structure], RESOURCE_ENERGY))
+    }
+
+    /**
      * 临时函数
      */
     initSpawnList() {

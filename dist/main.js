@@ -3255,6 +3255,22 @@ const spawnTable = {
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 };
 const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1];
+const towerSetting = {
+    // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
+    threatScanInterval: 5,
+    // 每 15 tick 刷新一次维修队列
+    repairScanInterval: 15,
+    // 连续 N 次扫描没有敌对 creep 才切回和平
+    calmTicksToPeace: 2,
+    // 塔能量低于 60% 时请求 carrier 补能
+    refillThreshold: 0.6,
+    // 补能请求的节流间隔
+    refillInterval: 10,
+    // 维修时保留 50% 能量用于防守/治疗
+    repairReserve: 0.5,
+    // hits 低于最大值的 80% 才进入维修队列
+    repairThreshold: 0.8,
+};
 
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
 /**
@@ -4509,6 +4525,37 @@ class RoomExtension extends Room {
         }
     }
     /**
+     * 为单个结构登记补能任务（塔等主动请求补能用）。
+     * 已经存在指向该结构的 carryTask 时不重复登记。
+     */
+    ensureEnergyCarryTask(structureId) {
+        var _a, _b;
+        if (!this.memory.creepTask) {
+            return;
+        }
+        const structure = Game.getObjectById(structureId);
+        if (!structure || !structure.store.getFreeCapacity(RESOURCE_ENERGY)) {
+            return;
+        }
+        const carryBuckets = this.normalizeTaskBuckets('carryTask');
+        for (const key in carryBuckets) {
+            const bucket = carryBuckets[key];
+            if (!bucket || !bucket.length) {
+                continue;
+            }
+            for (const task of bucket) {
+                if (!task) {
+                    continue;
+                }
+                const taskTargetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
+                if (taskTargetId === structureId) {
+                    return;
+                }
+            }
+        }
+        this.registTask(getCarryList([structure], RESOURCE_ENERGY));
+    }
+    /**
      * 临时函数
      */
     initSpawnList() {
@@ -5333,9 +5380,105 @@ class RoomExtension extends Room {
     }
 }
 
+const repairPriorityMap = {
+    [STRUCTURE_SPAWN]: 1,
+    [STRUCTURE_EXTENSION]: 1,
+    [STRUCTURE_TOWER]: 1,
+    [STRUCTURE_CONTAINER]: 1,
+    [STRUCTURE_STORAGE]: 1,
+    [STRUCTURE_LINK]: 1,
+    [STRUCTURE_TERMINAL]: 1,
+    [STRUCTURE_LAB]: 1,
+    [STRUCTURE_ROAD]: 3,
+};
+function repairPriority(type) {
+    var _a;
+    return (_a = repairPriorityMap[type]) !== null && _a !== void 0 ? _a : 2;
+}
+/**
+ * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
+ * 塔每 tick 只做 O(1) 的缓存读取，避免所有塔重复 find。
+ */
+class RoomScanExtension extends Room {
+    scan() {
+        const cache = global.room[this.name];
+        if (!cache) {
+            return;
+        }
+        const now = Game.time;
+        // 防御状态下每 tick 重新确认敌对目标；和平状态按间隔扫描
+        if (cache.threatMode === 'defend'
+            || cache.lastThreatScan === undefined
+            || now - cache.lastThreatScan >= towerSetting.threatScanInterval) {
+            cache.lastThreatScan = now;
+            this.refreshThreat(cache);
+        }
+        if (cache.lastRepairScan === undefined
+            || now - cache.lastRepairScan >= towerSetting.repairScanInterval) {
+            cache.lastRepairScan = now;
+            this.refreshRepairQueue(cache);
+        }
+    }
+    refreshThreat(cache) {
+        var _a;
+        const hostiles = this.find(FIND_HOSTILE_CREEPS);
+        cache.hostileIds = hostiles.map(creep => creep.id);
+        const hurt = this.find(FIND_MY_CREEPS)
+            .filter(creep => creep.hits < creep.hitsMax)
+            .sort((a, b) => a.hits / a.hitsMax - b.hits / b.hitsMax);
+        cache.hurtCreepIds = hurt.map(creep => creep.id);
+        if (hostiles.length) {
+            cache.threatMode = 'defend';
+            cache.calmTicks = 0;
+            return;
+        }
+        if (cache.threatMode === 'defend') {
+            cache.calmTicks = ((_a = cache.calmTicks) !== null && _a !== void 0 ? _a : 0) + 1;
+            if (cache.calmTicks >= towerSetting.calmTicksToPeace) {
+                cache.threatMode = 'peace';
+                cache.calmTicks = 0;
+            }
+            return;
+        }
+        cache.threatMode = 'peace';
+        cache.calmTicks = 0;
+    }
+    refreshRepairQueue(cache) {
+        const damaged = this.find(FIND_STRUCTURES, {
+            filter: (object) => {
+                if (object.structureType == STRUCTURE_CONTROLLER
+                    || object.structureType == STRUCTURE_WALL
+                    || object.structureType == STRUCTURE_RAMPART) {
+                    return false;
+                }
+                return object.hits < object.hitsMax * towerSetting.repairThreshold;
+            }
+        });
+        damaged.sort((a, b) => {
+            const priorityDiff = repairPriority(a.structureType) - repairPriority(b.structureType);
+            if (priorityDiff) {
+                return priorityDiff;
+            }
+            return a.hits / a.hitsMax - b.hits / b.hitsMax;
+        });
+        cache.repairQueue = damaged.map(structure => structure.id);
+    }
+    dropRepairTarget(id) {
+        const cache = global.room[this.name];
+        if (!cache || !cache.repairQueue) {
+            return;
+        }
+        const index = cache.repairQueue.indexOf(id);
+        if (index >= 0) {
+            cache.repairQueue.splice(index, 1);
+        }
+    }
+}
+
 var mountRoom = () => {
     console.log("+ Mounting Room extension");
     assignPrototype(Room, RoomExtension);
+    assignPrototype(Room, RoomScanExtension);
 };
 
 class ControllerExtension extends StructureController {
@@ -5458,7 +5601,129 @@ class ExtensionExtension extends StructureExtension {
     }
 }
 
-// import TowerExtension from './tower'
+/**
+ * 塔的逻辑：只读 global.room 中的扫描缓存，不在每 tick 做 find。
+ * 优先级：攻击敌对 creep > 治疗己方 creep > 维修建筑 > 请求补能。
+ */
+class TowerExtension extends StructureTower {
+    work() {
+        const room = this.room;
+        const cache = room ? global.room[room.name] : undefined;
+        if (!room || !cache) {
+            return;
+        }
+        if (this.attackHostile(cache.hostileIds)) {
+            this.ensureEnergySupply(cache);
+            return;
+        }
+        if (this.healCreep(cache.hurtCreepIds)) {
+            this.ensureEnergySupply(cache);
+            return;
+        }
+        if (this.canRepair() && cache.repairQueue && cache.repairQueue.length) {
+            this.repairNext(cache.repairQueue, room);
+        }
+        this.ensureEnergySupply(cache);
+    }
+    /**
+     * 攻击敌对 creep。优先打射程内的，没有则退而求其次打射程内的最远目标。
+     * @return 是否执行了攻击（无论游戏 API 返回什么，都不再做后续动作）
+     */
+    attackHostile(ids) {
+        if (!ids || !ids.length) {
+            return false;
+        }
+        let fallback;
+        for (const id of ids) {
+            const target = Game.getObjectById(id);
+            if (!target) {
+                continue;
+            }
+            if (this.pos.inRangeTo(target, TOWER_OPTIMAL_RANGE)) {
+                this.attack(target);
+                return true;
+            }
+            if (!fallback && this.pos.inRangeTo(target, TOWER_FALLOFF_RANGE)) {
+                fallback = target;
+            }
+        }
+        if (fallback) {
+            this.attack(fallback);
+            return true;
+        }
+        return false;
+    }
+    /**
+     * 治疗己方受伤 creep，缓存里已经按血量比例升序排好。
+     */
+    healCreep(ids) {
+        if (!ids || !ids.length) {
+            return false;
+        }
+        let fallback;
+        for (const id of ids) {
+            const target = Game.getObjectById(id);
+            // 扫描缓存有间隔，期间可能已经治满，避免继续浪费能量
+            if (!target || target.hits >= target.hitsMax) {
+                continue;
+            }
+            if (this.pos.inRangeTo(target, TOWER_OPTIMAL_RANGE)) {
+                this.heal(target);
+                return true;
+            }
+            if (!fallback && this.pos.inRangeTo(target, TOWER_FALLOFF_RANGE)) {
+                fallback = target;
+            }
+        }
+        if (fallback) {
+            this.heal(fallback);
+            return true;
+        }
+        return false;
+    }
+    repairNext(queue, room) {
+        while (queue.length) {
+            const id = queue[0];
+            const target = Game.getObjectById(id);
+            if (!target || target.hits >= target.hitsMax) {
+                room.dropRepairTarget(id);
+                continue;
+            }
+            const result = this.repair(target);
+            if (result == ERR_NOT_ENOUGH_ENERGY || result == OK) {
+                return;
+            }
+            // 目标已经不可维修（被摧毁/换手等），移出队列，避免下 tick 死循环
+            room.dropRepairTarget(id);
+            return;
+        }
+    }
+    canRepair() {
+        const energy = this.store.getUsedCapacity(RESOURCE_ENERGY);
+        return energy >= this.store.getCapacity(RESOURCE_ENERGY) * towerSetting.repairReserve;
+    }
+    /**
+     * 能量不足时通过 room 的 carryTask 申请补给；同一座塔按 refillInterval 节流，
+     * ensureEnergyCarryTask 内部还会按目标 id 去重，因此不会重复登记任务。
+     */
+    ensureEnergySupply(cache) {
+        const energy = this.store.getUsedCapacity(RESOURCE_ENERGY);
+        if (energy >= this.store.getCapacity(RESOURCE_ENERGY) * towerSetting.refillThreshold) {
+            return;
+        }
+        if (!cache.refillTicks) {
+            cache.refillTicks = {};
+        }
+        const lastTick = cache.refillTicks[this.id];
+        const now = Game.time;
+        if (lastTick !== undefined && now - lastTick < towerSetting.refillInterval) {
+            return;
+        }
+        cache.refillTicks[this.id] = now;
+        this.room.ensureEnergyCarryTask(this.id);
+    }
+}
+
 // import { LinkExtension, LinkConsole } from './link'
 // import ExtractorExtension from './extractor'
 // import RampartExtension from './rampart'
@@ -5475,7 +5740,7 @@ const assignMap = [
     [StructureController, ControllerExtension],
     [StructureSpawn, SpawnExtension],
     [StructureExtension, ExtensionExtension],
-    // [ StructureTower, TowerExtension ],
+    [StructureTower, TowerExtension],
     // [StructureExtractor, RampartExtension],
     // [ StructureLink, LinkExtension ],
     // [ StructureLink, LinkConsole ],
@@ -6608,6 +6873,7 @@ const loop = errorMapper(() => {
     // if (!(Game.time % 30)) {
     //     creepRecycle()
     // }
+    scanControl();
     structureControl();
     creepControl();
     roomControl();
@@ -6634,6 +6900,14 @@ function roomControl() {
         // Game.rooms[room].registEvent(testEvent(Game.rooms[room]))
         Game.rooms[room].runEvent();
         // Game.rooms[room].calSourceMap()
+    }
+}
+/**
+ * 先扫描房间环境，保证同 tick 内的塔读到的是最新缓存
+ */
+function scanControl() {
+    for (const roomName in Game.rooms) {
+        Game.rooms[roomName].scan();
     }
 }
 function structureControl() {
