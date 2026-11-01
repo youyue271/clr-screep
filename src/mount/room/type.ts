@@ -45,7 +45,18 @@ interface Room {
 
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
 
+    ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>): void
+
     refreshEnergyCarryTasks(): void
+
+    /**
+     * 房间环境扫描（敌对/受伤/维修队列），结果缓存在 global.room
+     */
+    scan(): void
+
+    dropRepairTarget(id: Id<Structure>): void
+
+    syncRepairTasks(): void
 
     /**
      * 初始化Spawn列表

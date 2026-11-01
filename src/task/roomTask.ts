@@ -1,5 +1,5 @@
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
-import {upgradeTaskCapacity} from "@/setting";
+import {repairPriority, repairSetting, upgradeTaskCapacity} from "@/setting";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -167,6 +167,22 @@ export function getCarryList(targetList:Structure[], resourceType:ResourceConsta
             targetId: item.id
         }
     })
+}
+
+/**
+ * 把扫描出的受损建筑转换成 worker 的维修任务。
+ * 容量固定为 1，避免同一个建筑上堆太多 worker。
+ */
+export function getRepairTasks(targetList: Structure[]): MyTask[] {
+    return targetList.map(item => ({
+        taskType: 'repairTask',
+        taskFunc: 'repairStructure',
+        priority: repairPriority(item.structureType),
+        capacity: repairSetting.capacity,
+        persistent: true,
+        targetId: item.id,
+        taskParam: [item.id],
+    }))
 }
 
 export function createBuildTask(targetList:ConstructionSite[]): MyTask[]{

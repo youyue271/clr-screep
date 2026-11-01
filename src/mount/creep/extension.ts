@@ -4,7 +4,9 @@ import log from "@/util/log";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
     'harvester': ['harvestTask'],
-    'worker': ['upgradeTask', 'constructTask'],
+    // 维修排在升级前，但维修任务总量受 repairSetting.maxTasks 限制，
+    // 只有少数 worker 会短暂转去维修，修完后自动回来升级
+    'worker': ['repairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
     'carrier': ['carryTask'],
 }
@@ -405,6 +407,34 @@ export default class CreepExtension extends Creep {
             return true
         }
         return false
+    }
+
+    repairStructure(targetId: Id<Structure>) {
+        const target = Game.getObjectById<Structure>(targetId)
+        if (!target || target.hits >= target.hitsMax) {
+            // 目标已经修好/消失，把任务移出队列
+            this.removeCurrentWorkFromQueue()
+            this.releaseCurrentWork()
+            return true
+        }
+        if (!this.store['energy']) {
+            this.changeRole('emptyWorker')
+            return true
+        }
+        this.say("🔧维修中")
+        const res = this.repair(target)
+        if (res == ERR_NOT_IN_RANGE) {
+            this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}})
+            return false
+        }
+        if (res == OK) {
+            // 继续修，下一 tick 检查是否已经满了
+            return false
+        }
+        // ERR_NOT_OWNER / ERR_INVALID_TARGET / ERR_RCL_NOT_ENOUGH 等，任务作废
+        this.removeCurrentWorkFromQueue()
+        this.releaseCurrentWork()
+        return true
     }
 
     buildConstructionSite(constructionId: Id<any>) {

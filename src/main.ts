@@ -14,6 +14,7 @@ export const loop = errorMapper(() => {
     // if (!(Game.time % 30)) {
     //     creepRecycle()
     // }
+    scanControl()
     structureControl()
     creepControl()
     roomControl()
@@ -40,6 +41,15 @@ function roomControl(){
         // Game.rooms[room].registEvent(testEvent(Game.rooms[room]))
         Game.rooms[room].runEvent()
         // Game.rooms[room].calSourceMap()
+    }
+}
+
+/**
+ * 先扫描房间环境，保证同 tick 内的塔读到的是最新缓存
+ */
+function scanControl() {
+    for (const roomName in Game.rooms) {
+        Game.rooms[roomName].scan()
     }
 }
 

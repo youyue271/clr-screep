@@ -1,8 +1,8 @@
 import {getBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {spawnTable} from "@/setting";
-import {construct, createBuildTask, getCarryList, harvestSource, upgrade} from "@/task/roomTask";
+import {repairSetting, spawnTable} from "@/setting";
+import {construct, createBuildTask, getCarryList, getRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 
 export default class RoomExtension extends Room {
@@ -38,6 +38,7 @@ export default class RoomExtension extends Room {
             'carryTask': {},
             'upgradeTask': {},
             'constructTask': {},
+            'repairTask': {},
             'energyTask': {},
             'spawnTask': {}
         }
@@ -213,6 +214,104 @@ export default class RoomExtension extends Room {
         }
         if (toAdd.length) {
             this.registTask(getCarryList(toAdd, RESOURCE_ENERGY))
+        }
+    }
+
+    /**
+     * 为单个结构登记补能任务（塔等主动请求补能用）。
+     * 已经存在指向该结构的 carryTask 时不重复登记。
+     */
+    ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>) {
+        if (!this.memory.creepTask) {
+            return
+        }
+        const structure = Game.getObjectById<AnyStoreStructure>(structureId)
+        if (!structure || !structure.store.getFreeCapacity(RESOURCE_ENERGY)) {
+            return
+        }
+        const carryBuckets = this.normalizeTaskBuckets('carryTask')
+        for (const key in carryBuckets) {
+            const bucket = carryBuckets[key]
+            if (!bucket || !bucket.length) {
+                continue
+            }
+            for (const task of bucket) {
+                if (!task) {
+                    continue
+                }
+                const taskTargetId = task.targetId ?? task.taskParam?.[0]
+                if (taskTargetId === structureId) {
+                    return
+                }
+            }
+        }
+        this.registTask(getCarryList([structure], RESOURCE_ENERGY))
+    }
+
+    /**
+     * 把扫描缓存里的维修队列同步成 worker 任务。
+     * 只补到 repairSetting.maxTasks 个，已经有人领取的任务不会重复登记。
+     * 由 scan() 每 repairScanInterval tick 调用一次。
+     */
+    syncRepairTasks() {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return
+        }
+        const cache = global.room[this.name]
+        if (!cache || !cache.repairQueue) {
+            return
+        }
+        const buckets = this.normalizeTaskBuckets('repairTask')
+        const knownTargets = new Set<string>()
+        for (const key in buckets) {
+            const queue = buckets[key]
+            if (!queue || !queue.length) {
+                delete buckets[key]
+                continue
+            }
+            const next: TaskEntity[] = []
+            for (const task of queue) {
+                if (!task) {
+                    continue
+                }
+                const targetId = task.targetId ?? task.taskParam?.[0]
+                const target = targetId ? Game.getObjectById<Structure>(targetId) : null
+                const reserved = !!(task.reservedBy && task.reservedBy.length)
+                // 已经修好/消失且没人在修的任务直接删掉；有人在修的等 worker 自己释放
+                if ((!target || target.hits >= target.hitsMax) && !reserved) {
+                    continue
+                }
+                if (targetId) {
+                    knownTargets.add(targetId)
+                }
+                next.push(task)
+            }
+            if (next.length) {
+                buckets[key] = next
+            } else {
+                delete buckets[key]
+            }
+        }
+        let taskCount = knownTargets.size
+        if (taskCount >= repairSetting.maxTasks) {
+            return
+        }
+        const toAdd: Structure[] = []
+        for (const id of cache.repairQueue) {
+            if (taskCount + toAdd.length >= repairSetting.maxTasks) {
+                break
+            }
+            if (knownTargets.has(id)) {
+                continue
+            }
+            const structure = Game.getObjectById<Structure>(id)
+            if (!structure) {
+                continue
+            }
+            toAdd.push(structure)
+        }
+        if (toAdd.length) {
+            this.registTask(getRepairTasks(toAdd))
         }
     }
 
