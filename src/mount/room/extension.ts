@@ -300,30 +300,27 @@ export default class RoomExtension extends Room {
                 // creep 已经死了
                 const memory = Memory.creeps[creepName]
                 const room = Game.rooms[memory.spawnRoom]
-                if (memory.currentWorkType) {
-                    const task = memory.currentWork
-                    if (task && task.reservedBy) {
-                        // 如果在干活， 就把自己去掉
-                        task.reservedBy = task.reservedBy.filter(item => item.name != creepName)
-                        if(task.reservedBy.length == 0 && !task.persistent){
-                            const buckets = room.normalizeTaskBuckets(memory.currentWorkType)
-                            for (const key in buckets) {
-                                const queue = buckets[key]
-                                if (!queue || !queue.length) {
-                                    continue
-                                }
-                                for (const task of queue) {
-                                    if (!task || !task.reservedBy) {
-                                        continue
-                                    }
+                // 从房间所有任务队列里清除该 creep 的预约（persistent 任务同样要清）
+                if (room && room.memory.creepTask) {
+                    for (const taskType in room.memory.creepTask) {
+                        const buckets = room.memory.creepTask[taskType] as TaskBucket
+                        if (!buckets) {
+                            continue
+                        }
+                        for (const key in buckets) {
+                            const queue = buckets[key]
+                            if (!queue || !queue.length) {
+                                continue
+                            }
+                            for (const task of queue) {
+                                if (task && task.reservedBy) {
                                     task.reservedBy = task.reservedBy.filter(item => item.name !== creepName)
                                 }
                             }
-                            room.memory.creepTask[memory.currentWorkType] = buckets
                         }
                     }
                 }
-                if (memory.spawnRoom && memory.reSpawn) {
+                if (room && memory.spawnRoom && memory.reSpawn) {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole
                     }
@@ -534,7 +531,7 @@ export default class RoomExtension extends Room {
     }
 
     getResources() {
-        if (!global.room[this.name].resources || !(Game.time % 100)) {
+        if ((Game.time % 10 === 1)) {
             let resources = this.find(FIND_DROPPED_RESOURCES)
             global.room[this.name].resources = resources
            
@@ -543,11 +540,20 @@ export default class RoomExtension extends Room {
     }
 
     getContainer(): Id<StructureContainer>[] {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {}
+        }
         if (!global.room[this.name].container) {
             global.room[this.name].containerCount = 0
-            const containers = []
-            for (const [x, y] of this.containerPos()) {
-                const structure = this.getPositionAt(x, y).lookFor(LOOK_STRUCTURES)[0]
+            const containers: Id<StructureContainer>[] = []
+            const posList = this.containerPos() ?? []
+            for (const [x, y] of posList) {
+                const pos = this.getPositionAt(x, y)
+                if (!pos) {
+                    continue
+                }
+                const structure = pos.lookFor(LOOK_STRUCTURES)
+                    .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
                 if (structure) {
                     containers.push(structure.id)
                 }
