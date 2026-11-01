@@ -56,6 +56,8 @@ interface Room {
 
     dropRepairTarget(id: Id<Structure>): void
 
+    syncRepairTasks(): void
+
     /**
      * 初始化Spawn列表
      */

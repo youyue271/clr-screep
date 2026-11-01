@@ -33,5 +33,6 @@ type TaskType = 'workTask'
     | 'carryTask'
     | 'upgradeTask'
     | "constructTask"
+    | 'repairTask'
     | 'energyTask'
     | 'spawnTask'

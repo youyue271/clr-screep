@@ -1,20 +1,4 @@
-import {towerSetting} from "@/setting";
-
-const repairPriorityMap: { [type: string]: number } = {
-    [STRUCTURE_SPAWN]: 1,
-    [STRUCTURE_EXTENSION]: 1,
-    [STRUCTURE_TOWER]: 1,
-    [STRUCTURE_CONTAINER]: 1,
-    [STRUCTURE_STORAGE]: 1,
-    [STRUCTURE_LINK]: 1,
-    [STRUCTURE_TERMINAL]: 1,
-    [STRUCTURE_LAB]: 1,
-    [STRUCTURE_ROAD]: 3,
-}
-
-function repairPriority(type: StructureConstant): number {
-    return repairPriorityMap[type] ?? 2
-}
+import {repairPriority, towerSetting} from "@/setting";
 
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
@@ -39,6 +23,8 @@ export default class RoomScanExtension extends Room {
             || now - cache.lastRepairScan >= towerSetting.repairScanInterval) {
             cache.lastRepairScan = now
             this.refreshRepairQueue(cache)
+            // 维修队列刷新后同步 worker 的维修任务，次数与扫描同频（15 tick 一次）
+            this.syncRepairTasks()
         }
     }
 
@@ -74,6 +60,10 @@ export default class RoomScanExtension extends Room {
                 if (object.structureType == STRUCTURE_CONTROLLER
                     || object.structureType == STRUCTURE_WALL
                     || object.structureType == STRUCTURE_RAMPART) {
+                    return false
+                }
+                // 不维修其他玩家的建筑；中立建筑（道路/容器）没有 owner，正常纳入
+                if (object.owner && !object.my) {
                     return false
                 }
                 return object.hits < object.hitsMax * towerSetting.repairThreshold

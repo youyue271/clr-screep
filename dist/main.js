@@ -3255,6 +3255,31 @@ const spawnTable = {
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 };
 const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1];
+const repairSetting = {
+    // 同时存在的维修任务上限。每个任务容量 1，避免大量 worker 被维修吸走
+    maxTasks: 3,
+    // 单个维修任务允许几个 creep 同时修
+    capacity: 1,
+};
+/**
+ * 维修优先级：数值越小越先被 worker 领取
+ * 1 关键结构 / 2 其他结构 / 3 道路
+ */
+const repairPriorityMap = {
+    [STRUCTURE_SPAWN]: 1,
+    [STRUCTURE_EXTENSION]: 1,
+    [STRUCTURE_TOWER]: 1,
+    [STRUCTURE_CONTAINER]: 1,
+    [STRUCTURE_STORAGE]: 1,
+    [STRUCTURE_LINK]: 1,
+    [STRUCTURE_TERMINAL]: 1,
+    [STRUCTURE_LAB]: 1,
+    [STRUCTURE_ROAD]: 3,
+};
+function repairPriority(type) {
+    var _a;
+    return (_a = repairPriorityMap[type]) !== null && _a !== void 0 ? _a : 2;
+}
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
     threatScanInterval: 5,
@@ -3429,6 +3454,21 @@ function getCarryList(targetList, resourceType) {
         };
     });
 }
+/**
+ * 把扫描出的受损建筑转换成 worker 的维修任务。
+ * 容量固定为 1，避免同一个建筑上堆太多 worker。
+ */
+function getRepairTasks(targetList) {
+    return targetList.map(item => ({
+        taskType: 'repairTask',
+        taskFunc: 'repairStructure',
+        priority: repairPriority(item.structureType),
+        capacity: repairSetting.capacity,
+        persistent: true,
+        targetId: item.id,
+        taskParam: [item.id],
+    }));
+}
 function createBuildTask(targetList) {
     return targetList.map(item => {
         let constructionType = item.structureType;
@@ -3522,7 +3562,9 @@ const loggerInstance = new logger();
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 const roleToTask = {
     'harvester': ['harvestTask'],
-    'worker': ['upgradeTask', 'constructTask'],
+    // 维修排在升级前，但维修任务总量受 repairSetting.maxTasks 限制，
+    // 只有少数 worker 会短暂转去维修，修完后自动回来升级
+    'worker': ['repairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
     'carrier': ['carryTask'],
 };
@@ -3930,6 +3972,33 @@ class CreepExtension extends Creep {
             return true;
         }
         return false;
+    }
+    repairStructure(targetId) {
+        const target = Game.getObjectById(targetId);
+        if (!target || target.hits >= target.hitsMax) {
+            // 目标已经修好/消失，把任务移出队列
+            this.removeCurrentWorkFromQueue();
+            this.releaseCurrentWork();
+            return true;
+        }
+        if (!this.store['energy']) {
+            this.changeRole('emptyWorker');
+            return true;
+        }
+        this.say("🔧维修中");
+        const res = this.repair(target);
+        if (res == ERR_NOT_IN_RANGE) {
+            this.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' } });
+            return false;
+        }
+        if (res == OK) {
+            // 继续修，下一 tick 检查是否已经满了
+            return false;
+        }
+        // ERR_NOT_OWNER / ERR_INVALID_TARGET / ERR_RCL_NOT_ENOUGH 等，任务作废
+        this.removeCurrentWorkFromQueue();
+        this.releaseCurrentWork();
+        return true;
     }
     buildConstructionSite(constructionId) {
         if (this.store['energy']) {
@@ -4352,6 +4421,7 @@ class RoomExtension extends Room {
             'carryTask': {},
             'upgradeTask': {},
             'constructTask': {},
+            'repairTask': {},
             'energyTask': {},
             'spawnTask': {}
         };
@@ -4554,6 +4624,74 @@ class RoomExtension extends Room {
             }
         }
         this.registTask(getCarryList([structure], RESOURCE_ENERGY));
+    }
+    /**
+     * 把扫描缓存里的维修队列同步成 worker 任务。
+     * 只补到 repairSetting.maxTasks 个，已经有人领取的任务不会重复登记。
+     * 由 scan() 每 repairScanInterval tick 调用一次。
+     */
+    syncRepairTasks() {
+        var _a, _b;
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return;
+        }
+        const cache = global.room[this.name];
+        if (!cache || !cache.repairQueue) {
+            return;
+        }
+        const buckets = this.normalizeTaskBuckets('repairTask');
+        const knownTargets = new Set();
+        for (const key in buckets) {
+            const queue = buckets[key];
+            if (!queue || !queue.length) {
+                delete buckets[key];
+                continue;
+            }
+            const next = [];
+            for (const task of queue) {
+                if (!task) {
+                    continue;
+                }
+                const targetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
+                const target = targetId ? Game.getObjectById(targetId) : null;
+                const reserved = !!(task.reservedBy && task.reservedBy.length);
+                // 已经修好/消失且没人在修的任务直接删掉；有人在修的等 worker 自己释放
+                if ((!target || target.hits >= target.hitsMax) && !reserved) {
+                    continue;
+                }
+                if (targetId) {
+                    knownTargets.add(targetId);
+                }
+                next.push(task);
+            }
+            if (next.length) {
+                buckets[key] = next;
+            }
+            else {
+                delete buckets[key];
+            }
+        }
+        let taskCount = knownTargets.size;
+        if (taskCount >= repairSetting.maxTasks) {
+            return;
+        }
+        const toAdd = [];
+        for (const id of cache.repairQueue) {
+            if (taskCount + toAdd.length >= repairSetting.maxTasks) {
+                break;
+            }
+            if (knownTargets.has(id)) {
+                continue;
+            }
+            const structure = Game.getObjectById(id);
+            if (!structure) {
+                continue;
+            }
+            toAdd.push(structure);
+        }
+        if (toAdd.length) {
+            this.registTask(getRepairTasks(toAdd));
+        }
     }
     /**
      * 临时函数
@@ -5380,21 +5518,6 @@ class RoomExtension extends Room {
     }
 }
 
-const repairPriorityMap = {
-    [STRUCTURE_SPAWN]: 1,
-    [STRUCTURE_EXTENSION]: 1,
-    [STRUCTURE_TOWER]: 1,
-    [STRUCTURE_CONTAINER]: 1,
-    [STRUCTURE_STORAGE]: 1,
-    [STRUCTURE_LINK]: 1,
-    [STRUCTURE_TERMINAL]: 1,
-    [STRUCTURE_LAB]: 1,
-    [STRUCTURE_ROAD]: 3,
-};
-function repairPriority(type) {
-    var _a;
-    return (_a = repairPriorityMap[type]) !== null && _a !== void 0 ? _a : 2;
-}
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
  * 塔每 tick 只做 O(1) 的缓存读取，避免所有塔重复 find。
@@ -5417,6 +5540,8 @@ class RoomScanExtension extends Room {
             || now - cache.lastRepairScan >= towerSetting.repairScanInterval) {
             cache.lastRepairScan = now;
             this.refreshRepairQueue(cache);
+            // 维修队列刷新后同步 worker 的维修任务，次数与扫描同频（15 tick 一次）
+            this.syncRepairTasks();
         }
     }
     refreshThreat(cache) {
@@ -5449,6 +5574,10 @@ class RoomScanExtension extends Room {
                 if (object.structureType == STRUCTURE_CONTROLLER
                     || object.structureType == STRUCTURE_WALL
                     || object.structureType == STRUCTURE_RAMPART) {
+                    return false;
+                }
+                // 不维修其他玩家的建筑；中立建筑（道路/容器）没有 owner，正常纳入
+                if (object.owner && !object.my) {
                     return false;
                 }
                 return object.hits < object.hitsMax * towerSetting.repairThreshold;
