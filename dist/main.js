@@ -3279,7 +3279,8 @@ function harvestSource(room) {
         tasks.push({
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
-            taskParam: [sourceId, targetPos.x, targetPos.y]
+            // 找不到 source 旁的 container / 工地时退化为直接走到 source 旁边采集
+            taskParam: targetPos ? [sourceId, targetPos.x, targetPos.y] : [sourceId, null, null]
         });
     }
     return tasks;
@@ -3337,7 +3338,6 @@ function getResourceEnergy(room) {
 }
 function getStorageEnergy(room) {
     const storage = room.storage;
-    console.log(room.storage);
     if (!storage) {
         return [];
     }
@@ -3417,13 +3417,17 @@ function createBuildTask(targetList) {
     return targetList.map(item => {
         let constructionType = item.structureType;
         let priority = 3;
-        if (constructionType in [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER]) {
+        // 注意：这里必须用 includes，in 判断的是数组下标而不是元素
+        const priority1Structures = [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER];
+        const priority2Structures = [STRUCTURE_TOWER];
+        const priority4Structures = [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL];
+        if (priority1Structures.includes(constructionType)) {
             priority = 1;
         }
-        else if (constructionType in [STRUCTURE_TOWER]) {
+        else if (priority2Structures.includes(constructionType)) {
             priority = 2;
         }
-        else if (constructionType in [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]) {
+        else if (priority4Structures.includes(constructionType)) {
             priority = 4;
         }
         return {
@@ -3551,7 +3555,7 @@ class CreepExtension extends Creep {
         if (!room.memory.creepTask) {
             return false;
         }
-        console.log(this.memory.role);
+        // console.log(this.memory.role)
         if (this.memory.role === 'emptyWorker' && room.memory.lastEnergyTaskTick !== Game.time) {
             const energyBuckets = room.normalizeTaskBuckets('energyTask');
             let hasEnergyTask = false;
@@ -3590,6 +3594,8 @@ class CreepExtension extends Creep {
                     if (!task.reservedBy) {
                         task.reservedBy = [];
                     }
+                    // 清理已经死掉的 creep 留下的预约，否则 persistent 任务会被永久占满
+                    task.reservedBy = task.reservedBy.filter(item => item && Game.creeps[item.name]);
                     const existing = task.reservedBy.find(item => item.name === this.name);
                     if (existing) {
                         existing.lastTick = now;
@@ -3619,9 +3625,30 @@ class CreepExtension extends Creep {
         return true;
     }
     releaseCurrentWork() {
+        var _a, _b;
         const task = this.memory.currentWork;
+        const taskType = this.memory.currentWorkType;
         if (task && task.reservedBy) {
             task.reservedBy = task.reservedBy.filter(item => item.name !== this.name);
+        }
+        if (task && taskType) {
+            const buckets = this.room.normalizeTaskBuckets(taskType);
+            const taskId = task.id;
+            const taskTargetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
+            for (const key in buckets) {
+                const queue = buckets[key];
+                if (!queue || !queue.length) {
+                    continue;
+                }
+                for (const item of queue) {
+                    if (!item || !item.reservedBy) {
+                        continue;
+                    }
+                    if (item.id === taskId || (taskTargetId && item.targetId === taskTargetId)) {
+                        item.reservedBy = item.reservedBy.filter(entry => entry.name !== this.name);
+                    }
+                }
+            }
         }
         this.memory.working = false;
         this.memory.currentWork = undefined;
@@ -3674,6 +3701,16 @@ class CreepExtension extends Creep {
             return true;
         }
         this.say("⛏️007采矿");
+        // 没有 container / 工地位置时退化为直接贴着 source 采集
+        if (containerPosX === undefined || ContainerPosY === undefined) {
+            if (!this.pos.inRangeTo(source, 1)) {
+                this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } });
+            }
+            else {
+                this.harvest(source);
+            }
+            return false;
+        }
         if (!this.pos.inRangeTo(containerPosX, ContainerPosY, 0)) {
             this.moveTo(containerPosX, ContainerPosY, { visualizePathStyle: { stroke: '#ffffff' } });
         }
@@ -3683,7 +3720,7 @@ class CreepExtension extends Creep {
         return false;
     }
     getEnergyFromStructure(id, energyType) {
-        var _a;
+        var _a, _b, _c;
         const structure = Game.getObjectById(id);
         if (!structure) {
             this.removeCurrentWorkFromQueue();
@@ -3699,13 +3736,23 @@ class CreepExtension extends Creep {
             return true;
         }
         this.say("🫳偷拿资源");
+        if (!this.store.getFreeCapacity()) {
+            const targetRole = (_b = this.memory.oldRole) !== null && _b !== void 0 ? _b : this.memory.role;
+            if (targetRole) {
+                this.changeRole(targetRole);
+            }
+            else {
+                this.remember();
+            }
+            delete this.memory.oldRole;
+            return true;
+        }
         const res = this.withdraw(structure, energyType);
         if (res == ERR_NOT_IN_RANGE) {
             this.moveTo(structure, { visualizePathStyle: { stroke: '#ffff00' } });
             return false;
         }
         else if (res == OK) {
-            this.releaseCurrentWork();
             const targetRole = this.memory.oldRole;
             if (targetRole) {
                 this.changeRole(targetRole);
@@ -3718,6 +3765,17 @@ class CreepExtension extends Creep {
         }
         else if (res == ERR_NOT_ENOUGH_RESOURCES) {
             this.releaseCurrentWork();
+            return true;
+        }
+        else if (res == ERR_FULL) {
+            const targetRole = (_c = this.memory.oldRole) !== null && _c !== void 0 ? _c : this.memory.role;
+            if (targetRole) {
+                this.changeRole(targetRole);
+            }
+            else {
+                this.remember();
+            }
+            delete this.memory.oldRole;
             return true;
         }
         return false;
@@ -4531,30 +4589,27 @@ class RoomExtension extends Room {
                 // creep 已经死了
                 const memory = Memory.creeps[creepName];
                 const room = Game.rooms[memory.spawnRoom];
-                if (memory.currentWorkType) {
-                    const task = memory.currentWork;
-                    if (task && task.reservedBy) {
-                        // 如果在干活， 就把自己去掉
-                        task.reservedBy = task.reservedBy.filter(item => item.name != creepName);
-                        if (task.reservedBy.length == 0 && !task.persistent) {
-                            const buckets = room.normalizeTaskBuckets(memory.currentWorkType);
-                            for (const key in buckets) {
-                                const queue = buckets[key];
-                                if (!queue || !queue.length) {
-                                    continue;
-                                }
-                                for (const task of queue) {
-                                    if (!task || !task.reservedBy) {
-                                        continue;
-                                    }
+                // 从房间所有任务队列里清除该 creep 的预约（persistent 任务同样要清）
+                if (room && room.memory.creepTask) {
+                    for (const taskType in room.memory.creepTask) {
+                        const buckets = room.memory.creepTask[taskType];
+                        if (!buckets) {
+                            continue;
+                        }
+                        for (const key in buckets) {
+                            const queue = buckets[key];
+                            if (!queue || !queue.length) {
+                                continue;
+                            }
+                            for (const task of queue) {
+                                if (task && task.reservedBy) {
                                     task.reservedBy = task.reservedBy.filter(item => item.name !== creepName);
                                 }
                             }
-                            room.memory.creepTask[memory.currentWorkType] = buckets;
                         }
                     }
                 }
-                if (memory.spawnRoom && memory.reSpawn) {
+                if (room && memory.spawnRoom && memory.reSpawn) {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole;
                     }
@@ -4750,18 +4805,28 @@ class RoomExtension extends Room {
         this.visualizeMap(map);
     }
     getResources() {
-        if (!global.room[this.name].resources) {
+        if ((Game.time % 10 === 1)) {
             let resources = this.find(FIND_DROPPED_RESOURCES);
             global.room[this.name].resources = resources;
         }
         return global.room[this.name].resources;
     }
     getContainer() {
+        var _a;
+        if (!global.room[this.name]) {
+            global.room[this.name] = {};
+        }
         if (!global.room[this.name].container) {
             global.room[this.name].containerCount = 0;
             const containers = [];
-            for (const [x, y] of this.containerPos()) {
-                const structure = this.getPositionAt(x, y).lookFor(LOOK_STRUCTURES)[0];
+            const posList = (_a = this.containerPos()) !== null && _a !== void 0 ? _a : [];
+            for (const [x, y] of posList) {
+                const pos = this.getPositionAt(x, y);
+                if (!pos) {
+                    continue;
+                }
+                const structure = pos.lookFor(LOOK_STRUCTURES)
+                    .find(item => item.structureType === STRUCTURE_CONTAINER);
                 if (structure) {
                     containers.push(structure.id);
                 }
@@ -4788,85 +4853,79 @@ class RoomExtension extends Room {
         }
     }
     containerPos() {
-        if (!this.memory.containerPos) {
-            const containerPos = [];
-            this.sources().forEach(item => {
-                var _a;
-                const source = Game.getObjectById(item);
-                if (!source) {
-                    return;
-                }
-                // console.log(source.pos)
-                // 先找有没有以前的container
-                let containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, { filter: { structureType: STRUCTURE_CONTAINER } });
-                // console.log(containers.length)
-                if (containers.length > 0) {
-                    // console.log(containers[0].pos.x, containers[0].pos.y)
-                    containerPos.push([containers[0].pos.x, containers[0].pos.y]);
-                }
-                else {
-                    // 在找有没有新的constructionSite
-                    let constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, { filter: { structureType: STRUCTURE_CONTAINER } });
-                    // console.log(constructionSites)
-                    if (constructionSites.length > 0) {
-                        containerPos.push([constructionSites[0].pos.x, constructionSites[0].pos.y]);
-                    }
-                    else {
-                        // 新建constructionSite
-                        const direction = [
-                            [-1, -1], [-1, 0], [-1, 1],
-                            [0, -1], [0, 1],
-                            [1, -1], [1, 0], [1, 1]
-                        ];
-                        const containerPosList = [];
-                        for (const [xx, yy] of direction) {
-                            const x = xx + source.pos.x;
-                            const y = yy + source.pos.y;
-                            const pos = new RoomPosition(x, y, this.name);
-                            if (pos.lookFor(LOOK_TERRAIN)[0] != 'wall') {
-                                const targetPos = this.getPositionAt(x, y);
-                                if (targetPos) {
-                                    containerPosList.push(targetPos);
-                                }
-                            }
-                        }
-                        if (!containerPosList.length) {
-                            return;
-                        }
-                        let finalPos = containerPosList[0];
-                        let anchorPos = null;
-                        if (this.memory.roomPlanType === 2 && ((_a = this.memory.plan2Pos) === null || _a === void 0 ? void 0 : _a.core)) {
-                            anchorPos = this.memory.plan2Pos.core;
-                        }
-                        else if (this.memory.plan1Pos) {
-                            anchorPos = this.memory.plan1Pos;
-                        }
-                        const planPos = anchorPos
-                            ? this.getPositionAt(anchorPos[0], anchorPos[1])
-                            : null;
-                        if (planPos) {
-                            const bestPos = planPos.findClosestByPath(containerPosList, { algorithm: "astar" });
-                            if (bestPos) {
-                                finalPos = bestPos;
-                            }
-                        }
-                        containerPos.push([finalPos.x, finalPos.y]);
-                        const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER);
-                        if (createResult == OK) {
-                            const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0];
-                            if (site) {
-                                this.registTask(construct(site.id));
-                            }
-                        }
+        var _a;
+        const cached = (_a = this.memory.containerPos) !== null && _a !== void 0 ? _a : [];
+        const sources = this.sources();
+        const containerPos = [];
+        sources.forEach((item, index) => {
+            var _a;
+            const source = Game.getObjectById(item);
+            if (!source) {
+                return;
+            }
+            const containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, { filter: { structureType: STRUCTURE_CONTAINER } });
+            if (containers.length > 0) {
+                containerPos.push([containers[0].pos.x, containers[0].pos.y]);
+                return;
+            }
+            const constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, { filter: { structureType: STRUCTURE_CONTAINER } });
+            if (constructionSites.length > 0) {
+                containerPos.push([constructionSites[0].pos.x, constructionSites[0].pos.y]);
+                return;
+            }
+            const cachedPos = cached[index];
+            if (cachedPos) {
+                containerPos.push([cachedPos[0], cachedPos[1]]);
+                return;
+            }
+            const direction = [
+                [-1, -1], [-1, 0], [-1, 1],
+                [0, -1], [0, 1],
+                [1, -1], [1, 0], [1, 1]
+            ];
+            const containerPosList = [];
+            for (const [xx, yy] of direction) {
+                const x = xx + source.pos.x;
+                const y = yy + source.pos.y;
+                const pos = new RoomPosition(x, y, this.name);
+                if (pos.lookFor(LOOK_TERRAIN)[0] != 'wall') {
+                    const targetPos = this.getPositionAt(x, y);
+                    if (targetPos) {
+                        containerPosList.push(targetPos);
                     }
                 }
-            });
-            this.memory.containerPos = containerPos;
-            return containerPos;
-        }
-        else {
-            return this.memory.containerPos;
-        }
+            }
+            if (!containerPosList.length) {
+                return;
+            }
+            let finalPos = containerPosList[0];
+            let anchorPos = null;
+            if (this.memory.roomPlanType === 2 && ((_a = this.memory.plan2Pos) === null || _a === void 0 ? void 0 : _a.core)) {
+                anchorPos = this.memory.plan2Pos.core;
+            }
+            else if (this.memory.plan1Pos) {
+                anchorPos = this.memory.plan1Pos;
+            }
+            const planPos = anchorPos
+                ? this.getPositionAt(anchorPos[0], anchorPos[1])
+                : null;
+            if (planPos) {
+                const bestPos = planPos.findClosestByPath(containerPosList, { algorithm: "astar" });
+                if (bestPos) {
+                    finalPos = bestPos;
+                }
+            }
+            containerPos.push([finalPos.x, finalPos.y]);
+            const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER);
+            if (createResult == OK) {
+                const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0];
+                if (site) {
+                    this.registTask(construct(site.id));
+                }
+            }
+        });
+        this.memory.containerPos = containerPos;
+        return containerPos;
     }
     energyList() {
         if (this.memory.energyList) {
