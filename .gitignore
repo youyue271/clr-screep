@@ -1,3 +1,5 @@
 .idea
 .secret.json
+node_modules/
 node_modules/.cache/
+dist/main.js.map.js
