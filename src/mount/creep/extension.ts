@@ -56,7 +56,7 @@ export default class CreepExtension extends Creep {
         if (!room.memory.creepTask) {
             return false
         }
-        console.log(this.memory.role)
+        // console.log(this.memory.role)
         if (this.memory.role === 'emptyWorker' && room.memory.lastEnergyTaskTick !== Game.time) {
             const energyBuckets = room.normalizeTaskBuckets('energyTask')
             let hasEnergyTask = false
@@ -95,6 +95,8 @@ export default class CreepExtension extends Creep {
                     if (!task.reservedBy) {
                         task.reservedBy = []
                     }
+                    // 清理已经死掉的 creep 留下的预约，否则 persistent 任务会被永久占满
+                    task.reservedBy = task.reservedBy.filter(item => item && Game.creeps[item.name])
                     const existing = task.reservedBy.find(item => item.name === this.name)
                     if (existing) {
                         existing.lastTick = now
@@ -126,8 +128,28 @@ export default class CreepExtension extends Creep {
 
     releaseCurrentWork() {
         const task = this.memory.currentWork
+        const taskType = this.memory.currentWorkType
         if (task && task.reservedBy) {
             task.reservedBy = task.reservedBy.filter(item => item.name !== this.name)
+        }
+        if (task && taskType) {
+            const buckets = this.room.normalizeTaskBuckets(taskType)
+            const taskId = task.id
+            const taskTargetId = task.targetId ?? task.taskParam?.[0]
+            for (const key in buckets) {
+                const queue = buckets[key]
+                if (!queue || !queue.length) {
+                    continue
+                }
+                for (const item of queue) {
+                    if (!item || !item.reservedBy) {
+                        continue
+                    }
+                    if (item.id === taskId || (taskTargetId && item.targetId === taskTargetId)) {
+                        item.reservedBy = item.reservedBy.filter(entry => entry.name !== this.name)
+                    }
+                }
+            }
         }
         this.memory.working = false
         this.memory.currentWork = undefined
@@ -175,12 +197,22 @@ export default class CreepExtension extends Creep {
         }
     }
 
-    harvestSource(sourceId: Id<any>, containerPosX: number, ContainerPosY: number): boolean {
+    harvestSource(sourceId: Id<any>, containerPosX?: number, ContainerPosY?: number): boolean {
         const source: Source = Game.getObjectById(sourceId)
         if (!source) {
             return true
         }
         this.say("⛏️007采矿")
+
+        // 没有 container / 工地位置时退化为直接贴着 source 采集
+        if (containerPosX === undefined || ContainerPosY === undefined) {
+            if (!this.pos.inRangeTo(source, 1)) {
+                this.moveTo(source, {visualizePathStyle: {stroke: '#ffffff'}})
+            } else {
+                this.harvest(source)
+            }
+            return false
+        }
 
         if (!this.pos.inRangeTo(containerPosX, ContainerPosY, 0)) {
             this.moveTo(containerPosX, ContainerPosY, {visualizePathStyle: {stroke: '#ffffff'}})
