@@ -224,14 +224,25 @@ export default class CreepExtension extends Creep {
         if (!source) {
             return true
         }
-        // 身上满了先卸货：能量必须进入 container（没有就掉在地上给 carrier 捡），
-        // 否则 container 永远存不住能量，整个能量链就断了
-        if (!this.store.getFreeCapacity(RESOURCE_ENERGY)) {
-            this.say("📦卸货")
-            this.dumpEnergy()
+        this.say("⛏️007采矿")
+
+        // 引擎的 harvest 溢出会先填进同一格的 container（_create-energy），
+        // 所以站在 container 上持续 harvest 即可；transfer 会白占一个采集 tick。
+        const standingOnContainer = this.pos.lookFor(LOOK_STRUCTURES)
+            .some(item => item.structureType === STRUCTURE_CONTAINER)
+        if (standingOnContainer && this.pos.inRangeTo(source, 1)) {
+            this.harvest(source)
             return false
         }
-        this.say("⛏️007采矿")
+
+        // taskParam 里的坐标可能是 container 建成前缓存的旧位置，优先找矿点旁真实的 container
+        const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
+            filter: (object: any) => object.structureType === STRUCTURE_CONTAINER
+        })[0] as StructureContainer | undefined
+        if (container) {
+            this.moveTo(container.pos, {visualizePathStyle: {stroke: '#ffffff'}})
+            return false
+        }
 
         // 没有 container / 工地位置时退化为直接贴着 source 采集
         if (containerPosX === undefined || ContainerPosY === undefined) {
@@ -249,23 +260,6 @@ export default class CreepExtension extends Creep {
             this.harvest(source)
         }
         return false
-    }
-
-    /**
-     * 把身上的能量交给脚下的 container；没有 container 或已满就丢在地上。
-     * container 和掉落物都会被 carrier / emptyWorker 的 energyTask 捡走。
-     */
-    private dumpEnergy() {
-        if (!this.store.getUsedCapacity(RESOURCE_ENERGY)) {
-            return
-        }
-        const container = this.pos.lookFor(LOOK_STRUCTURES)
-            .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
-        if (container && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            this.transfer(container, RESOURCE_ENERGY)
-            return
-        }
-        this.drop(RESOURCE_ENERGY)
     }
 
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant) {

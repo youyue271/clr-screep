@@ -3,12 +3,12 @@ export const spawnPercent = 0.6
 export const spawnTable: { [role in Role]: number[] } = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester':    [0, 0, 0, 0, 0, 0, 0, 0, 0], // harvester 根据房间source数量动态调整
-    'carrier':      [0, 1, 3, 5, 5, 5, 5, 5, 5],
-    'worker':       [0, 11, 11, 9, 9, 7, 7, 7, 3],
+    'carrier':      [0, 1, 2, 5, 5, 5, 5, 5, 5],
+    'worker':       [0, 3, 6, 9, 9, 7, 7, 7, 3],
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 }
 
-export const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1]
+export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
 
 export const repairSetting = {
     // 同时存在的维修任务上限。每个任务容量 1，避免大量 worker 被维修吸走

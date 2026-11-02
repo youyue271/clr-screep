@@ -96,22 +96,17 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
  //  * @returns
  //  */
 const getHarvesterBody = function (room: Room) {
-    const level = room.controller ? room.controller.level : 1
-    // RCL1 还没有 container，采集溢出的能量由引擎自动掉在地上，carrier 去捡
-    if (level < 2) {
-        return calcBodyPart({[CARRY]: 1, [WORK]: 2, [MOVE]: 1})
-    }
-    // 有 container 时 CARRY = 2 x WORK：一次 harvest 正好装满，下一 tick 整包倒进 container。
-    // 如果 CARRY 比采集量小，harvest 会立刻溢出并掉在地上，container 永远存不住能量。
-    let num = Math.floor(room.energyCapacityAvailable / 550)
+    // CARRY 保持最小：站在 container 上采集时，溢出的能量由引擎自动填进脚下 container，
+    // 不需要转身卸货，采集不会被打断。
+    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent)
+    let num = Math.floor((energyBase - 50) / 250)
     if (num > 3) {
         num = 3
     }
     if (num <= 0) {
-        // 容量还不够一个完整单元时退回最小体型（250 能量）
-        return calcBodyPart({[CARRY]: 2, [WORK]: 1, [MOVE]: 2})
+        num = 1
     }
-    return calcBodyPart({[CARRY]: 4 * num, [WORK]: 2 * num, [MOVE]: 3 * num})
+    return calcBodyPart({[CARRY]: 1, [WORK]: 2 * num, [MOVE]: num})
 }
 
 const getCarrierBody = function (room: Room) {

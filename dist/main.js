@@ -3250,11 +3250,11 @@ const spawnPercent = 0.6;
 const spawnTable = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
-    'carrier': [0, 1, 3, 5, 5, 5, 5, 5, 5],
-    'worker': [0, 11, 11, 9, 9, 7, 7, 7, 3],
+    'carrier': [0, 1, 2, 5, 5, 5, 5, 5, 5],
+    'worker': [0, 3, 6, 9, 9, 7, 7, 7, 3],
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 };
-const upgradeTaskCapacity = [0, 5, 5, 5, 5, 4, 4, 4, 1];
+const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1];
 const repairSetting = {
     // 同时存在的维修任务上限。每个任务容量 1，避免大量 worker 被维修吸走
     maxTasks: 3,
@@ -3828,14 +3828,23 @@ class CreepExtension extends Creep {
         if (!source) {
             return true;
         }
-        // 身上满了先卸货：能量必须进入 container（没有就掉在地上给 carrier 捡），
-        // 否则 container 永远存不住能量，整个能量链就断了
-        if (!this.store.getFreeCapacity(RESOURCE_ENERGY)) {
-            this.say("📦卸货");
-            this.dumpEnergy();
+        this.say("⛏️007采矿");
+        // 引擎的 harvest 溢出会先填进同一格的 container（_create-energy），
+        // 所以站在 container 上持续 harvest 即可；transfer 会白占一个采集 tick。
+        const standingOnContainer = this.pos.lookFor(LOOK_STRUCTURES)
+            .some(item => item.structureType === STRUCTURE_CONTAINER);
+        if (standingOnContainer && this.pos.inRangeTo(source, 1)) {
+            this.harvest(source);
             return false;
         }
-        this.say("⛏️007采矿");
+        // taskParam 里的坐标可能是 container 建成前缓存的旧位置，优先找矿点旁真实的 container
+        const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
+            filter: (object) => object.structureType === STRUCTURE_CONTAINER
+        })[0];
+        if (container) {
+            this.moveTo(container.pos, { visualizePathStyle: { stroke: '#ffffff' } });
+            return false;
+        }
         // 没有 container / 工地位置时退化为直接贴着 source 采集
         if (containerPosX === undefined || ContainerPosY === undefined) {
             if (!this.pos.inRangeTo(source, 1)) {
@@ -3853,22 +3862,6 @@ class CreepExtension extends Creep {
             this.harvest(source);
         }
         return false;
-    }
-    /**
-     * 把身上的能量交给脚下的 container；没有 container 或已满就丢在地上。
-     * container 和掉落物都会被 carrier / emptyWorker 的 energyTask 捡走。
-     */
-    dumpEnergy() {
-        if (!this.store.getUsedCapacity(RESOURCE_ENERGY)) {
-            return;
-        }
-        const container = this.pos.lookFor(LOOK_STRUCTURES)
-            .find(item => item.structureType === STRUCTURE_CONTAINER);
-        if (container && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            this.transfer(container, RESOURCE_ENERGY);
-            return;
-        }
-        this.drop(RESOURCE_ENERGY);
     }
     getEnergyFromStructure(id, energyType) {
         var _a, _b, _c;
@@ -4230,22 +4223,17 @@ function getBody(role, room) {
  //  * @returns
  //  */
 const getHarvesterBody = function (room) {
-    const level = room.controller ? room.controller.level : 1;
-    // RCL1 还没有 container，采集溢出的能量由引擎自动掉在地上，carrier 去捡
-    if (level < 2) {
-        return calcBodyPart({ [CARRY]: 1, [WORK]: 2, [MOVE]: 1 });
-    }
-    // 有 container 时 CARRY = 2 x WORK：一次 harvest 正好装满，下一 tick 整包倒进 container。
-    // 如果 CARRY 比采集量小，harvest 会立刻溢出并掉在地上，container 永远存不住能量。
-    let num = Math.floor(room.energyCapacityAvailable / 550);
+    // CARRY 保持最小：站在 container 上采集时，溢出的能量由引擎自动填进脚下 container，
+    // 不需要转身卸货，采集不会被打断。
+    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent);
+    let num = Math.floor((energyBase - 50) / 250);
     if (num > 3) {
         num = 3;
     }
     if (num <= 0) {
-        // 容量还不够一个完整单元时退回最小体型（250 能量）
-        return calcBodyPart({ [CARRY]: 2, [WORK]: 1, [MOVE]: 2 });
+        num = 1;
     }
-    return calcBodyPart({ [CARRY]: 4 * num, [WORK]: 2 * num, [MOVE]: 3 * num });
+    return calcBodyPart({ [CARRY]: 1, [WORK]: 2 * num, [MOVE]: num });
 };
 const getCarrierBody = function (room) {
     let body;
