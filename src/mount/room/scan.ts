@@ -1,4 +1,4 @@
-import {repairPriority, towerSetting, wallSetting} from "@/setting";
+import {energyStructureScanInterval, repairPriority, towerSetting, wallSetting} from "@/setting";
 
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
@@ -37,6 +37,14 @@ export default class RoomScanExtension extends Room {
             || now - cache.lastEnergyTaskScan >= 10) {
             cache.lastEnergyTaskScan = now
             this.refreshEnergyTasks()
+            // spawn/extension 的补能需求同样按间隔兜底同步
+            this.refreshEnergyCarryTasks()
+        }
+        // 兜底重建 spawn/extension 顺序表，处理漏掉的建成/拆除
+        if (cache.lastEnergyStructureScan === undefined
+            || now - cache.lastEnergyStructureScan >= energyStructureScanInterval) {
+            cache.lastEnergyStructureScan = now
+            this.refreshEnergyStructures()
         }
     }
 

@@ -396,18 +396,8 @@ export default class CreepExtension extends Creep {
                 // delete this.memory.oldRole
                 return true
             }
-            const addToEnergyList = () => {
-                if (!this.room.memory.energyList) {
-                    this.room.memory.energyList = []
-                }
-                const isEnergyStructure = target.structureType === STRUCTURE_EXTENSION
-                if (isEnergyStructure && !this.room.memory.energyList.includes(target.id)) {
-                    this.room.memory.energyList.push(target.id)
-                }
-            }
             if (!target.store.getFreeCapacity(resourceType)) {
                 this.say("⚡目标已满")
-                addToEnergyList()
                 this.removeCurrentWorkFromQueue()
                 // this.releaseCurrentWork()
                 // const targetRole = this.memory.oldRole ?? this.memory.role
@@ -428,7 +418,6 @@ export default class CreepExtension extends Creep {
             } else if (res == OK) {
                 // 这个persistent不知道是用来干什么的，先不删了
                 // if (this.memory.currentWork?.persistent && !target.store.getFreeCapacity(resourceType)) {
-                addToEnergyList()
                 if (!target.store.getFreeCapacity(resourceType)) {
                     this.removeCurrentWorkFromQueue()
                     return true
@@ -436,7 +425,6 @@ export default class CreepExtension extends Creep {
                 return false
             } else if (res == ERR_FULL) {
                 this.say("⚡目标已满")
-                addToEnergyList()
                 this.removeCurrentWorkFromQueue()
                 return true
             }
@@ -497,13 +485,16 @@ export default class CreepExtension extends Creep {
                 this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}});
                 return false
             } else if (res == OK) {
-                // 建成以后下一tick执行onBuild
-                             
-                // this.room.registEvent({
-                //     triggerTime: Game.time + 1,
-                //     triggerFunc: "buildOver",
-                //     param: [target.pos.x, target.pos.y]
-                // })
+                // 只有这一下会把工地打满时才在下一 tick 触发 onBuild；
+                // 否则每个建造 tick 都会重复触发。
+                const buildPower = this.getActiveBodyparts(WORK) * BUILD_POWER
+                if (target.progress + buildPower >= target.progressTotal) {
+                    this.room.registEvent({
+                        triggerTime: Game.time + 1,
+                        triggerFunc: "buildOver",
+                        param: [target.pos.x, target.pos.y]
+                    })
+                }
                 return false
             } else {
                 this.removeCurrentWorkFromQueue()

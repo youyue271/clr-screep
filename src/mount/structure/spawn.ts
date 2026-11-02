@@ -8,7 +8,6 @@
 import {CalBodyCost} from "@/util/utils";
 import log from "@/util/log";
 import {spawnCreepErrorDescription} from "@/util/errorInformation";
-import { getCarryList } from "@/task/roomTask";
 
 export default class SpawnExtension extends Spawn {
     /**
@@ -73,15 +72,13 @@ export default class SpawnExtension extends Spawn {
                 if (this.room.energyAvailable < energyNeeded) {
                     return
                 } else {
-                    const energyStructureList: (StructureExtension | StructureSpawn)[] = [...this.room.energyList().map(obj=>{return Game.getObjectById(obj)}),...this.room.find(FIND_MY_SPAWNS)]
-                    let energyAvailable = 0
-                    for (const structure of energyStructureList) {
-                        if(!structure) {
-                            return
-                        }
-                        energyAvailable += structure.store.getUsedCapacity(RESOURCE_ENERGY)
+                    // 按布局集群顺序挑"刚好够"的结构，不做存量排序。
+                    // spawnCreep 会严格按这个顺序扣能量。
+                    const picked = this.room.pickEnergyStructures(energyNeeded)
+                    if (!picked) {
+                        // 能量结构顺序表可能还没同步好，下一 tick 再试
+                        return
                     }
-                    //TODO: 在自动规划以后，这里可以加上对应的精准控制消耗的逻辑
                     let creepName = role + Game.time
                     let res = this.spawnCreep(rolePart, creepName, {
                         memory: {
@@ -92,7 +89,7 @@ export default class SpawnExtension extends Spawn {
                             // 提前换班的 harvester 会带上矿点 id
                             harvestSourceId: task?.taskParam?.[2] as Id<Source> | undefined
                         },
-                        energyStructures: energyStructureList
+                        energyStructures: picked.structures
                     })
                     if (res == OK) {
                         /* 孵化成功 */
@@ -100,7 +97,13 @@ export default class SpawnExtension extends Spawn {
                         if (activeKey && spawnQueue.length === 0) {
                             delete spawnBuckets[activeKey]
                         }
-                        
+                        // spawnCreep 是 intent，回合末才扣能量；下一 tick 给实际
+                        // 被扣空的结构登记补能需求，再由 calSpawningTime 安排 recycle
+                        this.room.registEvent({
+                            triggerTime: Game.time + 1,
+                            triggerFunc: "refillAfterSpawn",
+                            param: [picked.usedIds]
+                        })
                         this.room.registEvent({
                             triggerTime: Game.time + 1,
                             triggerFunc: "calSpawningTime",

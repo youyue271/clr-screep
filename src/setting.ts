@@ -10,6 +10,14 @@ export const spawnTable: { [role in Role]: number[] } = {
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
 
+// spawn/extension 顺序表的兜底扫描间隔。建成/拆除有事件，
+// 这里只处理漏网的情况，频率不需要高。
+export const energyStructureScanInterval = 100
+
+// TODO(energy): container 低/高水位、取能任务并发数按 RCL 配置。
+// 后期大型 carrier 一次能取很多，并发数应随 carrier 平均载重动态下降，
+// 不要一直固定为 3。Phase 2 再实现。
+
 export const repairSetting = {
     // 同时存在的维修任务上限。每个任务容量 1，避免大量 worker 被维修吸走
     maxTasks: 3,

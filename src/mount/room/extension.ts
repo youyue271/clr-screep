@@ -44,7 +44,6 @@ export default class RoomExtension extends Room {
             'spawnTask': {}
         }
 
-        this.initEnergyList()
         this.initResource()
         this.initBuildList()
         this.initSpawn(this.controller.level)
@@ -53,15 +52,6 @@ export default class RoomExtension extends Room {
         this.initCreepRecycle()
         
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
-    }
-
-    initEnergyList(): void {
-        const extensions = this.find(FIND_MY_STRUCTURES, {
-            filter: (object: any) => {
-                return object.structureType == STRUCTURE_EXTENSION && object.store['energy']
-            }
-        })
-        this.memory.energyList = extensions.map((extension: StructureExtension) => extension.id)
     }
 
     initBuildList() {
@@ -135,27 +125,12 @@ export default class RoomExtension extends Room {
         if (!this.memory.creepTask) {
             return
         }
-        const structureList:Structure[] = this.find(FIND_MY_STRUCTURES, {
-            filter: (object: any) => {
-                // console.log(object.structureType)
-                if (!object.store) {
-                    return false;
-                }
-                if (object.structureType == STRUCTURE_EXTENSION
-                    || object.structureType == STRUCTURE_TOWER
-                    || object.structureType == STRUCTURE_SPAWN) {
-                    if (object.store.getFreeCapacity(RESOURCE_ENERGY)) {
-                        // console.log(object.structureType, object.store.getFreeCapacity(RESOURCE_ENERGY))
-                        return true;
-                    } else {
-                        return false
-                    }
-                } else {
-                    return false
-                }
-            }
-        })
-        // console.log(structureList)
+        // 只从 spawn/extension 登记表里取，不再每 tick find。
+        // tower 不放进这张表，它走 ensureEnergyCarryTask 的 60% 阈值补能。
+        const structureList = this.energyStructureOrder()
+            .map(id => Game.getObjectById<StructureSpawn | StructureExtension>(id))
+            .filter((structure): structure is StructureSpawn | StructureExtension =>
+                !!structure && structure.store.getFreeCapacity(RESOURCE_ENERGY) > 0)
         this.registTask(getCarryList(structureList, RESOURCE_ENERGY))
     }
 
@@ -163,19 +138,15 @@ export default class RoomExtension extends Room {
         if (!this.memory.creepTask) {
             return
         }
-        const structureList = this.find(FIND_MY_STRUCTURES, {
-            filter: (object: any) => {
-                if (!object.store) {
-                    return false
-                }
-                const isEnergyStructure = object.structureType == STRUCTURE_EXTENSION || object.structureType == STRUCTURE_SPAWN
-                if (!isEnergyStructure) {
-                    return false
-                }
-                return object.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-            }
-        }) as (StructureExtension | StructureSpawn)[]
+        // 直接遍历 spawn/extension 登记表，状态实时读 store，不再 find
+        const structureList = this.energyStructureOrder()
+            .map(id => Game.getObjectById<StructureSpawn | StructureExtension>(id))
+            .filter((structure): structure is StructureSpawn | StructureExtension =>
+                !!structure && structure.store.getFreeCapacity(RESOURCE_ENERGY) > 0)
         const carryBuckets = this.normalizeTaskBuckets('carryTask')
+        // 只清理 spawn/extension 自己的补能任务；塔等其它目标的任务不能动，
+        // 它们由各自的触发逻辑（ensureEnergyCarryTask）管理。
+        const orderIds = new Set<string>(this.energyStructureOrder())
         const neededIds = new Set(structureList.map(item => item.id))
         const existingIds = new Set<string>()
         for (const key in carryBuckets) {
@@ -190,10 +161,16 @@ export default class RoomExtension extends Room {
                     continue
                 }
                 const taskTargetId = task.targetId ?? task.taskParam?.[0]
-                if (!taskTargetId || !neededIds.has(taskTargetId)) {
+                if (!taskTargetId) {
                     continue
                 }
-                existingIds.add(taskTargetId)
+                if (orderIds.has(taskTargetId) && !neededIds.has(taskTargetId)) {
+                    // 这个 spawn/extension 已经满了，任务作废
+                    continue
+                }
+                if (neededIds.has(taskTargetId)) {
+                    existingIds.add(taskTargetId)
+                }
                 nextBucket.push(task)
             }
             if (nextBucket.length) {
@@ -207,6 +184,179 @@ export default class RoomExtension extends Room {
         if (toAdd.length) {
             this.registTask(getCarryList(toAdd, RESOURCE_ENERGY))
         }
+    }
+
+    /**
+     * 按布局集群顺序返回 spawn/extension 的固定 id 列表。
+     * 顺序在布局阶段就由 plan1/plan2 的数组顺序决定，和存量无关。
+     */
+    energyStructureOrder(): Id<StructureSpawn | StructureExtension>[] {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {}
+        }
+        if (!global.room[this.name].energyStructureOrder) {
+            return this.buildEnergyStructureOrder()
+        }
+        return global.room[this.name].energyStructureOrder
+    }
+
+    /**
+     * 重建能量结构顺序：
+     * - plan2: Core -> extensionCluster1 -> extensionCluster2（和建造顺序一致）
+     * - plan1: 整个 plan1 行优先
+     * - 不在布局里的结构追加到最后，按到 spawn 的距离排
+     */
+    private buildEnergyStructureOrder(): Id<StructureSpawn | StructureExtension>[] {
+        const rankMap: { [pos: string]: number } = {}
+        let rank = 0
+        const addPlan = (map: string[], anchor?: [number, number], plusOne: boolean = true) => {
+            if (!anchor || !map) {
+                return
+            }
+            // 与 buildLayout / constructPlan1 的坐标计算保持一致
+            const offset = plusOne ? map.length - 1 : map.length
+            for (let y = 0; y < map.length; y++) {
+                const row = map[y].split(" ")
+                for (let x = 0; x < row.length; x++) {
+                    const cell = row[x]
+                    if (!cell) {
+                        continue
+                    }
+                    const type = mapping[cell[0]]
+                    if (type !== STRUCTURE_EXTENSION && type !== STRUCTURE_SPAWN) {
+                        continue
+                    }
+                    rankMap[`${anchor[0] + x - offset},${anchor[1] + y - offset}`] = rank++
+                }
+            }
+        }
+        if (this.memory.roomPlanType === 2 && this.memory.plan2Pos) {
+            const planPos = this.memory.plan2Pos
+            addPlan(plan2_Core, planPos.core)
+            addPlan(plan2_extensionCluster1, planPos.ext1)
+            addPlan(plan2_extensionCluster2, planPos.ext2)
+        } else if (this.memory.plan1Pos) {
+            addPlan(plan1, this.memory.plan1Pos, false)
+        }
+
+        const structures = this.find(FIND_MY_STRUCTURES, {
+            filter: (object: any) => object.structureType === STRUCTURE_SPAWN
+                || object.structureType === STRUCTURE_EXTENSION
+        }) as (StructureSpawn | StructureExtension)[]
+        const spawn = this.find(FIND_MY_SPAWNS)[0]
+        const spawnPos = spawn ? spawn.pos : undefined
+        structures.sort((a, b) => {
+            const rankA = rankMap[`${a.pos.x},${a.pos.y}`]
+            const rankB = rankMap[`${b.pos.x},${b.pos.y}`]
+            const aPlanned = rankA !== undefined
+            const bPlanned = rankB !== undefined
+            if (aPlanned && bPlanned && rankA !== rankB) {
+                return rankA - rankB
+            }
+            if (aPlanned !== bPlanned) {
+                return aPlanned ? -1 : 1
+            }
+            const distanceA = spawnPos ? a.pos.getRangeTo(spawnPos) : 0
+            const distanceB = spawnPos ? b.pos.getRangeTo(spawnPos) : 0
+            if (distanceA !== distanceB) {
+                return distanceA - distanceB
+            }
+            if (a.pos.y !== b.pos.y) {
+                return a.pos.y - b.pos.y
+            }
+            return a.pos.x - b.pos.x
+        })
+        const order = structures.map(structure => structure.id)
+        global.room[this.name].energyStructureOrder = order
+        return order
+    }
+
+    /**
+     * 新建的 spawn/extension 加入顺序表；已经在表里则不动。
+     */
+    registerEnergyStructure(id: Id<StructureSpawn | StructureExtension>) {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {}
+        }
+        const order = global.room[this.name].energyStructureOrder
+        if (order && order.includes(id)) {
+            return
+        }
+        this.buildEnergyStructureOrder()
+    }
+
+    /**
+     * 定期兜底重建顺序表，处理漏掉的建成/拆除。
+     */
+    refreshEnergyStructures() {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return
+        }
+        this.buildEnergyStructureOrder()
+    }
+
+    /**
+     * 按布局固定顺序挑出"刚好够" cost 的结构，不做任何按存量排序。
+     * spawnCreep 会严格按返回顺序扣能量，usedIds 就是实际贡献了能量的结构。
+     */
+    pickEnergyStructures(cost: number): {
+        structures: (StructureSpawn | StructureExtension)[]
+        usedIds: Id<StructureSpawn | StructureExtension>[]
+    } | undefined {
+        let result = this.selectEnergyStructures(this.energyStructureOrder(), cost)
+        if (!result) {
+            // 顺序表可能漏了刚建好的结构，强制重建一次再试
+            result = this.selectEnergyStructures(this.buildEnergyStructureOrder(), cost)
+        }
+        if (result) {
+            return result
+        }
+        // 最后兜底：直接用房间里的全部 spawn/extension
+        const all = this.find(FIND_MY_STRUCTURES, {
+            filter: (object: any) => object.structureType === STRUCTURE_SPAWN
+                || object.structureType === STRUCTURE_EXTENSION
+        }) as (StructureSpawn | StructureExtension)[]
+        return this.selectEnergyStructures(all.map(structure => structure.id), cost)
+    }
+
+    private selectEnergyStructures(ids: Id<StructureSpawn | StructureExtension>[], cost: number): {
+        structures: (StructureSpawn | StructureExtension)[]
+        usedIds: Id<StructureSpawn | StructureExtension>[]
+    } | undefined {
+        let energy = 0
+        const structures: (StructureSpawn | StructureExtension)[] = []
+        const usedIds: Id<StructureSpawn | StructureExtension>[] = []
+        for (const id of ids) {
+            if (energy >= cost) {
+                break
+            }
+            const structure = Game.getObjectById<StructureSpawn | StructureExtension>(id)
+            if (!structure) {
+                continue
+            }
+            const stored = structure.store.getUsedCapacity(RESOURCE_ENERGY)
+            if (!stored) {
+                continue
+            }
+            structures.push(structure)
+            usedIds.push(id)
+            energy += stored
+        }
+        if (energy < cost) {
+            return
+        }
+        return {structures, usedIds}
+    }
+
+    /**
+     * spawn 成功后 +1 tick 调用：spawnCreep 是 intent，回合末才扣能量，
+     * 下一 tick 这些结构才会真正出现空位。只给实际贡献了能量的结构登记 carry 任务。
+     */
+    refillAfterSpawn(structureIds: Id<StructureSpawn | StructureExtension>[]) {
+        if (!structureIds || !structureIds.length) {
+            return
+        }
+        this.addExtensionCarryTasks(structureIds)
     }
 
     /**
@@ -752,25 +902,11 @@ export default class RoomExtension extends Room {
 
     calSpawningTime(SpawnId: Id<StructureSpawn>) {
         const thisSpawn = Game.getObjectById(SpawnId)
-        const nextEnergyList: Id<StructureExtension>[] = []
-        for (const id of thisSpawn.room.energyList()) {
-            const extension = Game.getObjectById(id)
-            if (!extension) {
-                continue
-            }
-            if (extension.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                thisSpawn.room.registTask(getCarryList([extension], RESOURCE_ENERGY))
-            }
-            if (extension.store['energy']){
-                nextEnergyList.push(id)
-            }
+        if (!thisSpawn || !thisSpawn.spawning) {
+            return
         }
-        for (const spawn of thisSpawn.room.find(FIND_MY_SPAWNS)) {
-            if (spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                spawn.room.registTask(getCarryList([spawn], RESOURCE_ENERGY))
-            }
-        }
-        thisSpawn.room.memory.energyList = nextEnergyList
+        // spawn 消耗产生的补能需求由 refillAfterSpawn 在 +1 tick 登记，
+        // 这里只负责在孵化完成后安排 recycle 事件
         this.registEvent({
             triggerTime: Game.time + thisSpawn.spawning.remainingTime + 1,
             triggerFunc: "calRecycleTime",
@@ -795,9 +931,15 @@ export default class RoomExtension extends Room {
     }
 
     buildOver(x: number, y: number) {
-        const structure = this.lookForAt(LOOK_STRUCTURES, x, y)[0]
-        if (structure.onBuild) {
-            structure.onBuild()
+        const structures = this.lookForAt(LOOK_STRUCTURES, x, y)
+        for (const structure of structures) {
+            if (structure.onBuild) {
+                structure.onBuild()
+            }
+            // 新建的 spawn/extension 加入能量结构顺序表，后续 spawn 就能直接用它
+            if (structure.structureType === STRUCTURE_SPAWN || structure.structureType === STRUCTURE_EXTENSION) {
+                this.registerEnergyStructure(structure.id as Id<StructureSpawn | StructureExtension>)
+            }
         }
     }
 
@@ -1075,23 +1217,6 @@ export default class RoomExtension extends Room {
         this.memory.containerPosById = byId
         this.memory.containerPos = containerPos
         return containerPos
-    }
-
-    energyList() {
-        if (this.memory.energyList) {
-            return this.memory.energyList
-        }
-        const structures = this.find(FIND_MY_STRUCTURES, {
-            filter: (object: any) => {
-                if (!object.store) {
-                    return false
-                }
-                const isEnergyStructure = object.structureType === STRUCTURE_EXTENSION
-                return isEnergyStructure && object.store['energy']
-            }
-        }) as (StructureExtension)[]
-        this.memory.energyList = structures.map(obj=>{return obj.id})
-        return structures.map(obj=>{return obj.id})
     }
 
     /**

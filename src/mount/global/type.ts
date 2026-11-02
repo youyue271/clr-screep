@@ -17,6 +17,9 @@ interface RoomGlobalCache {
     sourceBFS?:any[]
     controllerBFS?:any[]
     energyExtensionList?: Id<StructureExtension | StructureSpawn>[]
+    // 按布局集群顺序排好的 spawn/extension id，spawn 孵化时按这个顺序扣能量
+    energyStructureOrder?: Id<StructureSpawn | StructureExtension>[]
+    lastEnergyStructureScan?: number
     container?:any[]
     containerCount?: number
     resources?:Resource[]

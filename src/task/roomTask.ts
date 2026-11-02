@@ -73,6 +73,9 @@ export function getContainerEnergy(room: Room): MyTask[] {
                 priority: 2,
                 taskParam: [containerId, RESOURCE_ENERGY],
                 // 一个 container 不需要太多人同时来取，多了只会排队绕圈
+                // TODO(energy): 并发数按 RCL + carrier 平均载重动态计算；
+                // 后期大型 carrier 一次能取很多，应该少派几个人。
+                // TODO(energy): container 低/高水位按 RCL 配置，Phase 2 实现。
                 capacity: 3
             }))
     }
@@ -84,6 +87,8 @@ export function getResourceEnergy(room: Room): MyTask[] {
     if (!resources) {
         return []
     } else {
+        // TODO(energy): 掉落物是会衰减的机会性能量，Phase 2 改成按
+        // amount / 距离 / 剩余衰减时间评分的机会队列，不占用固定任务容量。
         return resources.map(resource => ({
             taskType: 'energyTask',
             taskFunc: 'collectEnergy',

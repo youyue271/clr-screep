@@ -99,7 +99,7 @@ function debugDump() {
         if (!room) {
             continue
         }
-        const energyList = room.memory.energyList
+        const energyList = room.energyStructureOrder()
         if (energyList && energyList.length) {
             const sample = energyList.slice(0, 6).map(id => {
                 const s = Game.getObjectById<StructureExtension | StructureSpawn>(id)
@@ -110,8 +110,8 @@ function debugDump() {
                 const free = s.store?.getFreeCapacity(RESOURCE_ENERGY)
                 return `${type}:${free}`
             }).join(",")
-            lines.push(`energyList:${energyList.length}:${sample}`) 
-        } 
+            lines.push(`energyList:${energyList.length}:${sample}`)
+        }
         const timer = room.memory.timer
         if (timer) {
             const ticks = Object.keys(timer).map(Number).sort((a, b) => a - b)

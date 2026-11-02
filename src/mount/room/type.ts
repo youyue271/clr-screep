@@ -7,7 +7,6 @@ interface RoomMemory {
         [task in TaskType]: TaskBucket
     }
 
-    energyList?: Id<StructureExtension>[]
     lastEnergyTaskTick?: number
 
     roomPlanType?: number
@@ -38,15 +37,39 @@ interface Room {
 
     initResource(): void
 
-    initEnergyList(): void
-    
     initCreepRecycle(): void
 
     globalReset(): void
 
     normalizeTaskBuckets(taskType: TaskType): TaskBucket
 
-    energyList(): Id<StructureExtension >[]
+    /**
+     * 按布局集群顺序返回 spawn/extension 的固定 id 列表
+     */
+    energyStructureOrder(): Id<StructureSpawn | StructureExtension>[]
+
+    /**
+     * 新建/拆除后重建能量结构顺序表
+     */
+    refreshEnergyStructures(): void
+
+    /**
+     * 把新建的 spawn/extension 登记进顺序表
+     */
+    registerEnergyStructure(id: Id<StructureSpawn | StructureExtension>): void
+
+    /**
+     * 按固定顺序挑出刚好够 cost 的结构；usedIds 是实际贡献能量的结构
+     */
+    pickEnergyStructures(cost: number): {
+        structures: (StructureSpawn | StructureExtension)[]
+        usedIds: Id<StructureSpawn | StructureExtension>[]
+    } | undefined
+
+    /**
+     * spawn 成功后 +1 tick 给被扣能量的结构登记 carry 任务
+     */
+    refillAfterSpawn(structureIds: Id<StructureSpawn | StructureExtension>[]): void
 
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
 
