@@ -1,4 +1,4 @@
-import {harvestSetting, repairPriority, towerSetting, wallSetting} from "@/setting";
+import {repairPriority, towerSetting, wallSetting} from "@/setting";
 
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
@@ -12,12 +12,6 @@ export default class RoomScanExtension extends Room {
             return
         }
         const now = Game.time
-        // harvester 换班检查：提前孵化替补，避免死亡后才开始孵化造成断档
-        if (cache.lastHarvestCheck === undefined
-            || now - cache.lastHarvestCheck >= harvestSetting.checkInterval) {
-            cache.lastHarvestCheck = now
-            this.checkHarvesters()
-        }
         // 防御状态下每 tick 重新确认敌对目标；和平状态按间隔扫描
         if (cache.threatMode === 'defend'
             || cache.lastThreatScan === undefined

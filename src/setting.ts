@@ -55,8 +55,6 @@ export const wallSetting = {
 export const harvestSetting = {
     // 每个矿点允许的采集者数量：平时 1 个，换班时新旧 harvester 可以同时占用
     capacity: 2,
-    // 换班检查间隔（tick）
-    checkInterval: 5,
     // 提前量：spawn 排队、地形绕路等额外预留的 tick
     earlyMargin: 15,
     // 没有布局距离缓存时的默认路径长度（tile）

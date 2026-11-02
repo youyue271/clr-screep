@@ -403,7 +403,11 @@ export default class RoomExtension extends Room {
                 delete Memory.creeps[creepName]
                 creep.remember()
                 const role = creep.memory.role
-                
+                // 代码推送会清空 Memory.rooms（包括事件），这里给现存的 harvester 重新挂换班事件
+                if (role === 'harvester') {
+                    this.scheduleHarvesterHandover(creep)
+                }
+
                 // 还需要孵化, 那就直接拿现成的, 把任务扔掉就行
                 if (spawnNum[role]) {
                     spawnNum[role] -= 1
@@ -447,84 +451,71 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * harvester 换班检查：当现有 harvester 的 TTL 不足以完成
-     * spawn + 跑到矿点时，提前安排同一个矿点的替补。
-     * 换班期间新旧 harvester 可以同时占用一个矿点（harvestTask capacity = 2）。
+     * 给 harvester 挂一个换班事件：TTL 降到「孵化 + 赶路 + 余量」门槛时触发一次。
+     * 这样不需要定期扫描所有 creep，每个 harvester 一生只触发一次。
      */
-    checkHarvesters() {
+    scheduleHarvesterHandover(creep: Creep) {
+        const ticksToLive = creep.ticksToLive
+        if (ticksToLive === undefined) {
+            return
+        }
+        const threshold = this.harvesterHandoverThreshold(creep)
+        const countdown = Math.max(1, ticksToLive - threshold)
+        this.registEvent({
+            triggerTime: Game.time + countdown,
+            triggerFunc: 'harvesterHandover',
+            param: [creep.name]
+        })
+    }
+
+    /**
+     * 换班事件：creep 快死了，确保它负责的矿点有替补。
+     * 只看这一个矿点，不做全局扫描。
+     */
+    harvesterHandover(creepName: string) {
+        const creep = Game.creeps[creepName]
+        if (!creep) {
+            // creep 已经死了，由 creepRecycle 兜底补员
+            return
+        }
+        const sourceId = this.harvesterSourceOf(creep)
+        if (!sourceId) {
+            return
+        }
+        if (!this.ensureHarvesterForSource(sourceId as Id<Source>)) {
+            // 暂时没法处理（比如还没有 spawn），稍后重试
+            this.registEvent({
+                triggerTime: Game.time + 20,
+                triggerFunc: 'harvesterHandover',
+                param: [creepName]
+            })
+        }
+    }
+
+    /**
+     * 确保某个矿点有健康的 harvester：有就清掉多余替补，没有就排一个指定矿点的替补。
+     * @returns false 表示当前无法处理（房间没有 spawn 等）
+     */
+    ensureHarvesterForSource(sourceId: Id<Source>): boolean {
         if (!this.controller || !this.controller.my || !this.memory.creepTask) {
-            return
+            return true
         }
-        const sources = this.sources()
-        const spawns = this.find(FIND_MY_SPAWNS)
-        if (!sources.length || !spawns.length) {
-            return
+        if (!this.find(FIND_MY_SPAWNS).length) {
+            return false
         }
+        const distances = this.memory.harvestSpawnDistance ?? {}
         const body = getBody('harvester', this)
         const spawnTicks = calcSpawnTicks(body)
         const ticksPerTile = calcTicksPerTile(body)
-        const distances = this.memory.harvestSpawnDistance ?? {}
         const thresholdOf = (creep: Creep) => {
-            const sourceId = (creep.memory.harvestSourceId
-                ?? creep.memory.currentWork?.taskParam?.[0]) as string | undefined
-            const distance = (sourceId && distances[sourceId]) || this.maxHarvestDistance(distances)
+            const distance = distances[sourceId as string] || this.maxHarvestDistance(distances)
             return spawnTicks + distance * ticksPerTile + harvestSetting.earlyMargin
         }
         const isHealthy = (creep: Creep) =>
             creep.ticksToLive === undefined || creep.ticksToLive > thresholdOf(creep)
 
-        // 按矿点统计存活 harvester。不能只看预约：global 重置后预约会全部丢失，
-        // 但 creep 内存里还留着正在采集的矿点，仍然算有效覆盖，避免误判后重复孵化。
-        const coverage: { [sourceId: string]: Creep[] } = {}
-        for (const name in Game.creeps) {
-            const creep = Game.creeps[name]
-            if (creep.memory.role !== 'harvester' || creep.memory.spawnRoom !== this.name) {
-                continue
-            }
-            const sourceId = (creep.memory.harvestSourceId
-                ?? creep.memory.currentWork?.taskParam?.[0]) as string | undefined
-            if (!sourceId) {
-                continue
-            }
-            if (!coverage[sourceId]) {
-                coverage[sourceId] = []
-            }
-            coverage[sourceId].push(creep)
-        }
-
-        // 排队中 + 孵化中的 harvester 按 sourceId 记账，避免同一个矿点重复排队
-        const pendingAssigned: { [sourceId: string]: boolean } = {}
-        let pendingUnassigned = 0
-        const notePending = (sourceId?: string) => {
-            if (sourceId) {
-                pendingAssigned[sourceId] = true
-            } else {
-                pendingUnassigned += 1
-            }
-        }
-        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
-        for (const key in spawnBuckets) {
-            const queue = spawnBuckets[key]
-            if (!queue || !queue.length) {
-                continue
-            }
-            for (const task of queue) {
-                if (task && task.taskParam?.[0] === 'harvester') {
-                    notePending(task.taskParam?.[2] as string | undefined)
-                }
-            }
-        }
-        for (const spawn of spawns) {
-            const spawningName = spawn.spawning?.name
-            if (!spawningName) {
-                continue
-            }
-            const spawningMemory = Memory.creeps[spawningName]
-            if (spawningMemory && spawningMemory.role === 'harvester') {
-                notePending(spawningMemory.harvestSourceId as string | undefined)
-            }
-        }
-
+        // 该矿点任务上的预约
+        const reservers: Creep[] = []
         const buckets = this.normalizeTaskBuckets('harvestTask')
         for (const key in buckets) {
             const queue = buckets[key]
@@ -532,31 +523,58 @@ export default class RoomExtension extends Room {
                 continue
             }
             for (const task of queue) {
-                const sourceId = task?.taskParam?.[0] as string | undefined
-                if (!sourceId) {
+                if (!task || task.taskParam?.[0] !== sourceId) {
                     continue
                 }
-                const reservers = (task.reservedBy ?? [])
-                    .map(item => item && Game.creeps[item.name])
-                    .filter((creep): creep is Creep => !!creep)
-                const covered = reservers.concat(coverage[sourceId] ?? [])
-                    .some(creep => isHealthy(creep))
-                if (covered) {
-                    // 已经有健康的采集者，顺手清掉之前多排的替补任务
-                    this.cancelHarvestSpawnTasks(sourceId)
-                    continue
+                for (const item of task.reservedBy ?? []) {
+                    const creep = item && Game.creeps[item.name]
+                    if (creep) {
+                        reservers.push(creep)
+                    }
                 }
-                if (pendingAssigned[sourceId]) {
-                    continue
-                }
-                if (pendingUnassigned > 0) {
-                    pendingUnassigned -= 1
-                    continue
-                }
-                this.addToSpawnList('harvester', sourceId as Id<Source>)
-                pendingAssigned[sourceId] = true
             }
         }
+        // 代码推送后预约可能被清空，但 creep 内存里还记着矿点，仍算有效覆盖
+        const miners = this.find(FIND_MY_CREEPS).filter(creep =>
+            creep.memory.role === 'harvester' && this.harvesterSourceOf(creep) === sourceId)
+        const covered = reservers.concat(miners).some(creep => isHealthy(creep))
+        if (covered) {
+            this.cancelHarvestSpawnTasks(sourceId as string)
+            return true
+        }
+        if (this.hasHarvesterPending(sourceId as string)) {
+            return true
+        }
+        this.addToSpawnList('harvester', sourceId)
+        return true
+    }
+
+    /**
+     * 该矿点是否已经有在排队/孵化中的 harvester（包括没指定矿点的通用补员）
+     */
+    private hasHarvesterPending(sourceId: string): boolean {
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            for (const task of queue) {
+                if (task && task.taskParam?.[0] === 'harvester'
+                    && (task.taskParam?.[2] === sourceId || !task.taskParam?.[2])) {
+                    return true
+                }
+            }
+        }
+        for (const spawn of this.find(FIND_MY_SPAWNS)) {
+            const spawningName = spawn.spawning?.name
+            const spawningMemory = spawningName ? Memory.creeps[spawningName] : undefined
+            if (spawningMemory && spawningMemory.role === 'harvester'
+                && (spawningMemory.harvestSourceId === sourceId || !spawningMemory.harvestSourceId)) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -577,6 +595,19 @@ export default class RoomExtension extends Room {
                 delete spawnBuckets[key]
             }
         }
+    }
+
+    private harvesterSourceOf(creep: Creep): string | undefined {
+        return (creep.memory.harvestSourceId
+            ?? creep.memory.currentWork?.taskParam?.[0]) as string | undefined
+    }
+
+    private harvesterHandoverThreshold(creep: Creep): number {
+        const body = getBody('harvester', this)
+        const distances = this.memory.harvestSpawnDistance ?? {}
+        const sourceId = this.harvesterSourceOf(creep)
+        const distance = (sourceId && distances[sourceId]) || this.maxHarvestDistance(distances)
+        return calcSpawnTicks(body) + distance * calcTicksPerTile(body) + harvestSetting.earlyMargin
     }
 
     private maxHarvestDistance(distances: { [sourceId: string]: number }): number {
@@ -626,8 +657,14 @@ export default class RoomExtension extends Room {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole
                     }
-                    // harvester 由 checkHarvesters 提前换班并统一补员，这里不再重复排队
-                    if (memory.role !== 'harvester') {
+                    if (memory.role === 'harvester') {
+                        // harvester 正常由换班事件提前替补；意外死亡时在这里兜底补员
+                        const sourceId = (memory.harvestSourceId
+                            ?? memory.currentWork?.taskParam?.[0]) as string | undefined
+                        if (sourceId) {
+                            room.ensureHarvesterForSource(sourceId as Id<Source>)
+                        }
+                    } else {
                         room.addToSpawnList(memory.role)
                     }
                 }
@@ -697,11 +734,18 @@ export default class RoomExtension extends Room {
 
     calRecycleTime(creepName: string) {
         const creep = Game.creeps[creepName]
+        if (!creep) {
+            return
+        }
         this.registEvent({
             triggerTime: Game.time + creep.ticksToLive + 1,
             triggerFunc: "creepRecycle",
             param: []
         })
+        // 孵化完成时给 harvester 挂换班事件，到期只检查它自己的矿点
+        if (creep.memory.role === 'harvester') {
+            this.scheduleHarvesterHandover(creep)
+        }
     }
 
     buildOver(x: number, y: number) {

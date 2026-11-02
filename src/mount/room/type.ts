@@ -66,9 +66,9 @@ interface Room {
     syncWallRepairTasks(): void
 
     /**
-     * harvester 提前换班检查
+     * 确保某个矿点有 harvester（换班/死亡补员用）
      */
-    checkHarvesters(): void
+    ensureHarvesterForSource(sourceId: Id<Source>): boolean
 
     /**
      * 初始化Spawn列表
