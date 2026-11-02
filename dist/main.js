@@ -3377,12 +3377,20 @@ function getContainerEnergy(room) {
         return [];
     }
     else {
-        return containerIds.map(containerId => ({
+        // 只给真正有能量的 container 建任务，空 container 会变成黑洞，
+        // 把所有没能量的 creep 都吸过去原地打转
+        return containerIds
+            .filter(containerId => {
+            const container = Game.getObjectById(containerId);
+            return !!container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0;
+        })
+            .map(containerId => ({
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority: 2,
             taskParam: [containerId, RESOURCE_ENERGY],
-            capacity: 10
+            // 一个 container 不需要太多人同时来取，多了只会排队绕圈
+            capacity: 3
         }));
     }
 }
@@ -3403,7 +3411,7 @@ function getResourceEnergy(room) {
 }
 function getStorageEnergy(room) {
     const storage = room.storage;
-    if (!storage) {
+    if (!storage || !storage.store.getUsedCapacity(RESOURCE_ENERGY)) {
         return [];
     }
     else {
@@ -3699,6 +3707,10 @@ class CreepExtension extends Creep {
                         queue = [...queue].sort((a, b) => { var _a, _b, _c, _d; return ((_b = (_a = a === null || a === void 0 ? void 0 : a.reservedBy) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0) - ((_d = (_c = b === null || b === void 0 ? void 0 : b.reservedBy) === null || _c === void 0 ? void 0 : _c.length) !== null && _d !== void 0 ? _d : 0); });
                     }
                 }
+                else if (taskType === 'energyTask') {
+                    // 多个 container / 掉落物时优先去没人预约的，避免所有缺能量的 creep 挤在一个矿点
+                    queue = [...queue].sort((a, b) => { var _a, _b, _c, _d; return ((_b = (_a = a === null || a === void 0 ? void 0 : a.reservedBy) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0) - ((_d = (_c = b === null || b === void 0 ? void 0 : b.reservedBy) === null || _c === void 0 ? void 0 : _c.length) !== null && _d !== void 0 ? _d : 0); });
+                }
                 for (let i = 0; i < queue.length; i++) {
                     const task = queue[i];
                     if (!task) {
@@ -3816,6 +3828,13 @@ class CreepExtension extends Creep {
         if (!source) {
             return true;
         }
+        // 身上满了先卸货：能量必须进入 container（没有就掉在地上给 carrier 捡），
+        // 否则 container 永远存不住能量，整个能量链就断了
+        if (!this.store.getFreeCapacity(RESOURCE_ENERGY)) {
+            this.say("📦卸货");
+            this.dumpEnergy();
+            return false;
+        }
         this.say("⛏️007采矿");
         // 没有 container / 工地位置时退化为直接贴着 source 采集
         if (containerPosX === undefined || ContainerPosY === undefined) {
@@ -3834,6 +3853,22 @@ class CreepExtension extends Creep {
             this.harvest(source);
         }
         return false;
+    }
+    /**
+     * 把身上的能量交给脚下的 container；没有 container 或已满就丢在地上。
+     * container 和掉落物都会被 carrier / emptyWorker 的 energyTask 捡走。
+     */
+    dumpEnergy() {
+        if (!this.store.getUsedCapacity(RESOURCE_ENERGY)) {
+            return;
+        }
+        const container = this.pos.lookFor(LOOK_STRUCTURES)
+            .find(item => item.structureType === STRUCTURE_CONTAINER);
+        if (container && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            this.transfer(container, RESOURCE_ENERGY);
+            return;
+        }
+        this.drop(RESOURCE_ENERGY);
     }
     getEnergyFromStructure(id, energyType) {
         var _a, _b, _c;
@@ -3880,7 +3915,8 @@ class CreepExtension extends Creep {
             return true;
         }
         else if (res == ERR_NOT_ENOUGH_RESOURCES) {
-            this.releaseCurrentWork();
+            // 目标已经空了：把任务移出队列，否则所有 emptyWorker 会一直围着它转
+            this.removeCurrentWorkFromQueue();
             return true;
         }
         else if (res == ERR_FULL) {
@@ -4194,15 +4230,22 @@ function getBody(role, room) {
  //  * @returns
  //  */
 const getHarvesterBody = function (room) {
-    let body = [];
-    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent);
-    let num = Math.floor((energyBase - 50) / 250);
-    if (num > 3)
+    const level = room.controller ? room.controller.level : 1;
+    // RCL1 还没有 container，采集溢出的能量由引擎自动掉在地上，carrier 去捡
+    if (level < 2) {
+        return calcBodyPart({ [CARRY]: 1, [WORK]: 2, [MOVE]: 1 });
+    }
+    // 有 container 时 CARRY = 2 x WORK：一次 harvest 正好装满，下一 tick 整包倒进 container。
+    // 如果 CARRY 比采集量小，harvest 会立刻溢出并掉在地上，container 永远存不住能量。
+    let num = Math.floor(room.energyCapacityAvailable / 550);
+    if (num > 3) {
         num = 3;
-    if (num <= 0)
-        num = 1;
-    body = calcBodyPart({ [CARRY]: 1, [WORK]: 2 * num, [MOVE]: num });
-    return body;
+    }
+    if (num <= 0) {
+        // 容量还不够一个完整单元时退回最小体型（250 能量）
+        return calcBodyPart({ [CARRY]: 2, [WORK]: 1, [MOVE]: 2 });
+    }
+    return calcBodyPart({ [CARRY]: 4 * num, [WORK]: 2 * num, [MOVE]: 3 * num });
 };
 const getCarrierBody = function (room) {
     let body;
@@ -4663,6 +4706,42 @@ class RoomExtension extends Room {
             this.registTask(getCarryList(toAdd, RESOURCE_ENERGY));
         }
     }
+    /**
+     * 定期刷新取能任务：只补充还不存在的目标，已有的任务不重复登记。
+     * 空 container 的任务会在 creep 取不到能量时被移除，这里负责在它重新有能量后补回来。
+     */
+    refreshEnergyTasks() {
+        var _a, _b;
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return;
+        }
+        const tasks = getEnergyTask(this);
+        if (!tasks.length) {
+            return;
+        }
+        const buckets = this.normalizeTaskBuckets('energyTask');
+        const existingIds = new Set();
+        for (const key in buckets) {
+            const bucket = buckets[key];
+            if (!bucket || !bucket.length) {
+                continue;
+            }
+            for (const task of bucket) {
+                const targetId = (_a = task === null || task === void 0 ? void 0 : task.targetId) !== null && _a !== void 0 ? _a : (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
+                if (targetId) {
+                    existingIds.add(targetId);
+                }
+            }
+        }
+        const toAdd = tasks.filter(task => {
+            var _a, _b;
+            const targetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
+            return !!targetId && !existingIds.has(targetId);
+        });
+        if (toAdd.length) {
+            this.registTask(toAdd);
+        }
+    }
     addExtensionCarryTasks(structureIds) {
         var _a, _b;
         if (!this.memory.creepTask) {
@@ -4840,6 +4919,7 @@ class RoomExtension extends Room {
      * Spawn相关
      */
     initSpawn(level) {
+        var _a, _b, _c, _d;
         console.log("Global init Spawn");
         let spawnNum = {
             'harvester': this.find(FIND_SOURCES).length,
@@ -4852,11 +4932,21 @@ class RoomExtension extends Room {
             // console.log(creepName, creep, creep.memory.spawnRoom)
             if (creep.memory.spawnRoom == this.name) {
                 // console.log(1)
+                // remember() 会重建 Memory.creeps 条目，先保住 harvester 绑定的矿点，
+                // 否则每次推送代码都会丢掉矿点归属，补员/换班就会数错人数
+                const assignedSource = (_a = creep.memory.harvestSourceId) !== null && _a !== void 0 ? _a : (_c = (_b = creep.memory.currentWork) === null || _b === void 0 ? void 0 : _b.taskParam) === null || _c === void 0 ? void 0 : _c[0];
                 delete Memory.creeps[creepName];
                 creep.remember();
-                const role = creep.memory.role;
+                // emptyWorker 只是临时取能状态，按原职业统计，否则每次推送代码都会
+                // 把正在取能的 worker 当成缺失，重复排队孵化
+                const role = creep.memory.role === 'emptyWorker'
+                    ? ((_d = creep.memory.oldRole) !== null && _d !== void 0 ? _d : creep.memory.role)
+                    : creep.memory.role;
                 // 代码推送会清空 Memory.rooms（包括事件），这里给现存的 harvester 重新挂换班事件
                 if (role === 'harvester') {
+                    if (assignedSource) {
+                        creep.memory.harvestSourceId = assignedSource;
+                    }
                     this.scheduleHarvesterHandover(creep);
                 }
                 // 还需要孵化, 那就直接拿现成的, 把任务扔掉就行
@@ -5895,6 +5985,12 @@ class RoomScanExtension extends Room {
             cache.lastMaintenanceScan = now;
             this.refreshMaintenanceQueue(cache);
             this.syncWallRepairTasks();
+        }
+        // container / 掉落物会变化，定期把新出现的能量来源补进 energyTask 队列
+        if (cache.lastEnergyTaskScan === undefined
+            || now - cache.lastEnergyTaskScan >= 10) {
+            cache.lastEnergyTaskScan = now;
+            this.refreshEnergyTasks();
         }
     }
     refreshThreat(cache) {

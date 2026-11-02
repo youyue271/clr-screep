@@ -57,16 +57,24 @@ export function construct(ConstructionSiteId: any): MyTask[] {
 
 export function getContainerEnergy(room: Room): MyTask[] {
     const containerIds = room.getContainer()
-    if(!containerIds){
+    if (!containerIds) {
         return []
     } else {
-        return containerIds.map(containerId => ({
-            taskType: 'energyTask',
-            taskFunc: 'getEnergyFromStructure',
-            priority: 2,
-            taskParam: [containerId, RESOURCE_ENERGY],
-            capacity:10
-        }))
+        // 只给真正有能量的 container 建任务，空 container 会变成黑洞，
+        // 把所有没能量的 creep 都吸过去原地打转
+        return containerIds
+            .filter(containerId => {
+                const container = Game.getObjectById<StructureContainer>(containerId)
+                return !!container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+            })
+            .map(containerId => ({
+                taskType: 'energyTask',
+                taskFunc: 'getEnergyFromStructure',
+                priority: 2,
+                taskParam: [containerId, RESOURCE_ENERGY],
+                // 一个 container 不需要太多人同时来取，多了只会排队绕圈
+                capacity: 3
+            }))
     }
 
 }
@@ -88,7 +96,7 @@ export function getResourceEnergy(room: Room): MyTask[] {
 
 export function getStorageEnergy(room: Room): MyTask[] {
     const storage = room.storage
-    if (!storage) {
+    if (!storage || !storage.store.getUsedCapacity(RESOURCE_ENERGY)) {
         return []
     } else {
         return [{

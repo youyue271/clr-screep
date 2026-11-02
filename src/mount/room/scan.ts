@@ -32,6 +32,12 @@ export default class RoomScanExtension extends Room {
             this.refreshMaintenanceQueue(cache)
             this.syncWallRepairTasks()
         }
+        // container / 掉落物会变化，定期把新出现的能量来源补进 energyTask 队列
+        if (cache.lastEnergyTaskScan === undefined
+            || now - cache.lastEnergyTaskScan >= 10) {
+            cache.lastEnergyTaskScan = now
+            this.refreshEnergyTasks()
+        }
     }
 
     private refreshThreat(cache: RoomGlobalCache): void {

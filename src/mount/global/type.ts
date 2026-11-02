@@ -31,6 +31,7 @@ interface RoomGlobalCache {
     lastThreatScan?: number
     lastRepairScan?: number
     lastMaintenanceScan?: number
+    lastEnergyTaskScan?: number
     calmTicks?: number
     // towerId -> 上次请求补能的 tick
     refillTicks?: { [towerId: string]: number }

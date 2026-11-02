@@ -101,6 +101,10 @@ export default class CreepExtension extends Creep {
                         queue = [...queue].sort((a, b) =>
                             (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0))
                     }
+                } else if (taskType === 'energyTask') {
+                    // 多个 container / 掉落物时优先去没人预约的，避免所有缺能量的 creep 挤在一个矿点
+                    queue = [...queue].sort((a, b) =>
+                        (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0))
                 }
                 for (let i = 0; i < queue.length; i++) {
                     const task = queue[i]
@@ -220,6 +224,13 @@ export default class CreepExtension extends Creep {
         if (!source) {
             return true
         }
+        // 身上满了先卸货：能量必须进入 container（没有就掉在地上给 carrier 捡），
+        // 否则 container 永远存不住能量，整个能量链就断了
+        if (!this.store.getFreeCapacity(RESOURCE_ENERGY)) {
+            this.say("📦卸货")
+            this.dumpEnergy()
+            return false
+        }
         this.say("⛏️007采矿")
 
         // 没有 container / 工地位置时退化为直接贴着 source 采集
@@ -238,6 +249,23 @@ export default class CreepExtension extends Creep {
             this.harvest(source)
         }
         return false
+    }
+
+    /**
+     * 把身上的能量交给脚下的 container；没有 container 或已满就丢在地上。
+     * container 和掉落物都会被 carrier / emptyWorker 的 energyTask 捡走。
+     */
+    private dumpEnergy() {
+        if (!this.store.getUsedCapacity(RESOURCE_ENERGY)) {
+            return
+        }
+        const container = this.pos.lookFor(LOOK_STRUCTURES)
+            .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
+        if (container && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            this.transfer(container, RESOURCE_ENERGY)
+            return
+        }
+        this.drop(RESOURCE_ENERGY)
     }
 
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant) {
@@ -279,7 +307,8 @@ export default class CreepExtension extends Creep {
             delete this.memory.oldRole
             return true
         } else if (res == ERR_NOT_ENOUGH_RESOURCES) {
-            this.releaseCurrentWork()
+            // 目标已经空了：把任务移出队列，否则所有 emptyWorker 会一直围着它转
+            this.removeCurrentWorkFromQueue()
             return true
         } else if (res == ERR_FULL) {
             const targetRole = this.memory.oldRole ?? this.memory.role

@@ -2,7 +2,7 @@ import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {harvestSetting, repairSetting, spawnTable, wallSetting} from "@/setting";
-import {construct, createBuildTask, getCarryList, getRepairTasks, getWallRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
+import {construct, createBuildTask, getCarryList, getEnergyTask, getRepairTasks, getWallRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 
 export default class RoomExtension extends Room {
@@ -209,6 +209,41 @@ export default class RoomExtension extends Room {
         }
     }
 
+    /**
+     * 定期刷新取能任务：只补充还不存在的目标，已有的任务不重复登记。
+     * 空 container 的任务会在 creep 取不到能量时被移除，这里负责在它重新有能量后补回来。
+     */
+    refreshEnergyTasks() {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return
+        }
+        const tasks = getEnergyTask(this)
+        if (!tasks.length) {
+            return
+        }
+        const buckets = this.normalizeTaskBuckets('energyTask')
+        const existingIds = new Set<string>()
+        for (const key in buckets) {
+            const bucket = buckets[key]
+            if (!bucket || !bucket.length) {
+                continue
+            }
+            for (const task of bucket) {
+                const targetId = task?.targetId ?? task?.taskParam?.[0]
+                if (targetId) {
+                    existingIds.add(targetId)
+                }
+            }
+        }
+        const toAdd = tasks.filter(task => {
+            const targetId = task.targetId ?? task.taskParam?.[0]
+            return !!targetId && !existingIds.has(targetId)
+        })
+        if (toAdd.length) {
+            this.registTask(toAdd)
+        }
+    }
+
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]) {
         if (!this.memory.creepTask) {
             return
@@ -400,11 +435,22 @@ export default class RoomExtension extends Room {
             // console.log(creepName, creep, creep.memory.spawnRoom)
             if (creep.memory.spawnRoom == this.name) {
                 // console.log(1)
+                // remember() 会重建 Memory.creeps 条目，先保住 harvester 绑定的矿点，
+                // 否则每次推送代码都会丢掉矿点归属，补员/换班就会数错人数
+                const assignedSource = creep.memory.harvestSourceId
+                    ?? (creep.memory.currentWork?.taskParam?.[0] as Id<Source> | undefined)
                 delete Memory.creeps[creepName]
                 creep.remember()
-                const role = creep.memory.role
+                // emptyWorker 只是临时取能状态，按原职业统计，否则每次推送代码都会
+                // 把正在取能的 worker 当成缺失，重复排队孵化
+                const role = creep.memory.role === 'emptyWorker'
+                    ? (creep.memory.oldRole ?? creep.memory.role)
+                    : creep.memory.role
                 // 代码推送会清空 Memory.rooms（包括事件），这里给现存的 harvester 重新挂换班事件
                 if (role === 'harvester') {
+                    if (assignedSource) {
+                        creep.memory.harvestSourceId = assignedSource
+                    }
                     this.scheduleHarvesterHandover(creep)
                 }
 

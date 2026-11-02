@@ -55,6 +55,11 @@ interface Room {
     refreshEnergyCarryTasks(): void
 
     /**
+     * 定期把新出现的能量来源（container / 掉落物 / storage / tombstone）补进 energyTask
+     */
+    refreshEnergyTasks(): void
+
+    /**
      * 房间环境扫描（敌对/受伤/维修队列），结果缓存在 global.room
      */
     scan(): void
