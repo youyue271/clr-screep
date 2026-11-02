@@ -6,6 +6,8 @@ interface CreepMemory {
     currentWork?: TaskEntity
     currentWorkType?: TaskType
     reSpawn: boolean
+    // 提前换班的 harvester 孵化时指定的矿点，保证接替的是同一个矿
+    harvestSourceId?: Id<Source>
 }
 
 type Role = 'worker'

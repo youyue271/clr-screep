@@ -20,6 +20,11 @@ interface RoomMemory {
         lab: [number, number]
     }
     containerPos?: any[]
+    // 按 sourceId 缓存矿点 container 位置，避免 sources 顺序变化导致换点
+    containerPosById?: { [sourceId: string]: [number, number] }
+    // 布局时计算的 spawn -> 矿点路径长度（tile 数），用于 harvester 提前换班
+    harvestSpawnDistance?: { [sourceId: string]: number }
+    harvestSpawnPos?: [number, number]
 }
 
 interface Room {
@@ -61,6 +66,11 @@ interface Room {
     syncWallRepairTasks(): void
 
     /**
+     * harvester 提前换班检查
+     */
+    checkHarvesters(): void
+
+    /**
      * 初始化Spawn列表
      */
     initSpawnList(): void
@@ -69,7 +79,7 @@ interface Room {
      * 对添加孵化列表的简单封装
      * @param role
      */
-    addToSpawnList(role: Role): void
+    addToSpawnList(role: Role, sourceId?: Id<Source>): void
 
     /**
      * event相关

@@ -88,7 +88,9 @@ export default class SpawnExtension extends Spawn {
                             role: role,
                             spawnRoom: this.room.name,
                             working: false,
-                            reSpawn: true
+                            reSpawn: true,
+                            // 提前换班的 harvester 会带上矿点 id
+                            harvestSourceId: task?.taskParam?.[2] as Id<Source> | undefined
                         },
                         energyStructures: energyStructureList
                     })

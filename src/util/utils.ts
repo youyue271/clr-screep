@@ -32,6 +32,26 @@ export function calcBodyPart(bodySet: BodySet): BodyPartConstant[] {
     return [].concat(...bodys)
 }
 
+/**
+ * creep 走一格需要的 tick 数。
+ * 每 tick 恢复 2 * MOVE 数量点疲劳，走一格增加 (总部件数 - MOVE 数) 点疲劳。
+ */
+export function calcTicksPerTile(body: BodyPartConstant[]): number {
+    const moveParts = body.filter(part => part === MOVE).length
+    if (!moveParts) {
+        return 20
+    }
+    const weight = body.length - moveParts
+    return Math.max(1, Math.ceil(weight / (moveParts * 2)))
+}
+
+/**
+ * 单个 spawn 孵化这个身体需要的 tick 数
+ */
+export function calcSpawnTicks(body: BodyPartConstant[]): number {
+    return body.length * CREEP_SPAWN_TIME
+}
+
 export function CalBodyCost(bodys: BodyPartConstant[]) {
     let cost = 0
     if (!bodys) {

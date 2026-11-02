@@ -75,6 +75,8 @@ export default class CreepExtension extends Creep {
         }
         const TaskList = roleToTask[this.memory.role]
         const now = Game.time
+        // 提前换班孵化出来的 harvester 只认领孵化时指定的矿点
+        const assignedSource = this.memory.role === 'harvester' ? this.memory.harvestSourceId : undefined
         for (const taskType of TaskList) {
             const buckets = room.normalizeTaskBuckets(taskType)
             if (!buckets) {
@@ -82,9 +84,23 @@ export default class CreepExtension extends Creep {
             }
             const keys = Object.keys(buckets).map(Number).sort((a, b) => a - b)
             for (const key of keys) {
-                const queue = buckets[String(key)]
+                let queue = buckets[String(key)]
                 if (!queue || !queue.length) {
                     continue
+                }
+                if (taskType === 'harvestTask') {
+                    if (assignedSource) {
+                        // 指定的矿点优先；如果该矿点已满，再退回到其他矿点，避免替补原地发呆
+                        queue = [...queue].sort((a, b) => {
+                            const aMatched = a?.taskParam?.[0] === assignedSource ? 0 : 1
+                            const bMatched = b?.taskParam?.[0] === assignedSource ? 0 : 1
+                            return aMatched - bMatched
+                        })
+                    } else {
+                        // 没指定矿点时优先选还没人预约的矿点，避免多个 harvester 挤在一个矿上
+                        queue = [...queue].sort((a, b) =>
+                            (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0))
+                    }
                 }
                 for (let i = 0; i < queue.length; i++) {
                     const task = queue[i]

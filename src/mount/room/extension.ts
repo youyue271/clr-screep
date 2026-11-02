@@ -1,7 +1,7 @@
-import {getBody, initializeArray} from "@/util/utils";
+import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {repairSetting, spawnTable, wallSetting} from "@/setting";
+import {harvestSetting, repairSetting, spawnTable, wallSetting} from "@/setting";
 import {construct, createBuildTask, getCarryList, getRepairTasks, getWallRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 
@@ -69,8 +69,39 @@ export default class RoomExtension extends Room {
             this.memory.creepTask['constructTask'] = {}
         }
         this.construct(this.controller.level)
+        // 确保矿点 container 工地存在：已有 container 会被直接复用，不会另起新点
+        this.containerPos()
+        // 布局完成后计算 spawn 到各矿点的距离，供 harvester 提前换班使用
+        this.cacheHarvestSpawnDistances()
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES)
         this.registTask(createBuildTask(constructionSites))
+    }
+
+    /**
+     * 布局阶段计算 spawn 到每个矿点的路径长度，存进 Memory。
+     * spawn 位置不变时直接复用缓存，避免频繁寻路。
+     */
+    private cacheHarvestSpawnDistances() {
+        const spawn = this.find(FIND_MY_SPAWNS)[0]
+        if (!spawn) {
+            return
+        }
+        const spawnPos = spawn.pos
+        const storedPos = this.memory.harvestSpawnPos
+        if (storedPos && storedPos[0] === spawnPos.x && storedPos[1] === spawnPos.y
+            && this.memory.harvestSpawnDistance) {
+            return
+        }
+        const distances: { [sourceId: string]: number } = {}
+        for (const sourceId of this.sources()) {
+            const source = Game.getObjectById<Source>(sourceId)
+            if (!source) {
+                continue
+            }
+            distances[sourceId] = this.findPath(spawnPos, source.pos, {ignoreCreeps: true}).length
+        }
+        this.memory.harvestSpawnDistance = distances
+        this.memory.harvestSpawnPos = [spawnPos.x, spawnPos.y]
     }
 
     initResource() {
@@ -390,7 +421,7 @@ export default class RoomExtension extends Room {
         }
     }
 
-    addToSpawnList(role: Role) {
+    addToSpawnList(role: Role, sourceId?: Id<Source>) {
         if (!this.memory.creepTask) {
             return
         }
@@ -401,7 +432,8 @@ export default class RoomExtension extends Room {
         const task: TaskEntity = {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
-            taskParam: [role, getBody(role, this)],
+            // 第三个参数是矿点 id：提前换班的 harvester 孵化后只认这个矿点
+            taskParam: [role, getBody(role, this), sourceId],
             priority: role == 'harvester' ? 0 : role == 'carrier' ? 1 : 2,
             capacity: 1,
             persistent: false, 
@@ -412,6 +444,149 @@ export default class RoomExtension extends Room {
             spawnBuckets[key] = []
         }
         spawnBuckets[key].push(task)
+    }
+
+    /**
+     * harvester 换班检查：当现有 harvester 的 TTL 不足以完成
+     * spawn + 跑到矿点时，提前安排同一个矿点的替补。
+     * 换班期间新旧 harvester 可以同时占用一个矿点（harvestTask capacity = 2）。
+     */
+    checkHarvesters() {
+        if (!this.controller || !this.controller.my || !this.memory.creepTask) {
+            return
+        }
+        const sources = this.sources()
+        const spawns = this.find(FIND_MY_SPAWNS)
+        if (!sources.length || !spawns.length) {
+            return
+        }
+        const body = getBody('harvester', this)
+        const spawnTicks = calcSpawnTicks(body)
+        const ticksPerTile = calcTicksPerTile(body)
+        const distances = this.memory.harvestSpawnDistance ?? {}
+        const thresholdOf = (creep: Creep) => {
+            const sourceId = (creep.memory.harvestSourceId
+                ?? creep.memory.currentWork?.taskParam?.[0]) as string | undefined
+            const distance = (sourceId && distances[sourceId]) || this.maxHarvestDistance(distances)
+            return spawnTicks + distance * ticksPerTile + harvestSetting.earlyMargin
+        }
+        const isHealthy = (creep: Creep) =>
+            creep.ticksToLive === undefined || creep.ticksToLive > thresholdOf(creep)
+
+        // 按矿点统计存活 harvester。不能只看预约：global 重置后预约会全部丢失，
+        // 但 creep 内存里还留着正在采集的矿点，仍然算有效覆盖，避免误判后重复孵化。
+        const coverage: { [sourceId: string]: Creep[] } = {}
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.role !== 'harvester' || creep.memory.spawnRoom !== this.name) {
+                continue
+            }
+            const sourceId = (creep.memory.harvestSourceId
+                ?? creep.memory.currentWork?.taskParam?.[0]) as string | undefined
+            if (!sourceId) {
+                continue
+            }
+            if (!coverage[sourceId]) {
+                coverage[sourceId] = []
+            }
+            coverage[sourceId].push(creep)
+        }
+
+        // 排队中 + 孵化中的 harvester 按 sourceId 记账，避免同一个矿点重复排队
+        const pendingAssigned: { [sourceId: string]: boolean } = {}
+        let pendingUnassigned = 0
+        const notePending = (sourceId?: string) => {
+            if (sourceId) {
+                pendingAssigned[sourceId] = true
+            } else {
+                pendingUnassigned += 1
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            for (const task of queue) {
+                if (task && task.taskParam?.[0] === 'harvester') {
+                    notePending(task.taskParam?.[2] as string | undefined)
+                }
+            }
+        }
+        for (const spawn of spawns) {
+            const spawningName = spawn.spawning?.name
+            if (!spawningName) {
+                continue
+            }
+            const spawningMemory = Memory.creeps[spawningName]
+            if (spawningMemory && spawningMemory.role === 'harvester') {
+                notePending(spawningMemory.harvestSourceId as string | undefined)
+            }
+        }
+
+        const buckets = this.normalizeTaskBuckets('harvestTask')
+        for (const key in buckets) {
+            const queue = buckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            for (const task of queue) {
+                const sourceId = task?.taskParam?.[0] as string | undefined
+                if (!sourceId) {
+                    continue
+                }
+                const reservers = (task.reservedBy ?? [])
+                    .map(item => item && Game.creeps[item.name])
+                    .filter((creep): creep is Creep => !!creep)
+                const covered = reservers.concat(coverage[sourceId] ?? [])
+                    .some(creep => isHealthy(creep))
+                if (covered) {
+                    // 已经有健康的采集者，顺手清掉之前多排的替补任务
+                    this.cancelHarvestSpawnTasks(sourceId)
+                    continue
+                }
+                if (pendingAssigned[sourceId]) {
+                    continue
+                }
+                if (pendingUnassigned > 0) {
+                    pendingUnassigned -= 1
+                    continue
+                }
+                this.addToSpawnList('harvester', sourceId as Id<Source>)
+                pendingAssigned[sourceId] = true
+            }
+        }
+    }
+
+    /**
+     * 移除指定矿点多余的 harvester 替补 spawn 任务
+     */
+    private cancelHarvestSpawnTasks(sourceId: string) {
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            const next = queue.filter(task =>
+                !(task && task.taskParam?.[0] === 'harvester' && task.taskParam?.[2] === sourceId))
+            if (next.length) {
+                spawnBuckets[key] = next
+            } else {
+                delete spawnBuckets[key]
+            }
+        }
+    }
+
+    private maxHarvestDistance(distances: { [sourceId: string]: number }): number {
+        let max = 0
+        for (const sourceId in distances) {
+            if (distances[sourceId] > max) {
+                max = distances[sourceId]
+            }
+        }
+        return max || harvestSetting.defaultDistance
     }
 
     creepRecycle() {
@@ -451,7 +626,10 @@ export default class RoomExtension extends Room {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole
                     }
-                    room.addToSpawnList(memory.role)
+                    // harvester 由 checkHarvesters 提前换班并统一补员，这里不再重复排队
+                    if (memory.role !== 'harvester') {
+                        room.addToSpawnList(memory.role)
+                    }
                 }
                 delete Memory.creeps[creepName]
             }
@@ -708,27 +886,51 @@ export default class RoomExtension extends Room {
     }
 
     containerPos() {
-        const cached = this.memory.containerPos ?? []
         const sources = this.sources()
+        // 按 sourceId 缓存，避免 sources 顺序变化（global 重置/代码推送）后下标错位
+        const byId: { [sourceId: string]: [number, number] } = this.memory.containerPosById ?? {}
+        const legacy = this.memory.containerPos ?? []
         const containerPos: [number, number][] = []
+        const rememberPos = (sourceId: string, pos: RoomPosition) => {
+            const point: [number, number] = [pos.x, pos.y]
+            byId[sourceId] = point
+            containerPos.push(point)
+        }
         sources.forEach((item, index) => {
-            const source = Game.getObjectById(item)
+            const source = Game.getObjectById<Source>(item)
             if (!source) {
                 return
             }
-            const containers = source.pos.findInRange(FIND_MY_STRUCTURES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
+            // container 没有 owner，必须用 FIND_STRUCTURES；FIND_MY_STRUCTURES 永远查不到
+            const containers = source.pos.findInRange(FIND_STRUCTURES, 1, {
+                filter: (object: any) => object.structureType === STRUCTURE_CONTAINER
+            }) as StructureContainer[]
             if (containers.length > 0) {
-                containerPos.push([containers[0].pos.x, containers[0].pos.y])
+                // 已经建好的 container 优先复用，绝不在别处另起工地
+                rememberPos(item, containers[0].pos)
                 return
             }
-            const constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {filter: {structureType: STRUCTURE_CONTAINER}})
+            const constructionSites = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {
+                filter: {structureType: STRUCTURE_CONTAINER}
+            })
             if (constructionSites.length > 0) {
-                containerPos.push([constructionSites[0].pos.x, constructionSites[0].pos.y])
+                rememberPos(item, constructionSites[0].pos)
                 return
             }
-            const cachedPos = cached[index]
+            let cachedPos = byId[item]
+            if (!cachedPos && legacy[index]) {
+                // 旧缓存是按 sources 下标存的，global 重置后顺序可能变化，必须校验是否贴着这个矿点
+                const candidate = legacy[index]
+                const candidatePos = this.getPositionAt(candidate[0], candidate[1])
+                if (candidatePos && candidatePos.inRangeTo(source, 1)) {
+                    cachedPos = [candidate[0], candidate[1]]
+                }
+            }
             if (cachedPos) {
-                containerPos.push([cachedPos[0], cachedPos[1]])
+                const pos = this.getPositionAt(cachedPos[0], cachedPos[1])
+                if (pos) {
+                    rememberPos(item, pos)
+                }
                 return
             }
             const direction = [
@@ -767,7 +969,11 @@ export default class RoomExtension extends Room {
                     finalPos = bestPos
                 }
             }
-            containerPos.push([finalPos.x, finalPos.y])
+            rememberPos(item, finalPos)
+            // 目标格已经有建筑/工地时不再创建，避免重复工地
+            if (finalPos.lookFor(LOOK_STRUCTURES).length || finalPos.lookFor(LOOK_CONSTRUCTION_SITES).length) {
+                return
+            }
             const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
             if (createResult == OK) {
                 const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0]
@@ -776,6 +982,7 @@ export default class RoomExtension extends Room {
                 }
             }
         })
+        this.memory.containerPosById = byId
         this.memory.containerPos = containerPos
         return containerPos
     }

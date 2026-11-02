@@ -1,5 +1,5 @@
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
-import {repairPriority, repairSetting, upgradeTaskCapacity, wallSetting} from "@/setting";
+import {harvestSetting, repairPriority, repairSetting, upgradeTaskCapacity, wallSetting} from "@/setting";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -24,7 +24,9 @@ export function harvestSource(room: Room) {
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
             // 找不到 source 旁的 container / 工地时退化为直接走到 source 旁边采集
-            taskParam: targetPos ? [sourceId, targetPos.x, targetPos.y] : [sourceId, null, null]
+            taskParam: targetPos ? [sourceId, targetPos.x, targetPos.y] : [sourceId, null, null],
+            // 平时每个矿点 1 个采集者；容量 2 是为了换班时新旧 harvester 能同时上岗
+            capacity: harvestSetting.capacity,
         })
     }
     return tasks
@@ -207,7 +209,8 @@ export function createBuildTask(targetList:ConstructionSite[]): MyTask[]{
         let constructionType = item.structureType
         let priority = 3
         // 注意：这里必须用 includes，in 判断的是数组下标而不是元素
-        const priority1Structures: StructureConstant[] = [STRUCTURE_EXTENSION, STRUCTURE_SPAWN, STRUCTURE_CONTAINER]
+        // 前期优先建 spawn/extension（直接决定能孵化多少 creep），container 其次
+        const priority1Structures: StructureConstant[] = [STRUCTURE_EXTENSION, STRUCTURE_SPAWN]
         const priority2Structures: StructureConstant[] = [STRUCTURE_TOWER]
         const priority4Structures: StructureConstant[] = [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]
         if (priority1Structures.includes(constructionType)) {

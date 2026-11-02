@@ -52,6 +52,17 @@ export const wallSetting = {
     minStorageEnergy: 50000,
 }
 
+export const harvestSetting = {
+    // 每个矿点允许的采集者数量：平时 1 个，换班时新旧 harvester 可以同时占用
+    capacity: 2,
+    // 换班检查间隔（tick）
+    checkInterval: 5,
+    // 提前量：spawn 排队、地形绕路等额外预留的 tick
+    earlyMargin: 15,
+    // 没有布局距离缓存时的默认路径长度（tile）
+    defaultDistance: 20,
+}
+
 export const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
     threatScanInterval: 5,
