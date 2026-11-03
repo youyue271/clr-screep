@@ -14,9 +14,40 @@ export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
 // 这里只处理漏网的情况，频率不需要高。
 export const energyStructureScanInterval = 100
 
-// TODO(energy): container 低/高水位、取能任务并发数按 RCL 配置。
-// 后期大型 carrier 一次能取很多，并发数应随 carrier 平均载重动态下降，
-// 不要一直固定为 3。Phase 2 再实现。
+// container 低/高水位（按 controller level 取）。
+// 低于 low：不派新的取能任务，留一点缓冲，避免空 container 吸人。
+// 达到 high：并发拉满；介于两者之间时按可用能量 / carrier 平均载重算并发。
+// 数值先按经验给，后续按官服实测调整。
+export const containerWatermark = [
+    {low: 0, high: 0},        // RCL0
+    {low: 50, high: 600},     // RCL1
+    {low: 100, high: 1000},   // RCL2
+    {low: 150, high: 1400},   // RCL3
+    {low: 200, high: 1600},   // RCL4
+    {low: 250, high: 1800},   // RCL5
+    {low: 300, high: 2000},   // RCL6
+    {low: 300, high: 2000},   // RCL7
+    {low: 300, high: 2000},   // RCL8
+]
+
+// 单个 container 同时允许几个 creep 取能的上限（按 RCL）
+export const containerConcurrency = [0, 1, 2, 3, 4, 4, 5, 5, 5]
+
+// container 列表的兜底刷新间隔。建成有 buildOver 事件，这里只处理漏网/被拆。
+export const containerScanInterval = 100
+
+// 掉落物/墓碑的机会队列：按衰减速度 + 距离评分，只保留前几条
+export const opportunitySetting = {
+    maxTasks: 4,
+    // 单条机会任务最多允许几个 creep
+    maxCapacity: 2,
+}
+
+// storage 储备：低于 reserveEnergy 不再向外派取能任务
+export const storageSetting = {
+    reserveEnergy: 5000,
+    maxCapacity: 5,
+}
 
 export const repairSetting = {
     // 同时存在的维修任务上限。每个任务容量 1，避免大量 worker 被维修吸走

@@ -1,5 +1,15 @@
 // 此文件定义的所有Task执行的func都是绑定在Creep的prototype上的
-import {harvestSetting, repairPriority, repairSetting, upgradeTaskCapacity, wallSetting} from "@/setting";
+import {
+    containerConcurrency,
+    containerWatermark,
+    harvestSetting,
+    opportunitySetting,
+    repairPriority,
+    repairSetting,
+    storageSetting,
+    upgradeTaskCapacity,
+    wallSetting
+} from "@/setting";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -57,90 +67,127 @@ export function construct(ConstructionSiteId: any): MyTask[] {
 
 export function getContainerEnergy(room: Room): MyTask[] {
     const containerIds = room.getContainer()
-    if (!containerIds) {
+    if (!containerIds || !containerIds.length) {
         return []
-    } else {
-        // 只给真正有能量的 container 建任务，空 container 会变成黑洞，
-        // 把所有没能量的 creep 都吸过去原地打转
-        return containerIds
-            .filter(containerId => {
-                const container = Game.getObjectById<StructureContainer>(containerId)
-                return !!container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0
-            })
-            .map(containerId => ({
-                taskType: 'energyTask',
-                taskFunc: 'getEnergyFromStructure',
-                priority: 2,
-                taskParam: [containerId, RESOURCE_ENERGY],
-                // 一个 container 不需要太多人同时来取，多了只会排队绕圈
-                // TODO(energy): 并发数按 RCL + carrier 平均载重动态计算；
-                // 后期大型 carrier 一次能取很多，应该少派几个人。
-                // TODO(energy): container 低/高水位按 RCL 配置，Phase 2 实现。
-                capacity: 3
-            }))
     }
-
+    const level = room.controller ? room.controller.level : 0
+    const watermark = containerWatermark[level] ?? containerWatermark[0]
+    const maxConcurrency = containerConcurrency[level] ?? 0
+    if (!maxConcurrency) {
+        return []
+    }
+    const avgCarry = room.avgCarrierCapacity()
+    const tasks: MyTask[] = []
+    for (const containerId of containerIds) {
+        const container = Game.getObjectById<StructureContainer>(containerId)
+        if (!container) {
+            continue
+        }
+        const energy = container.store.getUsedCapacity(RESOURCE_ENERGY)
+        const usable = energy - watermark.low
+        // 低于低水位不建任务，留一点缓冲，避免空 container 吸人
+        if (usable <= 0) {
+            continue
+        }
+        // 高水位以上并发拉满；介于低/高水位之间按可用能量/平均载重算，
+        // 大 carrier 一次能取多，需要的并发自然下降。
+        const capacity = energy >= watermark.high
+            ? maxConcurrency
+            : Math.max(1, Math.min(maxConcurrency, Math.ceil(usable / avgCarry)))
+        tasks.push({
+            taskType: 'energyTask',
+            taskFunc: 'getEnergyFromStructure',
+            priority: 2,
+            taskParam: [containerId, RESOURCE_ENERGY],
+            capacity: capacity
+        })
+    }
+    return tasks
 }
 
-export function getResourceEnergy(room: Room): MyTask[] {
-    const resources = room.getResources()
-    if (!resources) {
-        return []
-    } else {
-        // TODO(energy): 掉落物是会衰减的机会性能量，Phase 2 改成按
-        // amount / 距离 / 剩余衰减时间评分的机会队列，不占用固定任务容量。
-        return resources.map(resource => ({
-            taskType: 'energyTask',
+/**
+ * 掉落物/墓碑的机会队列：都会衰减，不能按固定任务容量管理。
+ * 评分越高越优先：量越大、剩余寿命越短、离 spawn 越近。
+ * 只保留前 opportunitySetting.maxTasks 条。
+ */
+export function getOpportunityEnergy(room: Room): MyTask[] {
+    const avgCarry = room.avgCarrierCapacity()
+    const spawn = room.find(FIND_MY_SPAWNS)[0]
+    const candidates: {
+        id: Id<any>
+        taskFunc: string
+        amount: number
+        score: number
+    }[] = []
+    const scoreOf = (amount: number, ticksToDecay: number, distance: number) =>
+        amount / ((ticksToDecay + 1) * (10 + distance))
+    // 掉落物：直接用 find 拿本 tick 的新鲜对象。
+    // global.room 里缓存的 Resource 跨 tick 会失效（id 都读不到），不能用。
+    for (const resource of room.find(FIND_DROPPED_RESOURCES)) {
+        if (resource.resourceType !== RESOURCE_ENERGY || !resource.amount) {
+            continue
+        }
+        const distance = spawn ? resource.pos.getRangeTo(spawn) : 10
+        // @types/screeps 的 Resource 没声明 ticksToDecay，运行时是有的
+        const ticksToDecay = (resource as any).ticksToDecay ?? 1000
+        candidates.push({
+            id: resource.id,
             taskFunc: 'collectEnergy',
-            priority: 1,
-            taskParam: [resource.id],
-            capacity: 3
-        }))
+            amount: resource.amount,
+            score: scoreOf(resource.amount, ticksToDecay, distance)
+        })
     }
+    // 墓碑：几十 tick 就消失，优先于远处的大堆掉落物
+    for (const tombstone of room.find(FIND_TOMBSTONES)) {
+        const amount = tombstone.store.getUsedCapacity(RESOURCE_ENERGY)
+        if (!amount) {
+            continue
+        }
+        const distance = spawn ? tombstone.pos.getRangeTo(spawn) : 10
+        candidates.push({
+            id: tombstone.id,
+            taskFunc: 'getEnergyFromStructure',
+            amount: amount,
+            score: scoreOf(amount, tombstone.ticksToDecay ?? 100, distance)
+        })
+    }
+    candidates.sort((a, b) => b.score - a.score)
+    return candidates.slice(0, opportunitySetting.maxTasks).map(candidate => ({
+        taskType: 'energyTask',
+        taskFunc: candidate.taskFunc,
+        priority: 1,
+        taskParam: [candidate.id, RESOURCE_ENERGY],
+        capacity: candidate.amount >= avgCarry ? opportunitySetting.maxCapacity : 1
+    }))
 }
 
 export function getStorageEnergy(room: Room): MyTask[] {
     const storage = room.storage
-    if (!storage || !storage.store.getUsedCapacity(RESOURCE_ENERGY)) {
+    if (!storage) {
         return []
-    } else {
-        return [{
-            taskType: 'energyTask',
-            taskFunc: 'getEnergyFromStructure',
-            priority:3, 
-            taskParam: [storage.id, RESOURCE_ENERGY],
-            capacity:5
-        }]
     }
-}
-
-export function getTombstoneEnergy(room: Room): MyTask[] {
-    const tombstones = room.find(FIND_TOMBSTONES)
-    if (!tombstones) {
+    const energy = storage.store.getUsedCapacity(RESOURCE_ENERGY)
+    // storage 是储备，低于保留量不再向外派任务
+    const usable = energy - storageSetting.reserveEnergy
+    if (usable <= 0) {
         return []
-    } else {
-        return tombstones.filter(tombstone => tombstone.store['energy']).map(tombstone => {
-            return {
-                taskType: 'energyTask',
-                taskFunc: 'getEnergyFromStructure',
-                priority:3, 
-                taskParam: [tombstone.id, RESOURCE_ENERGY],
-                capacity: 1
-            }
-        })
     }
+    const avgCarry = room.avgCarrierCapacity()
+    const capacity = Math.max(1, Math.min(storageSetting.maxCapacity, Math.ceil(usable / avgCarry)))
+    return [{
+        taskType: 'energyTask',
+        taskFunc: 'getEnergyFromStructure',
+        priority: 3,
+        taskParam: [storage.id, RESOURCE_ENERGY],
+        capacity: capacity
+    }]
 }
 
 export function getEnergyTask(room: Room): MyTask[] {
-    let containTasks = getContainerEnergy(room)
-
-    let resourceTasks = getResourceEnergy(room)
-
-    let storageTasks = getStorageEnergy(room)
-
-    let tombstonesTasks = getTombstoneEnergy(room)
-
-    return [...containTasks, ...resourceTasks, ...storageTasks, ...tombstonesTasks]
+    const containTasks = getContainerEnergy(room)
+    const opportunityTasks = getOpportunityEnergy(room)
+    const storageTasks = getStorageEnergy(room)
+    return [...containTasks, ...opportunityTasks, ...storageTasks]
 }
 
 // export function getEnergyWithStorage(room: Room): MyTask[] {

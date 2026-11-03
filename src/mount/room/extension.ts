@@ -1,7 +1,7 @@
 import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {harvestSetting, repairSetting, spawnTable, wallSetting} from "@/setting";
+import {containerWatermark, harvestSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
 import {construct, createBuildTask, getCarryList, getEnergyTask, getRepairTasks, getWallRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 
@@ -360,31 +360,73 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * 定期刷新取能任务：只补充还不存在的目标，已有的任务不重复登记。
-     * 空 container 的任务会在 creep 取不到能量时被移除，这里负责在它重新有能量后补回来。
+     * 定期刷新取能任务：先剔除失效任务，再补缺失的目标。
+     * 以前只加不删，墓碑/掉落物消失后会留下永久的死任务。
      */
     refreshEnergyTasks() {
         if (!this.memory.creepTask || !this.controller || !this.controller.my) {
             return
         }
+        const level = this.controller.level
+        const watermark = containerWatermark[level] ?? containerWatermark[0]
+        // 先算出这一轮应有的任务，既用来补缺，也用来同步已有任务的并发数
         const tasks = getEnergyTask(this)
-        if (!tasks.length) {
-            return
+        const desired: { [targetId: string]: MyTask } = {}
+        for (const task of tasks) {
+            const targetId = task.targetId ?? task.taskParam?.[0]
+            if (targetId) {
+                desired[targetId] = task
+            }
         }
         const buckets = this.normalizeTaskBuckets('energyTask')
         const existingIds = new Set<string>()
         for (const key in buckets) {
             const bucket = buckets[key]
             if (!bucket || !bucket.length) {
+                delete buckets[key]
                 continue
             }
+            const nextBucket: TaskEntity[] = []
             for (const task of bucket) {
-                const targetId = task?.targetId ?? task?.taskParam?.[0]
-                if (targetId) {
-                    existingIds.add(targetId)
+                if (!task) {
+                    continue
                 }
+                const targetId = task.targetId ?? task.taskParam?.[0]
+                if (!targetId) {
+                    continue
+                }
+                const target = Game.getObjectById(targetId) as any
+                // 目标已经不存在（墓碑/掉落物过期、结构被拆）直接删
+                if (!target) {
+                    continue
+                }
+                const energy = this.energyOf(target)
+                if (energy <= 0) {
+                    continue
+                }
+                const structureType = target.structureType
+                if (structureType === STRUCTURE_CONTAINER && energy < watermark.low) {
+                    // 低于低水位，不再派人去取，留一点缓冲
+                    continue
+                }
+                if (structureType === STRUCTURE_STORAGE && energy <= storageSetting.reserveEnergy) {
+                    continue
+                }
+                // container 能量变化后并发数要跟着变
+                const wanted = desired[targetId]
+                if (wanted) {
+                    task.capacity = wanted.capacity ?? 1
+                }
+                nextBucket.push(task)
+                existingIds.add(targetId)
+            }
+            if (nextBucket.length) {
+                buckets[key] = nextBucket
+            } else {
+                delete buckets[key]
             }
         }
+        this.memory.creepTask['energyTask'] = buckets
         const toAdd = tasks.filter(task => {
             const targetId = task.targetId ?? task.taskParam?.[0]
             return !!targetId && !existingIds.has(targetId)
@@ -392,6 +434,19 @@ export default class RoomExtension extends Room {
         if (toAdd.length) {
             this.registTask(toAdd)
         }
+    }
+
+    /**
+     * 取能目标当前可用能量：container/storage/tombstone 读 store，掉落物读 amount。
+     */
+    private energyOf(target: any): number {
+        if (target.store && typeof target.store.getUsedCapacity == 'function') {
+            return target.store.getUsedCapacity(RESOURCE_ENERGY) ?? 0
+        }
+        if (target.resourceType === RESOURCE_ENERGY || target.resourceType === undefined) {
+            return target.amount ?? 0
+        }
+        return 0
     }
 
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]) {
@@ -940,6 +995,10 @@ export default class RoomExtension extends Room {
             if (structure.structureType === STRUCTURE_SPAWN || structure.structureType === STRUCTURE_EXTENSION) {
                 this.registerEnergyStructure(structure.id as Id<StructureSpawn | StructureExtension>)
             }
+            // 新建 container 立即刷新容器列表，不用等 100 tick 兜底
+            if (structure.structureType === STRUCTURE_CONTAINER) {
+                this.refreshContainers()
+            }
         }
     }
 
@@ -1076,33 +1135,77 @@ export default class RoomExtension extends Room {
         return global.room[this.name].resources
     }
 
+    /**
+     * 容器 id 列表。以前取到一次就永久缓存，新 container 建成后永远进不来；
+     * 现在按 containerScanInterval 兜底刷新，建成时由 buildOver 立即刷新。
+     */
     getContainer(): Id<StructureContainer>[] {
         if (!global.room[this.name]) {
             global.room[this.name] = {}
         }
         if (!global.room[this.name].container) {
-            global.room[this.name].containerCount = 0
-            const containers: Id<StructureContainer>[] = []
-            const posList = this.containerPos() ?? []
-            for (const [x, y] of posList) {
-                const pos = this.getPositionAt(x, y)
-                if (!pos) {
-                    continue
-                }
-                const structure = pos.lookFor(LOOK_STRUCTURES)
-                    .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
-                if (structure) {
-                    containers.push(structure.id)
-                }
-            }
-            if (!containers.length) {
-                return
-            }
-            global.room[this.name].container = containers
+            return this.refreshContainers()
         }
-        // global.room[this.name].containerCount = (global.room[this.name].containerCount + 1) % global.room[this.name].container.length
-        // return global.room[this.name].container[global.room[this.name].containerCount]
         return global.room[this.name].container
+    }
+
+    refreshContainers(): Id<StructureContainer>[] {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {}
+        }
+        const containers: Id<StructureContainer>[] = []
+        const posList = this.containerPos() ?? []
+        for (const [x, y] of posList) {
+            const pos = this.getPositionAt(x, y)
+            if (!pos) {
+                continue
+            }
+            const structure = pos.lookFor(LOOK_STRUCTURES)
+                .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
+            if (structure) {
+                containers.push(structure.id)
+            }
+        }
+        global.room[this.name].container = containers
+        global.room[this.name].lastContainerScan = Game.time
+        return containers
+    }
+
+    /**
+     * 存活 carrier 的平均载重。取能任务的并发数按它算：
+     * carrier 越大，同一个 container 需要的人越少。
+     * 同 tick 内只算一次。
+     */
+    avgCarrierCapacity(): number {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {}
+        }
+        const cache = global.room[this.name]
+        if (cache.avgCarrierCapacityTick === Game.time && cache.avgCarrierCapacity !== undefined) {
+            return cache.avgCarrierCapacity
+        }
+        let total = 0
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.role !== 'carrier') {
+                continue
+            }
+            const capacity = creep.store.getCapacity()
+            if (capacity) {
+                total += capacity
+                count += 1
+            }
+        }
+        let average = count ? total / count : 0
+        if (!average) {
+            // 还没孵化过 carrier 时按计划 body 兜底
+            const carryParts = getBody('carrier', this).filter(part => part === CARRY).length
+            average = Math.max(carryParts * 50, 50)
+        }
+        cache.avgCarrierCapacity = average
+        cache.avgCarrierCapacityTick = Game.time
+        return average
     }
 
     sources(): Id<Source> [] {

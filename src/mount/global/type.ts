@@ -20,6 +20,11 @@ interface RoomGlobalCache {
     // 按布局集群顺序排好的 spawn/extension id，spawn 孵化时按这个顺序扣能量
     energyStructureOrder?: Id<StructureSpawn | StructureExtension>[]
     lastEnergyStructureScan?: number
+    // container 列表改为带时间戳的缓存，不再取到一次就永久锁死
+    lastContainerScan?: number
+    // 存活 carrier 的平均载重（同 tick 内复用）
+    avgCarrierCapacity?: number
+    avgCarrierCapacityTick?: number
     container?:any[]
     containerCount?: number
     resources?:Resource[]

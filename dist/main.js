@@ -3258,9 +3258,36 @@ const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1];
 // spawn/extension 顺序表的兜底扫描间隔。建成/拆除有事件，
 // 这里只处理漏网的情况，频率不需要高。
 const energyStructureScanInterval = 100;
-// TODO(energy): container 低/高水位、取能任务并发数按 RCL 配置。
-// 后期大型 carrier 一次能取很多，并发数应随 carrier 平均载重动态下降，
-// 不要一直固定为 3。Phase 2 再实现。
+// container 低/高水位（按 controller level 取）。
+// 低于 low：不派新的取能任务，留一点缓冲，避免空 container 吸人。
+// 达到 high：并发拉满；介于两者之间时按可用能量 / carrier 平均载重算并发。
+// 数值先按经验给，后续按官服实测调整。
+const containerWatermark = [
+    { low: 0, high: 0 },
+    { low: 50, high: 600 },
+    { low: 100, high: 1000 },
+    { low: 150, high: 1400 },
+    { low: 200, high: 1600 },
+    { low: 250, high: 1800 },
+    { low: 300, high: 2000 },
+    { low: 300, high: 2000 },
+    { low: 300, high: 2000 }, // RCL8
+];
+// 单个 container 同时允许几个 creep 取能的上限（按 RCL）
+const containerConcurrency = [0, 1, 2, 3, 4, 4, 5, 5, 5];
+// container 列表的兜底刷新间隔。建成有 buildOver 事件，这里只处理漏网/被拆。
+const containerScanInterval = 100;
+// 掉落物/墓碑的机会队列：按衰减速度 + 距离评分，只保留前几条
+const opportunitySetting = {
+    maxTasks: 4,
+    // 单条机会任务最多允许几个 creep
+    maxCapacity: 2,
+};
+// storage 储备：低于 reserveEnergy 不再向外派取能任务
+const storageSetting = {
+    reserveEnergy: 5000,
+    maxCapacity: 5,
+};
 const repairSetting = {
     // 同时存在的维修任务上限。每个任务容量 1，避免大量 worker 被维修吸走
     maxTasks: 3,
@@ -3378,86 +3405,121 @@ function construct(ConstructionSiteId) {
         }];
 }
 function getContainerEnergy(room) {
+    var _a, _b;
     const containerIds = room.getContainer();
-    if (!containerIds) {
+    if (!containerIds || !containerIds.length) {
         return [];
     }
-    else {
-        // 只给真正有能量的 container 建任务，空 container 会变成黑洞，
-        // 把所有没能量的 creep 都吸过去原地打转
-        return containerIds
-            .filter(containerId => {
-            const container = Game.getObjectById(containerId);
-            return !!container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0;
-        })
-            .map(containerId => ({
+    const level = room.controller ? room.controller.level : 0;
+    const watermark = (_a = containerWatermark[level]) !== null && _a !== void 0 ? _a : containerWatermark[0];
+    const maxConcurrency = (_b = containerConcurrency[level]) !== null && _b !== void 0 ? _b : 0;
+    if (!maxConcurrency) {
+        return [];
+    }
+    const avgCarry = room.avgCarrierCapacity();
+    const tasks = [];
+    for (const containerId of containerIds) {
+        const container = Game.getObjectById(containerId);
+        if (!container) {
+            continue;
+        }
+        const energy = container.store.getUsedCapacity(RESOURCE_ENERGY);
+        const usable = energy - watermark.low;
+        // 低于低水位不建任务，留一点缓冲，避免空 container 吸人
+        if (usable <= 0) {
+            continue;
+        }
+        // 高水位以上并发拉满；介于低/高水位之间按可用能量/平均载重算，
+        // 大 carrier 一次能取多，需要的并发自然下降。
+        const capacity = energy >= watermark.high
+            ? maxConcurrency
+            : Math.max(1, Math.min(maxConcurrency, Math.ceil(usable / avgCarry)));
+        tasks.push({
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
             priority: 2,
             taskParam: [containerId, RESOURCE_ENERGY],
-            // 一个 container 不需要太多人同时来取，多了只会排队绕圈
-            // TODO(energy): 并发数按 RCL + carrier 平均载重动态计算；
-            // 后期大型 carrier 一次能取很多，应该少派几个人。
-            // TODO(energy): container 低/高水位按 RCL 配置，Phase 2 实现。
-            capacity: 3
-        }));
+            capacity: capacity
+        });
     }
+    return tasks;
 }
-function getResourceEnergy(room) {
-    const resources = room.getResources();
-    if (!resources) {
-        return [];
-    }
-    else {
-        // TODO(energy): 掉落物是会衰减的机会性能量，Phase 2 改成按
-        // amount / 距离 / 剩余衰减时间评分的机会队列，不占用固定任务容量。
-        return resources.map(resource => ({
-            taskType: 'energyTask',
+/**
+ * 掉落物/墓碑的机会队列：都会衰减，不能按固定任务容量管理。
+ * 评分越高越优先：量越大、剩余寿命越短、离 spawn 越近。
+ * 只保留前 opportunitySetting.maxTasks 条。
+ */
+function getOpportunityEnergy(room) {
+    var _a, _b;
+    const avgCarry = room.avgCarrierCapacity();
+    const spawn = room.find(FIND_MY_SPAWNS)[0];
+    const candidates = [];
+    const scoreOf = (amount, ticksToDecay, distance) => amount / ((ticksToDecay + 1) * (10 + distance));
+    // 掉落物：直接用 find 拿本 tick 的新鲜对象。
+    // global.room 里缓存的 Resource 跨 tick 会失效（id 都读不到），不能用。
+    for (const resource of room.find(FIND_DROPPED_RESOURCES)) {
+        if (resource.resourceType !== RESOURCE_ENERGY || !resource.amount) {
+            continue;
+        }
+        const distance = spawn ? resource.pos.getRangeTo(spawn) : 10;
+        // @types/screeps 的 Resource 没声明 ticksToDecay，运行时是有的
+        const ticksToDecay = (_a = resource.ticksToDecay) !== null && _a !== void 0 ? _a : 1000;
+        candidates.push({
+            id: resource.id,
             taskFunc: 'collectEnergy',
-            priority: 1,
-            taskParam: [resource.id],
-            capacity: 3
-        }));
+            amount: resource.amount,
+            score: scoreOf(resource.amount, ticksToDecay, distance)
+        });
     }
+    // 墓碑：几十 tick 就消失，优先于远处的大堆掉落物
+    for (const tombstone of room.find(FIND_TOMBSTONES)) {
+        const amount = tombstone.store.getUsedCapacity(RESOURCE_ENERGY);
+        if (!amount) {
+            continue;
+        }
+        const distance = spawn ? tombstone.pos.getRangeTo(spawn) : 10;
+        candidates.push({
+            id: tombstone.id,
+            taskFunc: 'getEnergyFromStructure',
+            amount: amount,
+            score: scoreOf(amount, (_b = tombstone.ticksToDecay) !== null && _b !== void 0 ? _b : 100, distance)
+        });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.slice(0, opportunitySetting.maxTasks).map(candidate => ({
+        taskType: 'energyTask',
+        taskFunc: candidate.taskFunc,
+        priority: 1,
+        taskParam: [candidate.id, RESOURCE_ENERGY],
+        capacity: candidate.amount >= avgCarry ? opportunitySetting.maxCapacity : 1
+    }));
 }
 function getStorageEnergy(room) {
     const storage = room.storage;
-    if (!storage || !storage.store.getUsedCapacity(RESOURCE_ENERGY)) {
+    if (!storage) {
         return [];
     }
-    else {
-        return [{
-                taskType: 'energyTask',
-                taskFunc: 'getEnergyFromStructure',
-                priority: 3,
-                taskParam: [storage.id, RESOURCE_ENERGY],
-                capacity: 5
-            }];
-    }
-}
-function getTombstoneEnergy(room) {
-    const tombstones = room.find(FIND_TOMBSTONES);
-    if (!tombstones) {
+    const energy = storage.store.getUsedCapacity(RESOURCE_ENERGY);
+    // storage 是储备，低于保留量不再向外派任务
+    const usable = energy - storageSetting.reserveEnergy;
+    if (usable <= 0) {
         return [];
     }
-    else {
-        return tombstones.filter(tombstone => tombstone.store['energy']).map(tombstone => {
-            return {
-                taskType: 'energyTask',
-                taskFunc: 'getEnergyFromStructure',
-                priority: 3,
-                taskParam: [tombstone.id, RESOURCE_ENERGY],
-                capacity: 1
-            };
-        });
-    }
+    const avgCarry = room.avgCarrierCapacity();
+    const capacity = Math.max(1, Math.min(storageSetting.maxCapacity, Math.ceil(usable / avgCarry)));
+    return [{
+            taskType: 'energyTask',
+            taskFunc: 'getEnergyFromStructure',
+            priority: 3,
+            taskParam: [storage.id, RESOURCE_ENERGY],
+            capacity: capacity
+        }];
 }
 function getEnergyTask(room) {
-    let containTasks = getContainerEnergy(room);
-    let resourceTasks = getResourceEnergy(room);
-    let storageTasks = getStorageEnergy(room);
-    let tombstonesTasks = getTombstoneEnergy(room);
-    return [...containTasks, ...resourceTasks, ...storageTasks, ...tombstonesTasks];
+    const containTasks = getContainerEnergy(room);
+    const opportunityTasks = getOpportunityEnergy(room);
+    const storageTasks = getStorageEnergy(room);
+    return [...containTasks, ...opportunityTasks, ...storageTasks];
 }
 // export function getEnergyWithStorage(room: Room): MyTask[] {
 //     let tasks = getContainerEnergy(room)
@@ -4832,32 +4894,75 @@ class RoomExtension extends Room {
         this.addExtensionCarryTasks(structureIds);
     }
     /**
-     * 定期刷新取能任务：只补充还不存在的目标，已有的任务不重复登记。
-     * 空 container 的任务会在 creep 取不到能量时被移除，这里负责在它重新有能量后补回来。
+     * 定期刷新取能任务：先剔除失效任务，再补缺失的目标。
+     * 以前只加不删，墓碑/掉落物消失后会留下永久的死任务。
      */
     refreshEnergyTasks() {
-        var _a, _b;
+        var _a, _b, _c, _d, _e, _f;
         if (!this.memory.creepTask || !this.controller || !this.controller.my) {
             return;
         }
+        const level = this.controller.level;
+        const watermark = (_a = containerWatermark[level]) !== null && _a !== void 0 ? _a : containerWatermark[0];
+        // 先算出这一轮应有的任务，既用来补缺，也用来同步已有任务的并发数
         const tasks = getEnergyTask(this);
-        if (!tasks.length) {
-            return;
+        const desired = {};
+        for (const task of tasks) {
+            const targetId = (_b = task.targetId) !== null && _b !== void 0 ? _b : (_c = task.taskParam) === null || _c === void 0 ? void 0 : _c[0];
+            if (targetId) {
+                desired[targetId] = task;
+            }
         }
         const buckets = this.normalizeTaskBuckets('energyTask');
         const existingIds = new Set();
         for (const key in buckets) {
             const bucket = buckets[key];
             if (!bucket || !bucket.length) {
+                delete buckets[key];
                 continue;
             }
+            const nextBucket = [];
             for (const task of bucket) {
-                const targetId = (_a = task === null || task === void 0 ? void 0 : task.targetId) !== null && _a !== void 0 ? _a : (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
-                if (targetId) {
-                    existingIds.add(targetId);
+                if (!task) {
+                    continue;
                 }
+                const targetId = (_d = task.targetId) !== null && _d !== void 0 ? _d : (_e = task.taskParam) === null || _e === void 0 ? void 0 : _e[0];
+                if (!targetId) {
+                    continue;
+                }
+                const target = Game.getObjectById(targetId);
+                // 目标已经不存在（墓碑/掉落物过期、结构被拆）直接删
+                if (!target) {
+                    continue;
+                }
+                const energy = this.energyOf(target);
+                if (energy <= 0) {
+                    continue;
+                }
+                const structureType = target.structureType;
+                if (structureType === STRUCTURE_CONTAINER && energy < watermark.low) {
+                    // 低于低水位，不再派人去取，留一点缓冲
+                    continue;
+                }
+                if (structureType === STRUCTURE_STORAGE && energy <= storageSetting.reserveEnergy) {
+                    continue;
+                }
+                // container 能量变化后并发数要跟着变
+                const wanted = desired[targetId];
+                if (wanted) {
+                    task.capacity = (_f = wanted.capacity) !== null && _f !== void 0 ? _f : 1;
+                }
+                nextBucket.push(task);
+                existingIds.add(targetId);
+            }
+            if (nextBucket.length) {
+                buckets[key] = nextBucket;
+            }
+            else {
+                delete buckets[key];
             }
         }
+        this.memory.creepTask['energyTask'] = buckets;
         const toAdd = tasks.filter(task => {
             var _a, _b;
             const targetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
@@ -4866,6 +4971,19 @@ class RoomExtension extends Room {
         if (toAdd.length) {
             this.registTask(toAdd);
         }
+    }
+    /**
+     * 取能目标当前可用能量：container/storage/tombstone 读 store，掉落物读 amount。
+     */
+    energyOf(target) {
+        var _a, _b;
+        if (target.store && typeof target.store.getUsedCapacity == 'function') {
+            return (_a = target.store.getUsedCapacity(RESOURCE_ENERGY)) !== null && _a !== void 0 ? _a : 0;
+        }
+        if (target.resourceType === RESOURCE_ENERGY || target.resourceType === undefined) {
+            return (_b = target.amount) !== null && _b !== void 0 ? _b : 0;
+        }
+        return 0;
     }
     addExtensionCarryTasks(structureIds) {
         var _a, _b;
@@ -5394,6 +5512,10 @@ class RoomExtension extends Room {
             if (structure.structureType === STRUCTURE_SPAWN || structure.structureType === STRUCTURE_EXTENSION) {
                 this.registerEnergyStructure(structure.id);
             }
+            // 新建 container 立即刷新容器列表，不用等 100 tick 兜底
+            if (structure.structureType === STRUCTURE_CONTAINER) {
+                this.refreshContainers();
+            }
         }
     }
     checkRoomLevel() {
@@ -5521,34 +5643,76 @@ class RoomExtension extends Room {
         }
         return global.room[this.name].resources;
     }
+    /**
+     * 容器 id 列表。以前取到一次就永久缓存，新 container 建成后永远进不来；
+     * 现在按 containerScanInterval 兜底刷新，建成时由 buildOver 立即刷新。
+     */
     getContainer() {
-        var _a;
         if (!global.room[this.name]) {
             global.room[this.name] = {};
         }
         if (!global.room[this.name].container) {
-            global.room[this.name].containerCount = 0;
-            const containers = [];
-            const posList = (_a = this.containerPos()) !== null && _a !== void 0 ? _a : [];
-            for (const [x, y] of posList) {
-                const pos = this.getPositionAt(x, y);
-                if (!pos) {
-                    continue;
-                }
-                const structure = pos.lookFor(LOOK_STRUCTURES)
-                    .find(item => item.structureType === STRUCTURE_CONTAINER);
-                if (structure) {
-                    containers.push(structure.id);
-                }
-            }
-            if (!containers.length) {
-                return;
-            }
-            global.room[this.name].container = containers;
+            return this.refreshContainers();
         }
-        // global.room[this.name].containerCount = (global.room[this.name].containerCount + 1) % global.room[this.name].container.length
-        // return global.room[this.name].container[global.room[this.name].containerCount]
         return global.room[this.name].container;
+    }
+    refreshContainers() {
+        var _a;
+        if (!global.room[this.name]) {
+            global.room[this.name] = {};
+        }
+        const containers = [];
+        const posList = (_a = this.containerPos()) !== null && _a !== void 0 ? _a : [];
+        for (const [x, y] of posList) {
+            const pos = this.getPositionAt(x, y);
+            if (!pos) {
+                continue;
+            }
+            const structure = pos.lookFor(LOOK_STRUCTURES)
+                .find(item => item.structureType === STRUCTURE_CONTAINER);
+            if (structure) {
+                containers.push(structure.id);
+            }
+        }
+        global.room[this.name].container = containers;
+        global.room[this.name].lastContainerScan = Game.time;
+        return containers;
+    }
+    /**
+     * 存活 carrier 的平均载重。取能任务的并发数按它算：
+     * carrier 越大，同一个 container 需要的人越少。
+     * 同 tick 内只算一次。
+     */
+    avgCarrierCapacity() {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {};
+        }
+        const cache = global.room[this.name];
+        if (cache.avgCarrierCapacityTick === Game.time && cache.avgCarrierCapacity !== undefined) {
+            return cache.avgCarrierCapacity;
+        }
+        let total = 0;
+        let count = 0;
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name];
+            if (creep.memory.role !== 'carrier') {
+                continue;
+            }
+            const capacity = creep.store.getCapacity();
+            if (capacity) {
+                total += capacity;
+                count += 1;
+            }
+        }
+        let average = count ? total / count : 0;
+        if (!average) {
+            // 还没孵化过 carrier 时按计划 body 兜底
+            const carryParts = getBody('carrier', this).filter(part => part === CARRY).length;
+            average = Math.max(carryParts * 50, 50);
+        }
+        cache.avgCarrierCapacity = average;
+        cache.avgCarrierCapacityTick = Game.time;
+        return average;
     }
     sources() {
         if (!global.room[this.name].sources) {
@@ -6100,6 +6264,11 @@ class RoomScanExtension extends Room {
             || now - cache.lastEnergyStructureScan >= energyStructureScanInterval) {
             cache.lastEnergyStructureScan = now;
             this.refreshEnergyStructures();
+        }
+        // 兜底刷新 container 列表（建成有 buildOver 事件，这里处理漏网/被拆）
+        if (cache.lastContainerScan === undefined
+            || now - cache.lastContainerScan >= containerScanInterval) {
+            this.refreshContainers();
         }
     }
     refreshThreat(cache) {

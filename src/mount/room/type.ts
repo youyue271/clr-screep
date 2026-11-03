@@ -139,6 +139,10 @@ interface Room {
 
     getContainer(): Id<StructureContainer>[]
 
+    refreshContainers(): Id<StructureContainer>[]
+
+    avgCarrierCapacity(): number
+
     containerPos(): any[]
 
 
