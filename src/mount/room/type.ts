@@ -83,6 +83,11 @@ interface Room {
     refreshEnergyTasks(): void
 
     /**
+     * 按工地状态同步升级任务的并发数
+     */
+    refreshUpgradeTask(): void
+
+    /**
      * 房间环境扫描（敌对/受伤/维修队列），结果缓存在 global.room
      */
     scan(): void

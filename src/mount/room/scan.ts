@@ -39,6 +39,8 @@ export default class RoomScanExtension extends Room {
             this.refreshEnergyTasks()
             // spawn/extension 的补能需求同样按间隔兜底同步
             this.refreshEnergyCarryTasks()
+            // 工地状态变化后升级并发要跟着调整
+            this.refreshUpgradeTask()
         }
         // 兜底重建 spawn/extension 顺序表，处理漏掉的建成/拆除
         if (cache.lastEnergyStructureScan === undefined

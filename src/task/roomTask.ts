@@ -7,6 +7,7 @@ import {
     repairPriority,
     repairSetting,
     storageSetting,
+    upgradeSetting,
     upgradeTaskCapacity,
     wallSetting
 } from "@/setting";
@@ -42,8 +43,34 @@ export function harvestSource(room: Room) {
     return tasks
 }
 
+/**
+ * 升级任务并发：
+ * - 有工地时用 RCL 基准值，保证建造有人干（worker 会先抢 upgrade 再抢 construct）
+ * - 工地清零后放开到实际 worker 数，把闲置劳动力转成进度
+ */
+export function upgradeTaskCapacityOf(room: Room): number {
+    const level = room.controller ? room.controller.level : 0
+    const base = upgradeTaskCapacity[level] ?? 0
+    if (!base) {
+        return 0
+    }
+    if (room.find(FIND_CONSTRUCTION_SITES).length > 0) {
+        return base
+    }
+    // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
+    const workerCount = room.find(FIND_MY_CREEPS, {
+        filter: creep => {
+            const role = creep.memory.role === 'emptyWorker'
+                ? creep.memory.oldRole
+                : creep.memory.role
+            return role === 'worker'
+        }
+    }).length
+    return Math.max(base, Math.min(upgradeSetting.maxCapacity, workerCount))
+}
+
 export function upgrade(room: Room): MyTask[] {
-    const capacity = upgradeTaskCapacity[room.controller.level]
+    const capacity = upgradeTaskCapacityOf(room)
     if (!capacity) {
         return []
     }

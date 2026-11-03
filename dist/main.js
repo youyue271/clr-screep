@@ -3255,6 +3255,12 @@ const spawnTable = {
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
 };
 const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1];
+// 升级并发：有工地时仍用 upgradeTaskCapacity 的基准值，
+// 工地清零后放开到实际 worker 数（不超过 maxCapacity）。
+// worker 的任务顺序里 upgrade 排在 construct 前面，所以有工地时必须限流。
+const upgradeSetting = {
+    maxCapacity: 12,
+};
 // spawn/extension 顺序表的兜底扫描间隔。建成/拆除有事件，
 // 这里只处理漏网的情况，频率不需要高。
 const energyStructureScanInterval = 100;
@@ -3383,8 +3389,34 @@ function harvestSource(room) {
     }
     return tasks;
 }
+/**
+ * 升级任务并发：
+ * - 有工地时用 RCL 基准值，保证建造有人干（worker 会先抢 upgrade 再抢 construct）
+ * - 工地清零后放开到实际 worker 数，把闲置劳动力转成进度
+ */
+function upgradeTaskCapacityOf(room) {
+    var _a;
+    const level = room.controller ? room.controller.level : 0;
+    const base = (_a = upgradeTaskCapacity[level]) !== null && _a !== void 0 ? _a : 0;
+    if (!base) {
+        return 0;
+    }
+    if (room.find(FIND_CONSTRUCTION_SITES).length > 0) {
+        return base;
+    }
+    // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
+    const workerCount = room.find(FIND_MY_CREEPS, {
+        filter: creep => {
+            const role = creep.memory.role === 'emptyWorker'
+                ? creep.memory.oldRole
+                : creep.memory.role;
+            return role === 'worker';
+        }
+    }).length;
+    return Math.max(base, Math.min(upgradeSetting.maxCapacity, workerCount));
+}
 function upgrade(room) {
-    const capacity = upgradeTaskCapacity[room.controller.level];
+    const capacity = upgradeTaskCapacityOf(room);
     if (!capacity) {
         return [];
     }
@@ -3813,6 +3845,14 @@ class CreepExtension extends Creep {
                     return true;
                 }
             }
+        }
+        // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
+        // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
+        // harvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
+        if (this.memory.role !== 'emptyWorker'
+            && this.memory.role !== 'harvester'
+            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+            this.changeRole('emptyWorker');
         }
         return false;
     }
@@ -4971,6 +5011,35 @@ class RoomExtension extends Room {
         if (toAdd.length) {
             this.registTask(toAdd);
         }
+    }
+    /**
+     * 升级任务的并发数随工地状态变化：有工地用 RCL 基准值，
+     * 工地清零后放开到实际 worker 数。只更新容量，不强踢已经预约的 worker，
+     * 他们在下一次补能后会按新容量自然分流。
+     */
+    refreshUpgradeTask() {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return;
+        }
+        const capacity = upgradeTaskCapacityOf(this);
+        if (!capacity) {
+            return;
+        }
+        const buckets = this.normalizeTaskBuckets('upgradeTask');
+        for (const key in buckets) {
+            const bucket = buckets[key];
+            if (!bucket) {
+                continue;
+            }
+            for (const task of bucket) {
+                if (task && task.taskFunc === 'upgrade') {
+                    task.capacity = capacity;
+                    return;
+                }
+            }
+        }
+        // 任务被清掉了（例如推送代码后），补注册一条
+        this.registTask(upgrade(this));
     }
     /**
      * 取能目标当前可用能量：container/storage/tombstone 读 store，掉落物读 amount。
@@ -6258,6 +6327,8 @@ class RoomScanExtension extends Room {
             this.refreshEnergyTasks();
             // spawn/extension 的补能需求同样按间隔兜底同步
             this.refreshEnergyCarryTasks();
+            // 工地状态变化后升级并发要跟着调整
+            this.refreshUpgradeTask();
         }
         // 兜底重建 spawn/extension 顺序表，处理漏掉的建成/拆除
         if (cache.lastEnergyStructureScan === undefined

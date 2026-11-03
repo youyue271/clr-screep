@@ -135,6 +135,14 @@ export default class CreepExtension extends Creep {
                 }
             }
         }
+        // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
+        // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
+        // harvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
+        if (this.memory.role !== 'emptyWorker'
+            && this.memory.role !== 'harvester'
+            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+            this.changeRole('emptyWorker')
+        }
         return false
     }
 

@@ -2,7 +2,7 @@ import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {containerWatermark, harvestSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
-import {construct, createBuildTask, getCarryList, getEnergyTask, getRepairTasks, getWallRepairTasks, harvestSource, upgrade} from "@/task/roomTask";
+import {construct, createBuildTask, getCarryList, getEnergyTask, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 
 export default class RoomExtension extends Room {
@@ -434,6 +434,36 @@ export default class RoomExtension extends Room {
         if (toAdd.length) {
             this.registTask(toAdd)
         }
+    }
+
+    /**
+     * 升级任务的并发数随工地状态变化：有工地用 RCL 基准值，
+     * 工地清零后放开到实际 worker 数。只更新容量，不强踢已经预约的 worker，
+     * 他们在下一次补能后会按新容量自然分流。
+     */
+    refreshUpgradeTask(): void {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return
+        }
+        const capacity = upgradeTaskCapacityOf(this)
+        if (!capacity) {
+            return
+        }
+        const buckets = this.normalizeTaskBuckets('upgradeTask')
+        for (const key in buckets) {
+            const bucket = buckets[key]
+            if (!bucket) {
+                continue
+            }
+            for (const task of bucket) {
+                if (task && task.taskFunc === 'upgrade') {
+                    task.capacity = capacity
+                    return
+                }
+            }
+        }
+        // 任务被清掉了（例如推送代码后），补注册一条
+        this.registTask(upgrade(this))
     }
 
     /**

@@ -10,6 +10,13 @@ export const spawnTable: { [role in Role]: number[] } = {
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
 
+// 升级并发：有工地时仍用 upgradeTaskCapacity 的基准值，
+// 工地清零后放开到实际 worker 数（不超过 maxCapacity）。
+// worker 的任务顺序里 upgrade 排在 construct 前面，所以有工地时必须限流。
+export const upgradeSetting = {
+    maxCapacity: 12,
+}
+
 // spawn/extension 顺序表的兜底扫描间隔。建成/拆除有事件，
 // 这里只处理漏网的情况，频率不需要高。
 export const energyStructureScanInterval = 100
