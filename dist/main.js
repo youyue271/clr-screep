@@ -5610,22 +5610,38 @@ class RoomExtension extends Room {
             this.registEvent(checkRoomLevelEvent(Game.time + this.controller.ticksToDowngrade + 1));
             return;
         }
+        // progress 在升级时会归零重算，所以 diff < 0 就是刚刚升级的信号。
+        // 此时 initBuildList 已经用新等级重建了工地；这里再按新等级的
+        // spawnTable 重算孵化配额，并让升级并发跟着新工地回落。
+        // 下一 tick 先重新测量新等级的升级速度，再进入正常排期。
+        if (diff < 0) {
+            if (this.memory.creepTask) {
+                // initSpawn 只按存活 creep 算差额、不统计已排队未孵化的任务，
+                // 先清空避免重复排队（与 globalReset 的做法一致）
+                this.memory.creepTask.spawnTask = {};
+            }
+            this.initSpawn(this.controller.level);
+            this.refreshUpgradeTask();
+            this.registEvent(checkRoomLevelEvent(Game.time + 1));
+            return;
+        }
+        // 预测间隔除以 3：提前触发会用新测到的 diff 重新预测，
+        // 升级速度变化时最多 1/3 个旧预估就能纠正，避免一次排到几百 tick 后。
+        let tickGap;
         if (diff === 0) {
             if (remain < 1000) {
-                this.registEvent(checkRoomLevelEvent(Game.time + remain + 1));
-                return;
+                // 进度停滞后恢复，按 1 progress/tick 的保守值每 1/5 检查一次
+                tickGap = Math.ceil(remain / 5) + 1;
             }
             else {
-                const tickGap = Math.ceil(remain / 100);
-                this.registEvent(checkRoomLevelEvent(Game.time + tickGap));
-                return;
+                tickGap = Math.max(10, Math.ceil(remain / 300));
             }
         }
         else {
-            const tickGap = Math.ceil(remain / diff);
-            this.registEvent(checkRoomLevelEvent(Game.time + tickGap));
-            return;
+            // 最低 10 tick，避免接近升级时极限情况下每 tick 都跑一遍 initBuildList
+            tickGap = Math.max(10, Math.ceil(remain / diff / 3));
         }
+        this.registEvent(checkRoomLevelEvent(Game.time + tickGap));
     }
     hello() {
         loggerInstance.debug("hello world");
