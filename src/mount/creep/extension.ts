@@ -1,4 +1,5 @@
 import { getEnergyTask } from "@/task/roomTask";
+import { remoteSetting } from "@/setting";
 import log from "@/util/log";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
@@ -8,7 +9,9 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     // 只有少数 worker 会短暂转去维修，修完后自动回来升级
     'worker': ['repairTask', 'wallRepairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
-    'carrier': ['carryTask'],
+    // 本地补能永远先认领，空闲时才去外矿拉货
+    'carrier': ['carryTask', 'remoteCarryTask'],
+    'remoteHarvester': ['remoteHarvestTask'],
 }
 
 export default class CreepExtension extends Creep {
@@ -137,9 +140,10 @@ export default class CreepExtension extends Creep {
         }
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
-        // harvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
+        // harvester / remoteHarvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
         if (this.memory.role !== 'emptyWorker'
             && this.memory.role !== 'harvester'
+            && this.memory.role !== 'remoteHarvester'
             && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
             this.changeRole('emptyWorker')
         }
@@ -515,6 +519,270 @@ export default class CreepExtension extends Creep {
             // this.room.registTask(getEnergyWithStorage(this.room))
             return true
         }
+    }
+
+    /**
+     * 按房间名走到相邻房间的出口。不相邻/不可达时返回 false，creep 原地等待。
+     * 出口方向按房间对缓存到 global（地形静态，推代码时随 global 一起丢弃）。
+     */
+    moveToRoom(roomName: string): boolean {
+        if (this.room.name === roomName) {
+            return true
+        }
+        const cache = global.roomExit ?? (global.roomExit = {})
+        const key = `${this.room.name}>${roomName}`
+        let exitDir = cache[key]
+        if (exitDir === undefined) {
+            exitDir = this.room.findExitTo(roomName) as number
+            cache[key] = exitDir
+        }
+        if (exitDir === ERR_NO_PATH) {
+            return false
+        }
+        const exits = this.room.find(exitDir as ExitConstant)
+        const exitPos = this.pos.findClosestByRange(exits)
+        if (!exitPos) {
+            return false
+        }
+        if (this.pos.isEqualTo(exitPos)) {
+            // 站在出口格上，回合结束引擎会自动把 creep 送到隔壁房间
+            return false
+        }
+        this.moveTo(exitPos, { visualizePathStyle: { stroke: '#00ffff' } })
+        return false
+    }
+
+    /**
+     * 外矿常驻采集。永远返回 false：任务持有到 creep 死亡，
+     * 死亡后由主房队列清理预约、由 refreshRemoteSpawn 按门槛补员。
+     * taskParam: [sourceId | null, 外矿房名, 主房名]
+     */
+    remoteHarvest(sourceId: Id<Source> | null, targetRoom: string, homeRoom: string): boolean {
+        if (this.room.name !== targetRoom) {
+            this.moveToRoom(targetRoom)
+            return false
+        }
+        let source = sourceId ? Game.getObjectById<Source>(sourceId) : undefined
+        if (!source && this.memory.harvestSourceId) {
+            source = Game.getObjectById<Source>(this.memory.harvestSourceId)
+        }
+        if (!source) {
+            // 第一次进来（还没有矿点缓存）：自己挑最近的矿点并写回缓存
+            source = this.pos.findClosestByRange(FIND_SOURCES) as Source | null
+            if (!source) {
+                return false
+            }
+            this.memory.harvestSourceId = source.id
+        }
+        const state = this.remoteSourceState(homeRoom, targetRoom, source)
+        const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
+            filter: (object: any) => object.structureType === STRUCTURE_CONTAINER
+        })[0] as StructureContainer | undefined
+        if (container) {
+            if (state && state.containerId !== container.id) {
+                state.containerId = container.id
+            }
+            if (state && (!state.containerPos || state.containerPos[0] !== container.pos.x || state.containerPos[1] !== container.pos.y)) {
+                state.containerPos = [container.pos.x, container.pos.y]
+            }
+            if (!this.pos.isEqualTo(container.pos)) {
+                this.moveTo(container.pos, { visualizePathStyle: { stroke: '#ffffff' } })
+                return false
+            }
+            // container 掉血时优先修：采集溢出的能量会先进自己背包，正好当维修费
+            if (container.hits < container.hitsMax * remoteSetting.repairThreshold
+                && this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                this.say('🔧修外矿')
+                if (this.repair(container) === ERR_NOT_IN_RANGE) {
+                    this.moveTo(container.pos, { visualizePathStyle: { stroke: '#ffffff' } })
+                }
+                return false
+            }
+            this.say('⛏️外矿采矿')
+            if (this.harvest(source) === ERR_NOT_IN_RANGE) {
+                this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
+            }
+            return false
+        }
+        // 还没有 container：自己放工地并建造（5000 进度，边采边建）
+        let site = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {
+            filter: (object: any) => object.structureType === STRUCTURE_CONTAINER
+        })[0] as ConstructionSite | undefined
+        if (!site) {
+            const pos = this.remoteContainerPos(source, homeRoom)
+            if (pos) {
+                if (state && (!state.containerPos || state.containerPos[0] !== pos.x || state.containerPos[1] !== pos.y)) {
+                    state.containerPos = [pos.x, pos.y]
+                }
+                if (pos.createConstructionSite(STRUCTURE_CONTAINER) === OK) {
+                    site = pos.lookFor(LOOK_CONSTRUCTION_SITES)
+                        .find(item => item.structureType === STRUCTURE_CONTAINER)
+                }
+            }
+        }
+        if (site) {
+            if (this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                this.say('🔨造外矿container')
+                if (this.build(site) === ERR_NOT_IN_RANGE) {
+                    this.moveTo(site, { visualizePathStyle: { stroke: '#ffffff' } })
+                }
+                return false
+            }
+            this.say('⛏️攒能量')
+            if (this.harvest(source) === ERR_NOT_IN_RANGE) {
+                this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
+            }
+            return false
+        }
+        // 放不了工地（被占/没有可走格）：贴着矿点采，溢出能量落在地上
+        this.say('⛏️外矿采矿')
+        if (!this.pos.inRangeTo(source, 1)) {
+            this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
+        } else {
+            this.harvest(source)
+        }
+        return false
+    }
+
+    /**
+     * 外矿运输：去外矿 container 取能，回到主房投递后才结束任务。
+     * 只有回到主房才能返回 true —— releaseCurrentWork 用的是 this.room 的队列，
+     * 在外矿房结束任务会把主房队列里的预约漏掉。
+     */
+    remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>): boolean {
+        const energy = this.store.getUsedCapacity(RESOURCE_ENERGY)
+        if (this.room.name === targetRoom) {
+            if (this.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                const container = Game.getObjectById<StructureContainer>(containerId)
+                if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                    this.memory.remoteReturn = true
+                    this.say('🫳外矿取能')
+                    if (this.withdraw(container, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
+                        this.moveTo(container, { visualizePathStyle: { stroke: '#ffff00' } })
+                    }
+                    return false
+                }
+            }
+            // 拿满了 / 外矿没货：标记回程，回主房再结算
+            this.memory.remoteReturn = true
+            this.moveToRoom(homeRoom)
+            return false
+        }
+        if (this.room.name !== homeRoom) {
+            // 走廊房间：有货或已在回程就回家，否则去外矿
+            this.moveToRoom(energy > 0 || this.memory.remoteReturn ? homeRoom : targetRoom)
+            return false
+        }
+        // 已经回到主房
+        if (!energy) {
+            if (!this.memory.remoteReturn) {
+                // 刚在主房认领任务，空背包是正常起点：先去外矿取能
+                this.moveToRoom(targetRoom)
+                return false
+            }
+            // 空手回来 = 外矿没货，任务作废（在家才能安全地按房间删任务）
+            this.removeCurrentWorkFromQueue()
+            delete this.memory.remoteReturn
+            return true
+        }
+        const sink = sinkId ? Game.getObjectById(sinkId) as any : undefined
+        const target: AnyStoreStructure | undefined = sink && sink.store && sink.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+            ? sink
+            : this.homeEnergySink()
+        if (target) {
+            this.say('⚡外矿回运')
+            if (this.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
+                this.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' } })
+                return false
+            }
+        }
+        delete this.memory.remoteReturn
+        return true
+    }
+
+    /**
+     * 把当前矿点登记进顶层 Memory.remotePlan，供主房扫描同步任务/补员。
+     */
+    private remoteSourceState(homeRoom: string, targetRoom: string, source: Source): RemoteSourceState | undefined {
+        const plan = Memory.remotePlan?.[homeRoom]
+        const state = plan?.rooms?.[targetRoom]
+        if (!state) {
+            return undefined
+        }
+        if (!state.sources) {
+            state.sources = {}
+        }
+        if (!state.sources[source.id]) {
+            state.sources[source.id] = {}
+        }
+        return state.sources[source.id]
+    }
+
+    /**
+     * 给外矿矿点挑 container 位置：贴着矿点、能走、尽量靠近回主房的出口。
+     */
+    private remoteContainerPos(source: Source, homeRoom: string): RoomPosition | undefined {
+        const terrain = this.room.getTerrain()
+        let anchor: RoomPosition | undefined
+        const exitRes = this.room.findExitTo(homeRoom) as number
+        if (exitRes !== ERR_NO_PATH) {
+            const exits = this.room.find(exitRes as ExitConstant)
+            anchor = this.pos.findClosestByRange(exits) ?? undefined
+        }
+        if (!anchor) {
+            anchor = this.pos
+        }
+        const offsets = [
+            [-1, -1], [-1, 0], [-1, 1],
+            [0, -1], [0, 1],
+            [1, -1], [1, 0], [1, 1]
+        ]
+        let best: RoomPosition | undefined
+        let bestRange = Infinity
+        for (const [dx, dy] of offsets) {
+            const x = source.pos.x + dx
+            const y = source.pos.y + dy
+            if (x < 1 || x > 48 || y < 1 || y > 48) {
+                continue
+            }
+            if (terrain.get(x, y) === TERRAIN_MASK_WALL) {
+                continue
+            }
+            const pos = new RoomPosition(x, y, this.room.name)
+            // 已经有别的建筑/工地就跳过，避免重复放工地
+            if (pos.lookFor(LOOK_STRUCTURES).length || pos.lookFor(LOOK_CONSTRUCTION_SITES).length) {
+                continue
+            }
+            const range = pos.getRangeTo(anchor)
+            if (range < bestRange) {
+                bestRange = range
+                best = pos
+            }
+        }
+        return best
+    }
+
+    /**
+     * 主房接收外矿能量的备选目标：storage 优先，其次任意有空位的 container，
+     * 最后直接补给 spawn/extension（主房还没建 container 时也能回运）。
+     */
+    private homeEnergySink(): AnyStoreStructure | undefined {
+        if (this.room.storage && this.room.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            return this.room.storage
+        }
+        for (const id of this.room.getContainer()) {
+            const container = Game.getObjectById<StructureContainer>(id)
+            if (container && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                return container
+            }
+        }
+        for (const id of this.room.energyStructureOrder()) {
+            const structure = Game.getObjectById<StructureExtension | StructureSpawn>(id)
+            if (structure && structure.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                return structure
+            }
+        }
+        return undefined
     }
 
 }

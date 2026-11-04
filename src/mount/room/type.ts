@@ -1,3 +1,29 @@
+/**
+ * 外矿计划存顶层 Memory（不存 Room.memory）：
+ * globalInit 每次推代码都会 delete Memory.rooms，只有顶层键能活下来。
+ */
+interface RemoteSourceState {
+    containerId?: Id<StructureContainer>
+    containerPos?: [number, number]
+}
+
+interface RemoteRoomState {
+    enabled?: boolean
+    sources?: { [sourceId: string]: RemoteSourceState }
+}
+
+interface RemotePlan {
+    enabled?: boolean
+    // 调试/测试用：忽略"富余能量"门槛，强制孵化外矿 harvester
+    force?: boolean
+    rooms: { [roomName: string]: RemoteRoomState }
+}
+
+interface Memory {
+    // 主房名 -> 外矿计划
+    remotePlan?: { [homeRoom: string]: RemotePlan }
+}
+
 interface RoomMemory {
     timer: {
         [tick: number]: [func?: string, param?: any[]][]
@@ -86,6 +112,16 @@ interface Room {
      * 按工地状态同步升级任务的并发数
      */
     refreshUpgradeTask(): void
+
+    /**
+     * 同步外矿采集/运输任务（任务统一登记在主房队列）
+     */
+    refreshRemoteTasks(): void
+
+    /**
+     * 按富余能量门槛孵化外矿 harvester
+     */
+    refreshRemoteSpawn(): void
 
     /**
      * 房间环境扫描（敌对/受伤/维修队列），结果缓存在 global.room

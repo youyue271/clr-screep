@@ -85,6 +85,9 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
             return getViewerBody(room)
         case 'remoteBuilder':
             return getWorkerBody(room)
+        case 'remoteHarvester':
+            // 外矿和主房一样是站在 container 上采，body 直接复用
+            return getHarvesterBody(room)
 
     }
 }

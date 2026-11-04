@@ -8,12 +8,15 @@ interface CreepMemory {
     reSpawn: boolean
     // 提前换班的 harvester 孵化时指定的矿点，保证接替的是同一个矿
     harvestSourceId?: Id<Source>
+    // 外矿 carrier 往返标记：已经离开外矿房、正在往回走
+    remoteReturn?: boolean
 }
 
 type Role = 'worker'
     | 'carrier'
     | 'harvester'
     | 'emptyWorker'
+    | 'remoteHarvester'
 
 interface Creep {
 
@@ -47,4 +50,17 @@ interface Creep {
     remember(): void
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean
     buildConstructionSite(constructionId: Id<any>):boolean
+    /**
+     * 按房间名走到目标房间。没有视野时用房间出口导航，只支持相邻房间
+     */
+    moveToRoom(roomName: string): boolean
+    /**
+     * 外矿常驻采集：到矿点后站 container 上采，矿点空了顺手修 container。
+     * 这个任务一直持有到 creep 死亡，永远返回 false。
+     */
+    remoteHarvest(sourceId: Id<Source> | null, targetRoom: string, homeRoom: string): boolean
+    /**
+     * 外矿运输：去外矿 container 取能，回到主房投递后才结束任务。
+     */
+    remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>): boolean
 }

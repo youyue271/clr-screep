@@ -4,6 +4,7 @@ import {
     containerWatermark,
     harvestSetting,
     opportunitySetting,
+    remoteSetting,
     repairPriority,
     repairSetting,
     storageSetting,
@@ -256,6 +257,42 @@ export function getCarryList(targetList:Structure[], resourceType:ResourceConsta
             targetId: item.id
         }
     })
+}
+
+/**
+ * 外矿采集任务：一个矿点一条，容量 1（常驻 harvester 一人一矿）。
+ * taskParam: [sourceId, 外矿房名, 主房名]
+ * sourceId 为 null 的探路任务由房间扩展自己构造。
+ */
+export function getRemoteHarvestTasks(sourceIds: Id<Source>[], targetRoom: string, homeRoom: string): MyTask[] {
+    return sourceIds.map(sourceId => ({
+        taskType: 'remoteHarvestTask',
+        taskFunc: 'remoteHarvest',
+        taskParam: [sourceId, targetRoom, homeRoom],
+        priority: 3,
+        capacity: 1,
+        targetId: sourceId,
+    }))
+}
+
+/**
+ * 外矿运输任务：去外矿 container 取能，回到主房投递后才结束。
+ * taskParam: [外矿 containerId, 外矿房名, 主房名, 主房投递目标]
+ */
+export function getRemoteCarryTasks(
+    containerId: Id<StructureContainer>,
+    targetRoom: string,
+    homeRoom: string,
+    sinkId: Id<any>
+): MyTask[] {
+    return [{
+        taskType: 'remoteCarryTask',
+        taskFunc: 'remoteCarry',
+        taskParam: [containerId, targetRoom, homeRoom, sinkId],
+        priority: 3,
+        capacity: remoteSetting.carryCapacity,
+        targetId: containerId,
+    }]
 }
 
 /**

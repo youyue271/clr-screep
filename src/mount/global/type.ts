@@ -53,6 +53,8 @@ declare var global: {
     currentMenu:string
     currentRoom: Room
     hasExtension:boolean
+    // 房间 -> 出口方向缓存（房间地形静态，代码推送时随 global 一起丢弃）
+    roomExit?: { [key: string]: number }
     cmdList: [string]
     logLevel: string,
     aliasList: [string?]

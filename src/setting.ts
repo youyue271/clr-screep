@@ -6,6 +6,8 @@ export const spawnTable: { [role in Role]: number[] } = {
     'carrier':      [0, 1, 2, 5, 5, 5, 5, 5, 5],
     'worker':       [0, 3, 6, 9, 9, 7, 7, 7, 3],
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
+    // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
+    'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
@@ -105,6 +107,14 @@ export const harvestSetting = {
     earlyMargin: 15,
     // 没有布局距离缓存时的默认路径长度（tile）
     defaultDistance: 20,
+}
+
+// 外矿（"富余能量才做"的添头）
+export const remoteSetting = {
+    // 同一个外矿 container 同时允许几个 carrier 去拉
+    carryCapacity: 2,
+    // harvester 修外矿 container 的血量阈值：低于 hitsMax * 该值就优先维修
+    repairThreshold: 0.9,
 }
 
 export const towerSetting = {

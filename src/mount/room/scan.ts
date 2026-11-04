@@ -41,6 +41,9 @@ export default class RoomScanExtension extends Room {
             this.refreshEnergyCarryTasks()
             // 工地状态变化后升级并发要跟着调整
             this.refreshUpgradeTask()
+            // 外矿任务和补员：任务登记在主房队列，孵化受"富余能量"门槛控制
+            this.refreshRemoteTasks()
+            this.refreshRemoteSpawn()
         }
         // 兜底重建 spawn/extension 顺序表，处理漏掉的建成/拆除
         if (cache.lastEnergyStructureScan === undefined
