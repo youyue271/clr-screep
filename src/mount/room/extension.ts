@@ -1,9 +1,10 @@
 import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {containerWatermark, harvestSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
+import {containerWatermark, harvestSetting, remoteSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
 import {construct, createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
+import {planRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
 
 export default class RoomExtension extends Room {
     /**
@@ -43,7 +44,8 @@ export default class RoomExtension extends Room {
             'energyTask': {},
             'spawnTask': {},
             'remoteHarvestTask': {},
-            'remoteCarryTask': {}
+            'remoteCarryTask': {},
+            'scoutTask': {}
         }
 
         this.initResource()
@@ -52,7 +54,9 @@ export default class RoomExtension extends Room {
         this.initTask(this.controller.level)
         this.initCarryList()
         this.initCreepRecycle()
-        
+        // 房间初始化（含新 claim 的房和推代码重建）时自动配好相邻外矿计划
+        this.syncRemotePlan()
+
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
 
@@ -480,14 +484,15 @@ export default class RoomExtension extends Room {
         const plan = Memory.remotePlan?.[this.name]
         if (!plan || plan.enabled === false) {
             // 总开关关闭：清掉外矿任务桶。已经在外面的 creep 手里有任务副本，会干到死。
-            if (this.memory.creepTask['remoteHarvestTask']) {
-                delete this.memory.creepTask['remoteHarvestTask']
-            }
-            if (this.memory.creepTask['remoteCarryTask']) {
-                delete this.memory.creepTask['remoteCarryTask']
+            for (const taskType of ['remoteHarvestTask', 'remoteCarryTask', 'scoutTask'] as TaskType[]) {
+                if (this.memory.creepTask[taskType]) {
+                    delete this.memory.creepTask[taskType]
+                }
             }
             return
         }
+        // 侦察兵的常驻任务先挂上：新孵化/空闲的侦察兵靠它领活
+        this.syncScoutTask()
         const harvestDesired: MyTask[] = []
         const carryDesired: MyTask[] = []
         for (const roomName in plan.rooms) {
@@ -500,19 +505,11 @@ export default class RoomExtension extends Room {
                 this.updateRemoteCache(state, remoteRoom)
             }
             const sourceIds = Object.keys(state.sources ?? {}) as Id<Source>[]
-            if (sourceIds.length) {
-                harvestDesired.push(...getRemoteHarvestTasks(sourceIds, roomName, this.name))
-            } else {
-                // 还没开过视野：先派一个 creep 去挑矿点，回来把缓存写上
-                harvestDesired.push({
-                    taskType: 'remoteHarvestTask',
-                    taskFunc: 'remoteHarvest',
-                    taskParam: [null, roomName, this.name],
-                    priority: 3,
-                    capacity: 1,
-                    targetId: `remote-scan-${roomName}`,
-                })
+            if (!sourceIds.length) {
+                // 还没情报的房交给侦察兵探路，不派 harvester 去盲跑
+                continue
             }
+            harvestDesired.push(...getRemoteHarvestTasks(sourceIds, roomName, this.name))
             // 只有看得见外矿 container 里有能量时才登记运输任务，避免 carrier 白跑
             if (!remoteRoom || !state.sources) {
                 continue
@@ -536,6 +533,114 @@ export default class RoomExtension extends Room {
         this.syncRemoteBucket('remoteHarvestTask', harvestDesired)
         this.syncRemoteBucket('remoteCarryTask', carryDesired)
         this.seedRemoteHarvestReservations()
+        this.refreshScoutSpawn()
+    }
+
+    /**
+     * 自动补全外矿计划：房间 init / 10 tick 扫描时调用。
+     * - 第一次遇到这个房时创建总开关（enabled: true）
+     * - 用户手动关掉总开关后不再自动加房
+     * - 只补到 remoteSetting.maxRooms，unsafe 的房由 autoplan 排除
+     */
+    syncRemotePlan(): void {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
+        if (!Memory.remotePlan) {
+            Memory.remotePlan = {}
+        }
+        const plan = Memory.remotePlan[this.name] ?? (Memory.remotePlan[this.name] = {enabled: true, rooms: {}})
+        if (!plan.rooms) {
+            plan.rooms = {}
+        }
+        if (plan.enabled === false) {
+            return
+        }
+        let active = 0
+        for (const roomName in plan.rooms) {
+            if (!Memory.mapIntel?.[roomName]?.unsafe) {
+                active += 1
+            }
+        }
+        let capacity = remoteSetting.maxRooms - active
+        if (capacity <= 0) {
+            return
+        }
+        for (const roomName of planRemoteRooms(this.name)) {
+            if (capacity <= 0) {
+                break
+            }
+            if (plan.rooms[roomName]) {
+                continue
+            }
+            plan.rooms[roomName] = {}
+            capacity -= 1
+        }
+    }
+
+    /**
+     * 常驻侦察任务：每个主房一个，capacity 1，priority 4（不挡富余能量门槛）。
+     * 侦察兵认领后一直持有，内部自己从 plan 里挑下一个要探的房。
+     */
+    private syncScoutTask(): void {
+        const buckets = this.normalizeTaskBuckets('scoutTask')
+        for (const key in buckets) {
+            delete buckets[key]
+        }
+        buckets['4'] = [{
+            id: `scout-${this.name}`,
+            taskFunc: 'scout',
+            taskParam: [this.name],
+            priority: 4,
+            capacity: 1,
+            persistent: true,
+            targetId: this.name,
+            reservedBy: [],
+        }]
+    }
+
+    /**
+     * 有房间缺情报且没有存活/排队的侦察兵时，补一个 priority 4 的 viewer。
+     */
+    private refreshScoutSpawn(): void {
+        const plan = Memory.remotePlan?.[this.name]
+        if (!plan || plan.enabled === false) {
+            return
+        }
+        let needScout = false
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            if (state.sources && Object.keys(state.sources).length) {
+                continue
+            }
+            const intel = Memory.mapIntel?.[roomName]
+            if (intel?.unsafe || intel?.scoutedAt) {
+                continue
+            }
+            needScout = true
+            break
+        }
+        if (!needScout) {
+            return
+        }
+        for (const creepName in Game.creeps) {
+            const creep = Game.creeps[creepName]
+            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'viewer') {
+                return
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === 'viewer') {
+                    return
+                }
+            }
+        }
+        this.addToSpawnList('viewer')
     }
 
     /**
@@ -557,8 +662,8 @@ export default class RoomExtension extends Room {
             if (!state || state.enabled === false) {
                 continue
             }
-            // 还没开视野时先派 1 个去探路
-            want += Math.max(1, Object.keys(state.sources ?? {}).length)
+            // 还没情报的房交给侦察兵，不在这里派 harvester
+            want += Object.keys(state.sources ?? {}).length
         }
         if (!want) {
             return
@@ -651,6 +756,8 @@ export default class RoomExtension extends Room {
                 delete state.sources[sourceId]
             }
         }
+        // 顺带刷新情报：有主/被他人 reserve/有敌对时会把该外矿房停用
+        recordRoomIntel(this.name, remoteRoom)
     }
 
     /**
@@ -989,6 +1096,8 @@ export default class RoomExtension extends Room {
             // 外矿 harvester 不参与自动补员：配额故意为 0，让它 reSpawn=false，
             // 由 refreshRemoteSpawn 按"富余能量"门槛决定要不要孵化
             'remoteHarvester': 0,
+            // 侦察兵同样不参与自动补员，由 refreshScoutSpawn 按需补
+            'viewer': 0,
         }
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName]
@@ -1065,9 +1174,10 @@ export default class RoomExtension extends Room {
             taskFunc: "spawnCreep",
             // 第三个参数是矿点 id：提前换班的 harvester 孵化后只认这个矿点
             taskParam: [role, getBody(role, this), sourceId],
-            // 外矿永远排在最后：本地换班/补员都做完了才轮得到它
+            // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
+                : role == 'viewer' ? 4
                 : role == 'remoteHarvester' ? 3
                 : 2,
             capacity: 1,

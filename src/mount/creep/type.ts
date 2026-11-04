@@ -10,6 +10,8 @@ interface CreepMemory {
     harvestSourceId?: Id<Source>
     // 外矿 carrier 往返标记：已经离开外矿房、正在往回走
     remoteReturn?: boolean
+    // 侦察兵当前要探的房间；探完清空，等待新目标
+    scoutTarget?: string
 }
 
 type Role = 'worker'
@@ -17,6 +19,8 @@ type Role = 'worker'
     | 'harvester'
     | 'emptyWorker'
     | 'remoteHarvester'
+    // 侦察兵：只有 MOVE 部件，负责探明相邻外矿房并写情报
+    | 'viewer'
 
 interface Creep {
 
@@ -63,4 +67,9 @@ interface Creep {
      * 外矿运输：去外矿 container 取能，回到主房投递后才结束任务。
      */
     remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>): boolean
+    /**
+     * 侦察兵常驻任务：探明相邻房间并写情报；没有目标时原地随机走，等新任务。
+     * 一直返回 false，只有主房关掉外矿时才回主房释放任务。
+     */
+    scout(homeRoom: string): boolean
 }

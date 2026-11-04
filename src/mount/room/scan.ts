@@ -42,6 +42,8 @@ export default class RoomScanExtension extends Room {
             // 工地状态变化后升级并发要跟着调整
             this.refreshUpgradeTask()
             // 外矿任务和补员：任务登记在主房队列，孵化受"富余能量"门槛控制
+            // 先按最新情报补全外矿计划（相邻房、unsafe 过滤），再同步任务/补员
+            this.syncRemotePlan()
             this.refreshRemoteTasks()
             this.refreshRemoteSpawn()
         }

@@ -1,6 +1,7 @@
 import { getEnergyTask } from "@/task/roomTask";
 import { remoteSetting } from "@/setting";
 import log from "@/util/log";
+import { recordRoomIntel } from "@/global/autoplan/remotePlan";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
@@ -12,6 +13,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     // 本地补能永远先认领，空闲时才去外矿拉货
     'carrier': ['carryTask', 'remoteCarryTask'],
     'remoteHarvester': ['remoteHarvestTask'],
+    // 侦察兵只有一个常驻任务，自己从外矿计划里挑要探的房间
+    'viewer': ['scoutTask'],
 }
 
 export default class CreepExtension extends Creep {
@@ -144,6 +147,7 @@ export default class CreepExtension extends Creep {
         if (this.memory.role !== 'emptyWorker'
             && this.memory.role !== 'harvester'
             && this.memory.role !== 'remoteHarvester'
+            && this.memory.role !== 'viewer'
             && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
             this.changeRole('emptyWorker')
         }
@@ -522,7 +526,9 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 按房间名走到相邻房间的出口。不相邻/不可达时返回 false，creep 原地等待。
+     * 按房间名走到相邻房间的出口。
+     * 返回值表示"能不能到达"：已在目标房、已发出移动、站在出口格上都返回 true，
+     * 只有真的无路（ERR_NO_PATH / 找不到出口格）才返回 false。
      * 出口方向按房间对缓存到 global（地形静态，推代码时随 global 一起丢弃）。
      */
     moveToRoom(roomName: string): boolean {
@@ -546,10 +552,10 @@ export default class CreepExtension extends Creep {
         }
         if (this.pos.isEqualTo(exitPos)) {
             // 站在出口格上，回合结束引擎会自动把 creep 送到隔壁房间
-            return false
+            return true
         }
         this.moveTo(exitPos, { visualizePathStyle: { stroke: '#00ffff' } })
-        return false
+        return true
     }
 
     /**
@@ -698,6 +704,127 @@ export default class CreepExtension extends Creep {
         }
         delete this.memory.remoteReturn
         return true
+    }
+
+    /**
+     * 侦察兵常驻任务：从外矿计划里挑需要情报的房间，走过去写情报；
+     * 没有目标时回主房随机走，等待 autoplan 以后新增的房间。
+     * 一直返回 false，只有主房关掉外矿时才回主房释放任务。
+     */
+    scout(homeRoom: string): boolean {
+        const plan = Memory.remotePlan?.[homeRoom]
+        if (!plan || plan.enabled === false) {
+            // 外矿总开关关了：回主房释放任务（releaseCurrentWork 用的是主房队列）
+            if (this.room.name === homeRoom) {
+                return true
+            }
+            this.moveToRoom(homeRoom)
+            return false
+        }
+        const target = this.memory.scoutTarget
+        if (target) {
+            if (this.room.name === target) {
+                this.say('👁️侦察完毕')
+                recordRoomIntel(homeRoom, this.room)
+                delete this.memory.scoutTarget
+                return false
+            }
+            // 侦察兵只支持在相邻房之间导航：先回主房，再从主房去目标
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+                return false
+            }
+            if (!this.moveToRoom(target)) {
+                // 从主房都走不到：当作不可用，避免反复派同一个房
+                this.markScoutUnreachable(homeRoom, target)
+                delete this.memory.scoutTarget
+            }
+            return false
+        }
+        // 没有目标时先回主房待命，避免留在外矿房没法接新任务
+        if (this.room.name !== homeRoom) {
+            this.moveToRoom(homeRoom)
+            return false
+        }
+        const next = this.pickScoutTarget(homeRoom)
+        if (next) {
+            this.memory.scoutTarget = next
+            this.say('👁️去侦察')
+            this.moveToRoom(next)
+            return false
+        }
+        // 没活：原地随便走走，等新任务
+        this.randomWalk()
+        return false
+    }
+
+    /**
+     * 从计划里挑一个还没有情报的房：没 sources、没被标记 unsafe、也没探过。
+     */
+    private pickScoutTarget(homeRoom: string): string | undefined {
+        const plan = Memory.remotePlan?.[homeRoom]
+        if (!plan?.rooms) {
+            return undefined
+        }
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            if (state.sources && Object.keys(state.sources).length) {
+                continue
+            }
+            const intel = Memory.mapIntel?.[roomName]
+            if (intel?.unsafe || intel?.scoutedAt) {
+                continue
+            }
+            return roomName
+        }
+        return undefined
+    }
+
+    /**
+     * 侦察兵从主房都走不到的房间：记成 unsafe，之后不再自动选它。
+     */
+    private markScoutUnreachable(homeRoom: string, roomName: string): void {
+        if (!Memory.mapIntel) {
+            Memory.mapIntel = {}
+        }
+        const intel = Memory.mapIntel[roomName] ?? (Memory.mapIntel[roomName] = {})
+        intel.scoutedAt = Game.time
+        intel.unsafe = true
+        const state = Memory.remotePlan?.[homeRoom]?.rooms?.[roomName]
+        if (state) {
+            state.enabled = false
+        }
+    }
+
+    /**
+     * 侦察兵待命时的随机移动：只在本房间内走，不跨出口。
+     */
+    private randomWalk(): void {
+        const directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT]
+        const delta: { [dir: number]: [number, number] } = {
+            [TOP]: [-1, 0],
+            [TOP_RIGHT]: [-1, 1],
+            [RIGHT]: [0, 1],
+            [BOTTOM_RIGHT]: [1, 1],
+            [BOTTOM]: [1, 0],
+            [BOTTOM_LEFT]: [1, -1],
+            [LEFT]: [0, -1],
+            [TOP_LEFT]: [-1, -1],
+        }
+        const dir = directions[Math.floor(Math.random() * directions.length)]
+        const [dx, dy] = delta[dir]
+        const x = this.pos.x + dx
+        const y = this.pos.y + dy
+        if (x < 1 || x > 48 || y < 1 || y > 48) {
+            return
+        }
+        if (this.room.getTerrain().get(x, y) === TERRAIN_MASK_WALL) {
+            return
+        }
+        this.move(dir)
     }
 
     /**

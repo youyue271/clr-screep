@@ -19,9 +19,26 @@ interface RemotePlan {
     rooms: { [roomName: string]: RemoteRoomState }
 }
 
+/**
+ * 相邻房间情报缓存（顶层 Memory，和 remotePlan 一样能扛推代码）。
+ * 由侦察兵或在外矿房有视野的 creep 写入，供 autoplan 选房。
+ */
+interface MapIntel {
+    // 最后一次看到这个房间的 tick
+    scoutedAt?: number
+    owner?: string
+    reservation?: string
+    hostile?: boolean
+    // 有主 / 被他人 reserve / 有敌对：不再自动选作外矿房
+    unsafe?: boolean
+    sources?: Id<Source>[]
+}
+
 interface Memory {
     // 主房名 -> 外矿计划
     remotePlan?: { [homeRoom: string]: RemotePlan }
+    // 房间名 -> 情报
+    mapIntel?: { [roomName: string]: MapIntel }
 }
 
 interface RoomMemory {
@@ -112,6 +129,11 @@ interface Room {
      * 按工地状态同步升级任务的并发数
      */
     refreshUpgradeTask(): void
+
+    /**
+     * 自动补全外矿计划（init / 10 tick 扫描时调用，按情报筛相邻房）
+     */
+    syncRemotePlan(): void
 
     /**
      * 同步外矿采集/运输任务（任务统一登记在主房队列）

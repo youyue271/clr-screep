@@ -152,7 +152,8 @@ const getAttackerBody = function (room: Room) {
 
 const getViewerBody = function (room: Room) {
     let body: any[]
-    body = calcBodyPart({[MOVE]: 1})
+    // 侦察兵只要移动：2 个 MOVE 走 2 格/tick，100 能量，探完原地待命
+    body = calcBodyPart({[MOVE]: 2})
     return body
 }
 

@@ -8,6 +8,8 @@ export const spawnTable: { [role in Role]: number[] } = {
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
     // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // 侦察兵同样不进正常配额：有房间需要情报时才由外矿逻辑补一个
+    'viewer':       [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
@@ -115,6 +117,8 @@ export const remoteSetting = {
     carryCapacity: 2,
     // harvester 修外矿 container 的血量阈值：低于 hitsMax * 该值就优先维修
     repairThreshold: 0.9,
+    // 每个主房自动选定的外矿房上限（相邻房最多四个）
+    maxRooms: 4,
 }
 
 export const towerSetting = {
