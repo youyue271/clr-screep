@@ -457,8 +457,24 @@ export default class CreepExtension extends Creep {
                 return true
             }
         } else {
+            // 高优先级补能任务自带取能：carrier 直接去能量最多的 container 取，
+            // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
+            // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
+            const source = this.room.bestEnergyContainer()
+            if (source) {
+                this.say("⚡补能取能")
+                const res = this.withdraw(source, resourceType)
+                if (res == ERR_NOT_IN_RANGE) {
+                    this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
+                    return false
+                }
+                if (res == OK) {
+                    // 取到了，下一 tick 继续这个 carryTask 去投递
+                    return false
+                }
+            }
+            // 没有可取的 container（或刚好被别人取空）：退回通用取能
             this.changeRole('emptyWorker')
-            // this.room.registTask(getEnergyWithStorage(this.room))
             return true
         }
         return false

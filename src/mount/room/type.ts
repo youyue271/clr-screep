@@ -116,6 +116,11 @@ interface Room {
 
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
 
+    /**
+     * 取能量最多且高于低水位的 container，carryTask 自带取能时用
+     */
+    bestEnergyContainer(): StructureContainer | undefined
+
     ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>): void
 
     refreshEnergyCarryTasks(): void

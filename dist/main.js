@@ -3252,6 +3252,9 @@ const spawnPercent = 0.6;
 // 正常补能 100 tick 内早就够了，只在 carrier 全灭之类的饿死场景生效。
 const spawnSetting = {
     affordWaitTicks: 100,
+    // 总等待硬上限：能量一直在缓慢增长时也会在这么多 tick 后强制缩体型，
+    // 保证兜底一定生效（正常 100 tick 内涨够就不会走到这里）
+    affordMaxWaitTicks: 400,
 };
 const spawnTable = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
@@ -4315,8 +4318,24 @@ class CreepExtension extends Creep {
             }
         }
         else {
+            // 高优先级补能任务自带取能：carrier 直接去能量最多的 container 取，
+            // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
+            // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
+            const source = this.room.bestEnergyContainer();
+            if (source) {
+                this.say("⚡补能取能");
+                const res = this.withdraw(source, resourceType);
+                if (res == ERR_NOT_IN_RANGE) {
+                    this.moveTo(source, { visualizePathStyle: { stroke: '#ffff00' } });
+                    return false;
+                }
+                if (res == OK) {
+                    // 取到了，下一 tick 继续这个 carryTask 去投递
+                    return false;
+                }
+            }
+            // 没有可取的 container（或刚好被别人取空）：退回通用取能
             this.changeRole('emptyWorker');
-            // this.room.registTask(getEnergyWithStorage(this.room))
             return true;
         }
         return false;
@@ -5892,6 +5911,30 @@ class RoomExtension extends Room {
         return false;
     }
     /**
+     * 取能量最多的 container（高于低水位才可取）。
+     * 给 carryTask 自带取能用：carrier 保持 priority 1 的补能任务，
+     * 不需要降级成 emptyWorker 去和 worker 抢通用 energyTask。
+     */
+    bestEnergyContainer() {
+        var _a;
+        const level = this.controller ? this.controller.level : 0;
+        const low = ((_a = containerWatermark[level]) !== null && _a !== void 0 ? _a : containerWatermark[0]).low;
+        let best;
+        let bestEnergy = low;
+        for (const id of this.getContainer()) {
+            const container = Game.getObjectById(id);
+            if (!container) {
+                continue;
+            }
+            const energy = container.store.getUsedCapacity(RESOURCE_ENERGY);
+            if (energy > bestEnergy) {
+                best = container;
+                bestEnergy = energy;
+            }
+        }
+        return best;
+    }
+    /**
      * 有视野时把外矿矿点/container 的最新情况写回顶层缓存。
      */
     updateRemoteCache(state, remoteRoom) {
@@ -6342,6 +6385,9 @@ class RoomExtension extends Room {
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
+            // 记录排队时的能量高水位：能量还在增长就说明房间在回血，先不缩体型
+            queuedEnergy: this.energyAvailable,
+            createdAt: Game.time,
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
@@ -7594,6 +7640,17 @@ class SpawnExtension extends Spawn {
                     const waited = task.queuedAt === undefined ? 0 : Game.time - task.queuedAt;
                     if (waited < spawnSetting.affordWaitTicks) {
                         return;
+                    }
+                    // 能量还在增长：说明房间正在回血（carrier 在往 spawn/extension 搬），
+                    // 继续等，不要急着把大体型任务砍成小体型。只有连续一个窗口都不增长
+                    // 才兜底；同时用总时长硬上限保证一定会有结果。
+                    if (task.queuedEnergy !== undefined && this.room.energyAvailable > task.queuedEnergy) {
+                        task.queuedEnergy = this.room.energyAvailable;
+                        task.queuedAt = Game.time;
+                        const age = task.createdAt === undefined ? 0 : Game.time - task.createdAt;
+                        if (age < spawnSetting.affordMaxWaitTicks) {
+                            return;
+                        }
                     }
                     const fallbackBody = getBodyForEnergy(role, this.room, this.room.energyAvailable);
                     if (!fallbackBody) {

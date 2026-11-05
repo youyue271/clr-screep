@@ -724,6 +724,30 @@ export default class RoomExtension extends Room {
     }
 
     /**
+     * 取能量最多的 container（高于低水位才可取）。
+     * 给 carryTask 自带取能用：carrier 保持 priority 1 的补能任务，
+     * 不需要降级成 emptyWorker 去和 worker 抢通用 energyTask。
+     */
+    bestEnergyContainer(): StructureContainer | undefined {
+        const level = this.controller ? this.controller.level : 0
+        const low = (containerWatermark[level] ?? containerWatermark[0]).low
+        let best: StructureContainer | undefined
+        let bestEnergy = low
+        for (const id of this.getContainer()) {
+            const container = Game.getObjectById<StructureContainer>(id)
+            if (!container) {
+                continue
+            }
+            const energy = container.store.getUsedCapacity(RESOURCE_ENERGY)
+            if (energy > bestEnergy) {
+                best = container
+                bestEnergy = energy
+            }
+        }
+        return best
+    }
+
+    /**
      * 有视野时把外矿矿点/container 的最新情况写回顶层缓存。
      */
     private updateRemoteCache(state: RemoteRoomState, remoteRoom: Room): void {
@@ -1177,6 +1201,9 @@ export default class RoomExtension extends Room {
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
+            // 记录排队时的能量高水位：能量还在增长就说明房间在回血，先不缩体型
+            queuedEnergy: this.energyAvailable,
+            createdAt: Game.time,
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1

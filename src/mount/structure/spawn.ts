@@ -78,6 +78,17 @@ export default class SpawnExtension extends Spawn {
                     if (waited < spawnSetting.affordWaitTicks) {
                         return
                     }
+                    // 能量还在增长：说明房间正在回血（carrier 在往 spawn/extension 搬），
+                    // 继续等，不要急着把大体型任务砍成小体型。只有连续一个窗口都不增长
+                    // 才兜底；同时用总时长硬上限保证一定会有结果。
+                    if (task.queuedEnergy !== undefined && this.room.energyAvailable > task.queuedEnergy) {
+                        task.queuedEnergy = this.room.energyAvailable
+                        task.queuedAt = Game.time
+                        const age = task.createdAt === undefined ? 0 : Game.time - task.createdAt
+                        if (age < spawnSetting.affordMaxWaitTicks) {
+                            return
+                        }
+                    }
                     const fallbackBody = getBodyForEnergy(role, this.room, this.room.energyAvailable)
                     if (!fallbackBody) {
                         return
