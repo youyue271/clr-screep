@@ -13,6 +13,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     // 本地补能永远先认领，空闲时才去外矿拉货
     'carrier': ['carryTask', 'remoteCarryTask'],
     'remoteHarvester': ['remoteHarvestTask'],
+    // 外矿专用运输只做外矿往返，保证外矿 container 不会因为本地任务不断出现而被饿死
+    'remoteCarrier': ['remoteCarryTask'],
     // 侦察兵只有一个常驻任务，自己从外矿计划里挑要探的房间
     'viewer': ['scoutTask'],
 }
@@ -40,10 +42,14 @@ export default class CreepExtension extends Creep {
             }
             if (!this.memory.working) {
                 if (!this.getWork()) {
-                    this.say('🤓 没活辣,随便走走')
-                    const directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT]
-                    const randIndex = Math.floor(Math.random() * directions.length)
-                    this.move(directions[randIndex])
+                    // 外矿 carrier 的空闲处理自己会发移动意图（回家/原地待命），
+                    // 这里再随机走会覆盖 moveToRoom，导致永远回不了主房
+                    if (this.memory.role !== 'remoteCarrier') {
+                        this.say('🤓 没活辣,随便走走')
+                        const directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT]
+                        const randIndex = Math.floor(Math.random() * directions.length)
+                        this.move(directions[randIndex])
+                    }
                     return
                 }
             }
@@ -62,6 +68,11 @@ export default class CreepExtension extends Creep {
     getWork(): boolean {
         const room = this.room
         if (!room.memory.creepTask) {
+            // 外矿房/走廊房没有任务桶：remoteCarrier 不能原地发呆，
+            // 先回家再把身上能量交接掉（被别的 carrier 踢出任务时会走到这里）
+            if (this.memory.role === 'remoteCarrier') {
+                return this.remoteCarrierIdle()
+            }
             return false
         }
         // console.log(this.memory.role)
@@ -152,6 +163,11 @@ export default class CreepExtension extends Creep {
             this.changeRole(targetRole)
             delete this.memory.oldRole
             return this.getWork()
+        }
+        // 外矿 carrier 没任务时不能转 emptyWorker（会和本地取能抢任务），
+        // 但必须保证不滞留在外矿房：先回主房，身上有能量就交给主房接收点。
+        if (this.memory.role === 'remoteCarrier') {
+            return this.remoteCarrierIdle()
         }
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
@@ -910,6 +926,24 @@ export default class CreepExtension extends Creep {
             }
         }
         return best
+    }
+
+    /**
+     * 外矿 carrier 没任务时的兜底：不在主房就先回去，在主房就把能量交给接收点。
+     * 任务可能被别人 removeCurrentWorkFromQueue 踢掉，保证它不会带着货滞留在外矿房。
+     */
+    private remoteCarrierIdle(): boolean {
+        if (this.room.name !== this.memory.spawnRoom) {
+            this.moveToRoom(this.memory.spawnRoom)
+            return false
+        }
+        if (this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            const sink = this.homeEnergySink()
+            if (sink) {
+                this.transfer(sink, RESOURCE_ENERGY)
+            }
+        }
+        return false
     }
 
     /**

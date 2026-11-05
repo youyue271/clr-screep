@@ -20,6 +20,8 @@ export const spawnTable: { [role in Role]: number[] } = {
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 侦察兵同样不进正常配额：有房间需要情报时才由外矿逻辑补一个
     'viewer':       [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // 外矿运输也不按这张表孵化：由 refreshRemoteSpawn 按"每房配额"补员
+    'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
@@ -129,6 +131,8 @@ export const remoteSetting = {
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
     maxRooms: 4,
+    // 每个"已建好 container"的外矿房配几个专用 remoteCarrier
+    carriersPerRoom: 1,
 }
 
 export const towerSetting = {

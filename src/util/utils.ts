@@ -88,6 +88,9 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
         case 'remoteHarvester':
             // 外矿和主房一样是站在 container 上采，body 直接复用
             return getHarvesterBody(room)
+        case 'remoteCarrier':
+            // 外矿运输和本地 carrier 一样是纯搬货，body 直接复用
+            return getCarrierBody(room)
 
     }
 }
@@ -173,7 +176,8 @@ export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: nu
             }
             return calcBodyPart({[CARRY]: 1, [WORK]: 2 * Math.min(num, 3), [MOVE]: Math.min(num, 3)})
         }
-        case 'carrier': {
+        case 'carrier':
+        case 'remoteCarrier': {
             const num = Math.floor(budget / 100)
             if (num <= 0) {
                 return undefined

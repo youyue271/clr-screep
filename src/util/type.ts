@@ -42,6 +42,7 @@ type BaseRoleConstant =
     | 'miner'
     | 'viewer'
     | 'remoteHarvester'
+    | 'remoteCarrier'
 
 type AdvancedRoleConstant =
     | 'attacker'

@@ -19,6 +19,8 @@ type Role = 'worker'
     | 'harvester'
     | 'emptyWorker'
     | 'remoteHarvester'
+    // 外矿专用运输：只领 remoteCarryTask，不和本地 carrier 抢补能任务
+    | 'remoteCarrier'
     // 侦察兵：只有 MOVE 部件，负责探明相邻外矿房并写情报
     | 'viewer'
 

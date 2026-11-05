@@ -656,6 +656,14 @@ export default class RoomExtension extends Room {
         if (!plan || plan.enabled === false) {
             return
         }
+        this.refreshRemoteHarvesterSpawn(plan)
+        this.refreshRemoteCarrierSpawn(plan)
+    }
+
+    /**
+     * 按每个外矿矿点补 remoteHarvester。
+     */
+    private refreshRemoteHarvesterSpawn(plan: RemotePlan): void {
         let want = 0
         for (const roomName in plan.rooms) {
             const state = plan.rooms[roomName]
@@ -692,6 +700,57 @@ export default class RoomExtension extends Room {
         }
         for (let i = alive + queued; i < want; i++) {
             this.addToSpawnList('remoteHarvester')
+        }
+    }
+
+    /**
+     * 每个"已建好 container"的启用外矿房补一个专用 remoteCarrier。
+     * 专用角色只认 remoteCarryTask，不会被本地 carryTask 长期饿死。
+     */
+    private refreshRemoteCarrierSpawn(plan: RemotePlan): void {
+        let want = 0
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            const sources = state.sources
+            if (!sources) {
+                continue
+            }
+            // container 建好才派运输，否则 carrier 去了也没东西可拉
+            const hasContainer = Object.keys(sources).some(sourceId => !!sources[sourceId]?.containerId)
+            if (hasContainer) {
+                want += remoteSetting.carriersPerRoom
+            }
+        }
+        if (!want) {
+            return
+        }
+        let alive = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'remoteCarrier') {
+                alive += 1
+            }
+        }
+        let queued = 0
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === 'remoteCarrier') {
+                    queued += 1
+                }
+            }
+        }
+        if (alive + queued >= want) {
+            return
+        }
+        if (!plan.force && !this.remoteGate()) {
+            return
+        }
+        for (let i = alive + queued; i < want; i++) {
+            this.addToSpawnList('remoteCarrier')
         }
     }
 
@@ -1120,6 +1179,8 @@ export default class RoomExtension extends Room {
             // 外矿 harvester 不参与自动补员：配额故意为 0，让它 reSpawn=false，
             // 由 refreshRemoteSpawn 按"富余能量"门槛决定要不要孵化
             'remoteHarvester': 0,
+            // 外矿运输同理，由 refreshRemoteCarrierSpawn 按每个外矿房的 container 补员
+            'remoteCarrier': 0,
             // 侦察兵同样不参与自动补员，由 refreshScoutSpawn 按需补
             'viewer': 0,
         }
@@ -1196,8 +1257,9 @@ export default class RoomExtension extends Room {
         const task: TaskEntity = {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
-            // 第三个参数是矿点 id：提前换班的 harvester 孵化后只认这个矿点
-            taskParam: [role, getBody(role, this), sourceId],
+            // 第三、四个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
+            // reSpawn 标记（false 表示死亡后由外矿逻辑补员，creepRecycle 不无条件重孵）
+            taskParam: [role, getBody(role, this), sourceId, role !== 'remoteCarrier'],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
@@ -1209,6 +1271,7 @@ export default class RoomExtension extends Room {
                 : role == 'carrier' ? 1
                 : role == 'viewer' ? 4
                 : role == 'remoteHarvester' ? 3
+                : role == 'remoteCarrier' ? 3
                 : 2,
             capacity: 1,
             persistent: false, 
