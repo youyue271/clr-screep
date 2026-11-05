@@ -101,7 +101,10 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
 const getHarvesterBody = function (room: Room) {
     // CARRY 保持最小：站在 container 上采集时，溢出的能量由引擎自动填进脚下 container，
     // 不需要转身卸货，采集不会被打断。
-    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent)
+    // 体型按「容量」而不是当前存量算：harvester 寿命长，按当前能量算会在低能量时
+    // 孵出最小体型，形成“能量低 → 弱 harvester → 能量更低”的死循环。
+    // spawn 会等能量攒够再孵化，换班余量（孵化 + 路程 + 15 tick）足够。
+    const energyBase = room.energyCapacityAvailable
     let num = Math.floor((energyBase - 50) / 250)
     if (num > 3) {
         num = 3
@@ -114,7 +117,9 @@ const getHarvesterBody = function (room: Room) {
 
 const getCarrierBody = function (room: Room) {
     let body: any[];
-    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent)
+    // 和 worker/harvester 一致：按容量算，避免低能量时孵出 1 CARRY 的“残废” carrier，
+    // 一次只能搬 50 能量、来回跑断腿。
+    const energyBase = room.energyCapacityAvailable * spawnPercent
     let num = Math.floor(energyBase / 100)
     if (num > 25) num = 25
     if (num <= 0) num = 1
@@ -148,6 +153,54 @@ const getAttackerBody = function (room: Room) {
     if (num <= 0) num = 1
     body = calcBodyPart({[TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num})
     return body
+}
+
+/**
+ * 兜底体型：按当前可用能量算一个刚好买得起的身体。
+ * 正常孵化仍然走 getBody 按容量算体型（避免低能量时孵出弱 creep）；
+ * 这里只给 spawn 队列在"等能量等太久"时保底用，保证房间至少能孵出一个 creep 破局。
+ * 连最小体型都买不起时返回 undefined。
+ */
+export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: number): BodyPartConstant[] | undefined {
+    const budget = Math.min(energy, room.energyCapacityAvailable)
+    switch (role) {
+        case 'harvester':
+        case 'remoteHarvester': {
+            // 和 getHarvesterBody 同构，只是能量基准换成当前可用量
+            const num = Math.floor((budget - 50) / 250)
+            if (num <= 0) {
+                return undefined
+            }
+            return calcBodyPart({[CARRY]: 1, [WORK]: 2 * Math.min(num, 3), [MOVE]: Math.min(num, 3)})
+        }
+        case 'carrier': {
+            const num = Math.floor(budget / 100)
+            if (num <= 0) {
+                return undefined
+            }
+            return calcBodyPart({[CARRY]: Math.min(num, 25), [MOVE]: Math.min(num, 25)})
+        }
+        case 'worker':
+        case 'remoteBuilder': {
+            const num = Math.floor((budget - 150) / 150)
+            if (num <= 0) {
+                return undefined
+            }
+            return calcBodyPart({[CARRY]: 3, [WORK]: Math.min(num, 23), [MOVE]: Math.min(num, 23)})
+        }
+        case 'viewer':
+            return budget >= 100 ? calcBodyPart({[MOVE]: 2}) : undefined
+        case 'claimer': {
+            const num = Math.floor(budget / 750)
+            return num > 0 ? calcBodyPart({[CLAIM]: num, [MOVE]: num * 3}) : undefined
+        }
+        case 'attacker': {
+            const num = Math.floor(budget / 200)
+            return num > 0 ? calcBodyPart({[TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num}) : undefined
+        }
+        default:
+            return undefined
+    }
 }
 
 const getViewerBody = function (room: Room) {

@@ -141,6 +141,18 @@ export default class CreepExtension extends Creep {
                 }
             }
         }
+        // 身上有能量却找不到任务：emptyWorker 直接回原职业，避免带着能量发呆。
+        // 正常回退发生在 getEnergyFromStructure / collectEnergy 成功分支里，
+        // 但任务被清掉、只捡到部分能量时会漏掉，这里兜底。
+        if (this.memory.role === 'emptyWorker'
+            && this.memory.oldRole
+            && this.memory.oldRole !== 'emptyWorker'
+            && this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            const targetRole = this.memory.oldRole
+            this.changeRole(targetRole)
+            delete this.memory.oldRole
+            return this.getWork()
+        }
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
         // harvester / remoteHarvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
@@ -486,14 +498,9 @@ export default class CreepExtension extends Creep {
             this.say("⚡建造中")
             const target = Game.getObjectById(constructionId)
             if (!target) {
-                // this.releaseCurrentWork()
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
+                // 工地已经完成/被拆：必须把这条任务从队列里删掉，否则它会一直留在
+                // 队首，每个 worker 每 tick 反复领到同一个死任务，永远轮不到后面的任务
+                this.removeCurrentWorkFromQueue()
                 return true
             }
             const res = this.build(target)

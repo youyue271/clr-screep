@@ -1,5 +1,12 @@
 export const spawnPercent = 0.6
 
+// spawn 队列等能量的兜底阈值：任务排队超过这么多 tick 还买不起 body，
+// 就按当前能量换一个买得起的最小体型先孵化。
+// 正常补能 100 tick 内早就够了，只在 carrier 全灭之类的饿死场景生效。
+export const spawnSetting = {
+    affordWaitTicks: 100,
+}
+
 export const spawnTable: { [role in Role]: number[] } = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester':    [0, 0, 0, 0, 0, 0, 0, 0, 0], // harvester 根据房间source数量动态调整
@@ -32,13 +39,13 @@ export const energyStructureScanInterval = 100
 export const containerWatermark = [
     {low: 0, high: 0},        // RCL0
     {low: 50, high: 600},     // RCL1
-    {low: 100, high: 1000},   // RCL2
-    {low: 150, high: 1400},   // RCL3
-    {low: 200, high: 1600},   // RCL4
-    {low: 250, high: 1800},   // RCL5
-    {low: 300, high: 2000},   // RCL6
-    {low: 300, high: 2000},   // RCL7
-    {low: 300, high: 2000},   // RCL8
+    {low: 50, high: 1000},    // RCL2
+    {low: 50, high: 1400},    // RCL3
+    {low: 50, high: 1600},    // RCL4
+    {low: 100, high: 1800},   // RCL5
+    {low: 100, high: 2000},   // RCL6
+    {low: 100, high: 2000},   // RCL7
+    {low: 100, high: 2000},   // RCL8
 ]
 
 // 单个 container 同时允许几个 creep 取能的上限（按 RCL）

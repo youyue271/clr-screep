@@ -5,9 +5,10 @@
 // import {spawnCreepErrorDescription} from "@/information"
 // import room from "@/mount/room";
 //
-import {CalBodyCost} from "@/util/utils";
+import {CalBodyCost, getBodyForEnergy} from "@/util/utils";
 import log from "@/util/log";
 import {spawnCreepErrorDescription} from "@/util/errorInformation";
+import {spawnSetting} from "@/setting";
 
 export default class SpawnExtension extends Spawn {
     /**
@@ -45,7 +46,7 @@ export default class SpawnExtension extends Spawn {
             } else {
                 const task = spawnQueue[0]
                 const role = task?.taskParam?.[0] as Role
-                const rolePart = task?.taskParam?.[1] as BodyPartConstant[]
+                let rolePart = task?.taskParam?.[1] as BodyPartConstant[]
                 if (!role || !rolePart) {
                     spawnQueue.shift()
                     if (activeKey && spawnQueue.length === 0) {
@@ -70,8 +71,25 @@ export default class SpawnExtension extends Spawn {
                     this.pos.y + 2,
                     {align: 'left', opacity: 0.8, font: "20px"})
                 if (this.room.energyAvailable < energyNeeded) {
-                    return
-                } else {
+                    // 正常情况等 carryTask 补能即可；等太久说明房间已经补不上能量
+                    // （典型是 carrier 全灭），按当前能量换一个买得起的最小体型先孵出来，
+                    // 否则 priority 0 的大体型任务会把后面的 carrier/worker 全部堵死。
+                    const waited = task.queuedAt === undefined ? 0 : Game.time - task.queuedAt
+                    if (waited < spawnSetting.affordWaitTicks) {
+                        return
+                    }
+                    const fallbackBody = getBodyForEnergy(role, this.room, this.room.energyAvailable)
+                    if (!fallbackBody) {
+                        return
+                    }
+                    task.taskParam[1] = fallbackBody
+                    rolePart = fallbackBody
+                    energyNeeded = CalBodyCost(fallbackBody)
+                    if (this.room.energyAvailable < energyNeeded) {
+                        return
+                    }
+                }
+                if (this.room.energyAvailable >= energyNeeded) {
                     // 按布局集群顺序挑"刚好够"的结构，不做存量排序。
                     // spawnCreep 会严格按这个顺序扣能量。
                     const picked = this.room.pickEnergyStructures(energyNeeded)

@@ -56,7 +56,9 @@ export function upgradeTaskCapacityOf(room: Room): number {
         return 0
     }
     if (room.find(FIND_CONSTRUCTION_SITES).length > 0) {
-        return base
+        // 有工地时压低升级并发（最多 2 个）：把有能量的 worker 让给建造，
+        // 尤其是 priority 1 的 extension 工地；工地清零后再按 worker 数放开。
+        return Math.max(1, Math.min(base, 2))
     }
     // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
     const workerCount = room.find(FIND_MY_CREEPS, {

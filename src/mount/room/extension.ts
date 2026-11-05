@@ -1174,6 +1174,9 @@ export default class RoomExtension extends Room {
             taskFunc: "spawnCreep",
             // 第三个参数是矿点 id：提前换班的 harvester 孵化后只认这个矿点
             taskParam: [role, getBody(role, this), sourceId],
+            // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
+            // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
+            queuedAt: Game.time,
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1

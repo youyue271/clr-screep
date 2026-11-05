@@ -3247,6 +3247,12 @@ const errorMapper = function (next) {
 };
 
 const spawnPercent = 0.6;
+// spawn 队列等能量的兜底阈值：任务排队超过这么多 tick 还买不起 body，
+// 就按当前能量换一个买得起的最小体型先孵化。
+// 正常补能 100 tick 内早就够了，只在 carrier 全灭之类的饿死场景生效。
+const spawnSetting = {
+    affordWaitTicks: 100,
+};
 const spawnTable = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -3275,13 +3281,13 @@ const energyStructureScanInterval = 100;
 const containerWatermark = [
     { low: 0, high: 0 },
     { low: 50, high: 600 },
-    { low: 100, high: 1000 },
-    { low: 150, high: 1400 },
-    { low: 200, high: 1600 },
-    { low: 250, high: 1800 },
-    { low: 300, high: 2000 },
-    { low: 300, high: 2000 },
-    { low: 300, high: 2000 }, // RCL8
+    { low: 50, high: 1000 },
+    { low: 50, high: 1400 },
+    { low: 50, high: 1600 },
+    { low: 100, high: 1800 },
+    { low: 100, high: 2000 },
+    { low: 100, high: 2000 },
+    { low: 100, high: 2000 }, // RCL8
 ];
 // 单个 container 同时允许几个 creep 取能的上限（按 RCL）
 const containerConcurrency = [0, 1, 2, 3, 4, 4, 5, 5, 5];
@@ -3415,7 +3421,9 @@ function upgradeTaskCapacityOf(room) {
         return 0;
     }
     if (room.find(FIND_CONSTRUCTION_SITES).length > 0) {
-        return base;
+        // 有工地时压低升级并发（最多 2 个）：把有能量的 worker 让给建造，
+        // 尤其是 priority 1 的 extension 工地；工地清零后再按 worker 数放开。
+        return Math.max(1, Math.min(base, 2));
     }
     // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
     const workerCount = room.find(FIND_MY_CREEPS, {
@@ -3984,6 +3992,18 @@ class CreepExtension extends Creep {
                 }
             }
         }
+        // 身上有能量却找不到任务：emptyWorker 直接回原职业，避免带着能量发呆。
+        // 正常回退发生在 getEnergyFromStructure / collectEnergy 成功分支里，
+        // 但任务被清掉、只捡到部分能量时会漏掉，这里兜底。
+        if (this.memory.role === 'emptyWorker'
+            && this.memory.oldRole
+            && this.memory.oldRole !== 'emptyWorker'
+            && this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            const targetRole = this.memory.oldRole;
+            this.changeRole(targetRole);
+            delete this.memory.oldRole;
+            return this.getWork();
+        }
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
         // harvester / remoteHarvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
@@ -4335,14 +4355,9 @@ class CreepExtension extends Creep {
             this.say("⚡建造中");
             const target = Game.getObjectById(constructionId);
             if (!target) {
-                // this.releaseCurrentWork()
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
+                // 工地已经完成/被拆：必须把这条任务从队列里删掉，否则它会一直留在
+                // 队首，每个 worker 每 tick 反复领到同一个死任务，永远轮不到后面的任务
+                this.removeCurrentWorkFromQueue();
                 return true;
             }
             const res = this.build(target);
@@ -4857,7 +4872,10 @@ function getBody(role, room) {
 const getHarvesterBody = function (room) {
     // CARRY 保持最小：站在 container 上采集时，溢出的能量由引擎自动填进脚下 container，
     // 不需要转身卸货，采集不会被打断。
-    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent);
+    // 体型按「容量」而不是当前存量算：harvester 寿命长，按当前能量算会在低能量时
+    // 孵出最小体型，形成“能量低 → 弱 harvester → 能量更低”的死循环。
+    // spawn 会等能量攒够再孵化，换班余量（孵化 + 路程 + 15 tick）足够。
+    const energyBase = room.energyCapacityAvailable;
     let num = Math.floor((energyBase - 50) / 250);
     if (num > 3) {
         num = 3;
@@ -4869,7 +4887,9 @@ const getHarvesterBody = function (room) {
 };
 const getCarrierBody = function (room) {
     let body;
-    const energyBase = Math.min(room.energyAvailable, room.energyCapacityAvailable * spawnPercent);
+    // 和 worker/harvester 一致：按容量算，避免低能量时孵出 1 CARRY 的“残废” carrier，
+    // 一次只能搬 50 能量、来回跑断腿。
+    const energyBase = room.energyCapacityAvailable * spawnPercent;
     let num = Math.floor(energyBase / 100);
     if (num > 25)
         num = 25;
@@ -4908,6 +4928,53 @@ const getAttackerBody = function (room) {
     body = calcBodyPart({ [TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num });
     return body;
 };
+/**
+ * 兜底体型：按当前可用能量算一个刚好买得起的身体。
+ * 正常孵化仍然走 getBody 按容量算体型（避免低能量时孵出弱 creep）；
+ * 这里只给 spawn 队列在"等能量等太久"时保底用，保证房间至少能孵出一个 creep 破局。
+ * 连最小体型都买不起时返回 undefined。
+ */
+function getBodyForEnergy(role, room, energy) {
+    const budget = Math.min(energy, room.energyCapacityAvailable);
+    switch (role) {
+        case 'harvester':
+        case 'remoteHarvester': {
+            // 和 getHarvesterBody 同构，只是能量基准换成当前可用量
+            const num = Math.floor((budget - 50) / 250);
+            if (num <= 0) {
+                return undefined;
+            }
+            return calcBodyPart({ [CARRY]: 1, [WORK]: 2 * Math.min(num, 3), [MOVE]: Math.min(num, 3) });
+        }
+        case 'carrier': {
+            const num = Math.floor(budget / 100);
+            if (num <= 0) {
+                return undefined;
+            }
+            return calcBodyPart({ [CARRY]: Math.min(num, 25), [MOVE]: Math.min(num, 25) });
+        }
+        case 'worker':
+        case 'remoteBuilder': {
+            const num = Math.floor((budget - 150) / 150);
+            if (num <= 0) {
+                return undefined;
+            }
+            return calcBodyPart({ [CARRY]: 3, [WORK]: Math.min(num, 23), [MOVE]: Math.min(num, 23) });
+        }
+        case 'viewer':
+            return budget >= 100 ? calcBodyPart({ [MOVE]: 2 }) : undefined;
+        case 'claimer': {
+            const num = Math.floor(budget / 750);
+            return num > 0 ? calcBodyPart({ [CLAIM]: num, [MOVE]: num * 3 }) : undefined;
+        }
+        case 'attacker': {
+            const num = Math.floor(budget / 200);
+            return num > 0 ? calcBodyPart({ [TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num }) : undefined;
+        }
+        default:
+            return undefined;
+    }
+}
 const getViewerBody = function (room) {
     let body;
     // 侦察兵只要移动：2 个 MOVE 走 2 格/tick，100 能量，探完原地待命
@@ -6272,6 +6339,9 @@ class RoomExtension extends Room {
             taskFunc: "spawnCreep",
             // 第三个参数是矿点 id：提前换班的 harvester 孵化后只认这个矿点
             taskParam: [role, getBody(role, this), sourceId],
+            // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
+            // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
+            queuedAt: Game.time,
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
@@ -7505,7 +7575,7 @@ class SpawnExtension extends Spawn {
             else {
                 const task = spawnQueue[0];
                 const role = (_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0];
-                const rolePart = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[1];
+                let rolePart = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[1];
                 if (!role || !rolePart) {
                     spawnQueue.shift();
                     if (activeKey && spawnQueue.length === 0) {
@@ -7518,9 +7588,25 @@ class SpawnExtension extends Spawn {
                 this.room.visual.text("💸" + energyNeeded + "\n", this.pos.x + 1, this.pos.y + 1, { align: 'left', opacity: 0.8, font: "20px" });
                 this.room.visual.text("💰" + this.room.energyAvailable + "\n", this.pos.x + 1, this.pos.y + 2, { align: 'left', opacity: 0.8, font: "20px" });
                 if (this.room.energyAvailable < energyNeeded) {
-                    return;
+                    // 正常情况等 carryTask 补能即可；等太久说明房间已经补不上能量
+                    // （典型是 carrier 全灭），按当前能量换一个买得起的最小体型先孵出来，
+                    // 否则 priority 0 的大体型任务会把后面的 carrier/worker 全部堵死。
+                    const waited = task.queuedAt === undefined ? 0 : Game.time - task.queuedAt;
+                    if (waited < spawnSetting.affordWaitTicks) {
+                        return;
+                    }
+                    const fallbackBody = getBodyForEnergy(role, this.room, this.room.energyAvailable);
+                    if (!fallbackBody) {
+                        return;
+                    }
+                    task.taskParam[1] = fallbackBody;
+                    rolePart = fallbackBody;
+                    energyNeeded = CalBodyCost(fallbackBody);
+                    if (this.room.energyAvailable < energyNeeded) {
+                        return;
+                    }
                 }
-                else {
+                if (this.room.energyAvailable >= energyNeeded) {
                     // 按布局集群顺序挑"刚好够"的结构，不做存量排序。
                     // spawnCreep 会严格按这个顺序扣能量。
                     const picked = this.room.pickEnergyStructures(energyNeeded);
