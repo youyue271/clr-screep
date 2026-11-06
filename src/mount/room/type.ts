@@ -10,6 +10,11 @@ interface RemoteSourceState {
 interface RemoteRoomState {
     enabled?: boolean
     sources?: { [sourceId: string]: RemoteSourceState }
+    // 外矿 container -> 回运任务 id。任务本身在主房队列里，id 过期后由 globalReset 重建
+    carryTaskIds?: { [containerId: string]: string }
+    // 主房这边给这个外矿规划/建成的 link（放顶层 memory，推代码后还在）
+    remoteLinkPos?: [number, number]
+    remoteLinkId?: Id<StructureLink>
 }
 
 interface RemotePlan {
@@ -17,6 +22,8 @@ interface RemotePlan {
     // 调试/测试用：忽略"富余能量"门槛，强制孵化外矿 harvester
     force?: boolean
     rooms: { [roomName: string]: RemoteRoomState }
+    // 当前有效的外矿回运任务数，给 carrier -> remoteCarrier 转换做 O(1) 判断
+    carryActive?: number
 }
 
 /**
@@ -89,6 +96,19 @@ interface RoomMemory {
     // 孵化成功的那一 tick 任务已出队、creep 要下一 tick 才进 Game.creeps，
     // 用这个标记补上窗口，避免 refreshClaimSpawn 重复排队。
     claimerSpawnTick?: { [roomName: string]: number }
+    // link 规划：位置在建房时算好，id 在建成/推代码后回填
+    linkPlan?: LinkPlan
+}
+
+interface LinkPlan {
+    corePos?: [number, number]
+    coreId?: Id<StructureLink>
+    // 矿点 link：sourceId -> 规划位置/建成 id
+    sources?: { [sourceId: string]: { pos: [number, number], id?: Id<StructureLink> } }
+    // 外矿 link：外矿房名 -> 规划位置/建成 id
+    remotes?: { [roomName: string]: { pos: [number, number], id?: Id<StructureLink> } }
+    // 按距离排好的建造顺序，key 形如 core / source:xxx / remote:xxx
+    order?: string[]
 }
 
 interface Room {
@@ -139,9 +159,9 @@ interface Room {
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
 
     /**
-     * 取能量最多且高于低水位的 container，carryTask 自带取能时用
+     * 取能量最多且高于低水位的 container / 中央 link，carryTask 自带取能时用
      */
-    bestEnergyContainer(): StructureContainer | undefined
+    bestEnergyContainer(): StructureLink | StructureContainer | undefined
 
     ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>): void
 
@@ -163,7 +183,8 @@ interface Room {
     syncRemotePlan(): void
 
     /**
-     * 同步外矿采集/运输任务（任务统一登记在主房队列）
+     * 同步外矿采集任务（任务统一登记在主房队列）。
+     * 回运任务是事件驱动登记的，不在这里扫描/创建。
      */
     refreshRemoteTasks(): void
 
@@ -171,6 +192,48 @@ interface Room {
      * 按富余能量门槛孵化外矿 harvester
      */
     refreshRemoteSpawn(): void
+
+    /**
+     * 登记一条外矿 container 的循环回运任务（幂等）。
+     * 由外矿 harvester 第一次看到 container / 推代码重建时调用。
+     */
+    registerRemoteCarryTask(remoteRoom: string, sourceId: string, containerId: string, linkId?: Id<StructureLink>): void
+
+    /**
+     * 外矿 container 消失/停用时删掉对应回运任务
+     */
+    removeRemoteCarryTask(containerId: string): void
+
+    /**
+     * 停用/移出计划的房：删掉它所有回运任务
+     */
+    removeRemoteCarryTasksOfRoom(remoteRoom: string): void
+
+    /**
+     * 推代码后按 Memory.remotePlan 里已知的 containerId 一次性重建回运任务
+     */
+    rearmRemoteCarryTasks(): void
+
+    /**
+     * 是否有可领的外矿回运任务（O(1)，只看顶层 memory 计数器）
+     */
+    hasRemoteCarryTask(): boolean
+
+    /**
+     * link 建成后把 linkId 补进对应 container 的回运任务
+     */
+    updateRemoteCarryLink(containerId: string, linkId: Id<StructureLink>): void
+
+    /**
+     * 中央 link（link 规划/建好后才有）
+     */
+    getCoreLink(): StructureLink | undefined
+
+    /**
+     * 规划/补 link 工地：中央 > 外矿（离中央越远越先）> 矿点，
+     * 数量受 RCL 的 link 上限约束；已建成/已有工地的规划位回填 id。
+     */
+    syncLinkPlan(): void
 
     /**
      * 房间环境扫描（敌对/受伤/维修队列），结果缓存在 global.room
@@ -216,7 +279,7 @@ interface Room {
      * task相关
      */
 
-    registTask(tasks: MyTask[]): void
+    registTask(tasks: MyTask[]): TaskEntity[]
 
     /**
      * 房间缓存

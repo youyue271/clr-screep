@@ -45,6 +45,8 @@ export default class RoomScanExtension extends Room {
             // 先按最新情报补全外矿计划（相邻房、unsafe 过滤），再同步任务/补员
             this.syncRemotePlan()
             this.refreshRemoteTasks()
+            // 新外矿房/新矿点出现后补 link 规划和工地（位置有缓存，正常只做几次 lookFor）
+            this.syncLinkPlan()
             this.refreshRemoteSpawn()
         }
         // 兜底重建 spawn/extension 顺序表，处理漏掉的建成/拆除

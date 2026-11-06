@@ -10,8 +10,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     // 只有少数 worker 会短暂转去维修，修完后自动回来升级
     'worker': ['repairTask', 'wallRepairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
-    // 本地补能永远先认领，空闲时才去外矿拉货
-    'carrier': ['carryTask', 'remoteCarryTask'],
+    // 本地补能永远先认领；本地没活时才转换角色去外矿拉货
+    'carrier': ['carryTask'],
     'remoteHarvester': ['remoteHarvestTask'],
     // 外矿专用运输只做外矿往返，保证外矿 container 不会因为本地任务不断出现而被饿死
     'remoteCarrier': ['remoteCarryTask'],
@@ -90,7 +90,7 @@ export default class CreepExtension extends Creep {
     }
 
 
-    getWork(): boolean {
+    getWork(noRemoteConvert?: boolean): boolean {
         const room = this.room
         if (!room.memory.creepTask) {
             // 外矿房/走廊房没有任务桶：remoteCarrier 不能原地发呆，
@@ -211,6 +211,12 @@ export default class CreepExtension extends Creep {
         // 但必须保证不滞留在外矿房：先回主房，身上有能量就交给主房接收点。
         if (this.memory.role === 'remoteCarrier') {
             return this.remoteCarrierIdle()
+        }
+        // 本地 carrier 没活干：只看有没有外矿回运任务，有就转 remoteCarrier。
+        // noRemoteConvert 防止转过去又领不到任务时在本 tick 内来回转换。
+        if (!noRemoteConvert && this.memory.role === 'carrier' && room.hasRemoteCarryTask()) {
+            this.changeRole('remoteCarrier')
+            return this.getWork(true)
         }
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
@@ -737,6 +743,8 @@ export default class CreepExtension extends Creep {
         if (container) {
             if (state && state.containerId !== container.id) {
                 state.containerId = container.id
+                // container 首次出现 / 换了 id：主房登记一条循环回运任务（事件驱动，不周期扫描）
+                Game.rooms[homeRoom]?.registerRemoteCarryTask(targetRoom, source.id, container.id)
             }
             if (state && (!state.containerPos || state.containerPos[0] !== container.pos.x || state.containerPos[1] !== container.pos.y)) {
                 state.containerPos = [container.pos.x, container.pos.y]
@@ -759,6 +767,11 @@ export default class CreepExtension extends Creep {
                 this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
             }
             return false
+        }
+        // 外矿 container 没了：清掉对应回运任务和缓存，重建后再按新 id 登记
+        if (state?.containerId) {
+            Game.rooms[homeRoom]?.removeRemoteCarryTask(state.containerId)
+            delete state.containerId
         }
         // 还没有 container：自己放工地并建造（5000 进度，边采边建）
         let site = source.pos.findInRange(FIND_CONSTRUCTION_SITES, 1, {
@@ -805,7 +818,7 @@ export default class CreepExtension extends Creep {
      * 只有回到主房才能返回 true —— releaseCurrentWork 用的是 this.room 的队列，
      * 在外矿房结束任务会把主房队列里的预约漏掉。
      */
-    remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>): boolean {
+    remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>, linkId?: Id<StructureLink>): boolean {
         const energy = this.store.getUsedCapacity(RESOURCE_ENERGY)
         if (this.room.name === targetRoom) {
             if (this.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
@@ -818,8 +831,12 @@ export default class CreepExtension extends Creep {
                     }
                     return false
                 }
+                // 有视野确认 container 已经没了：让主房删任务，别让循环任务跟着死目标跑
+                if (!container) {
+                    Game.rooms[homeRoom]?.removeRemoteCarryTask(containerId)
+                }
             }
-            // 拿满了 / 外矿没货：标记回程，回主房再结算
+            // 拿满了 / 外矿没货 / container 没了：标记回程，回主房再结算
             this.memory.remoteReturn = true
             this.moveToRoom(homeRoom)
             return false
@@ -836,24 +853,64 @@ export default class CreepExtension extends Creep {
                 this.moveToRoom(targetRoom)
                 return false
             }
-            // 空手回来 = 外矿没货，任务作废（在家才能安全地按房间删任务）
-            this.removeCurrentWorkFromQueue()
+            // 空手回来 = 外矿没货。任务保留（循环任务），转回 carrier 让本地活优先
             delete this.memory.remoteReturn
+            this.finishRemoteTrip()
             return true
         }
+        // 投递顺序：对应外矿 link > 任务登记的 sink > 普通 carrier 的接收点
+        const link = linkId ? Game.getObjectById<StructureLink>(linkId) : undefined
+        const linkFree = !!link && link.energy < link.energyCapacity
         const sink = sinkId ? Game.getObjectById(sinkId) as any : undefined
-        const target: AnyStoreStructure | undefined = sink && sink.store && sink.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-            ? sink
-            : this.homeEnergySink()
-        if (target) {
-            this.say('⚡外矿回运')
-            if (this.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
-                this.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' } })
-                return false
-            }
+        const target: AnyStoreStructure | StructureLink | undefined = linkFree
+            ? link
+            : (sink && sink.store && sink.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+                ? sink
+                : this.homeEnergySink())
+        if (!target) {
+            // 主房暂时没地方收：原地待命，不丢货
+            return false
+        }
+        this.say(linkFree ? '🔗外矿入link' : '⚡外矿回运')
+        const res = this.transfer(target, RESOURCE_ENERGY)
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(target, { visualizePathStyle: { stroke: linkFree ? '#66ccff' : '#ffffff' } })
+            return false
+        }
+        if (res !== OK) {
+            return false
+        }
+        if (linkFree) {
+            // link 收下了：冷却好了就转发中央 link，不用额外扫描
+            this.trySendLink(link as StructureLink)
         }
         delete this.memory.remoteReturn
+        // 卸完货：任务保留，转回 carrier；本地有活就干，没活下 tick 再转回来
+        this.finishRemoteTrip()
         return true
+    }
+
+    /**
+     * 外矿往返结束：循环任务保留，只把角色切回 carrier。
+     * oldRole 必须删掉，否则死的时候会重孵 remoteCarrier（现在不再特招这个角色）。
+     */
+    private finishRemoteTrip(): void {
+        this.changeRole('carrier')
+        delete this.memory.oldRole
+    }
+
+    /**
+     * 把 link 里的能量转发中央 link（link→link 瞬发，有冷却和损耗）。
+     */
+    private trySendLink(link: StructureLink): void {
+        if (link.cooldown > 0 || !link.energy) {
+            return
+        }
+        const core = this.room.getCoreLink?.()
+        if (!core || core.id === link.id || core.energy >= core.energyCapacity) {
+            return
+        }
+        link.transferEnergy(core)
     }
 
     /**
@@ -1220,6 +1277,10 @@ export default class CreepExtension extends Creep {
                 this.transfer(sink, RESOURCE_ENERGY)
             }
         }
+        // 回到主房还领不到回运任务：转回普通 carrier，本地补能优先。
+        // 如果本地也没活，下一 tick 会按"有没有回运任务"再转回来，不会滞留在外矿角色。
+        this.changeRole('carrier')
+        delete this.memory.oldRole
         return false
     }
 

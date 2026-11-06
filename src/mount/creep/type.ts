@@ -43,7 +43,7 @@ interface Creep {
      * 如果getWork成功，新工作存入creep的currentWork中
      * 否则，表示creep角色对应的所有工作都做完了
      */
-    getWork(): boolean
+    getWork(noRemoteConvert?: boolean): boolean
 
     /**
      * 主要用于调配相近部件creep的数量关系
@@ -76,7 +76,7 @@ interface Creep {
     /**
      * 外矿运输：去外矿 container 取能，回到主房投递后才结束任务。
      */
-    remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>): boolean
+    remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>, linkId?: Id<StructureLink>): boolean
     /**
      * 侦察兵常驻任务：探明相邻房间并写情报；没有目标时原地随机走，等新任务。
      * 一直返回 false，只有主房关掉外矿时才回主房释放任务。

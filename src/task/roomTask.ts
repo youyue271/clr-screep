@@ -208,11 +208,37 @@ export function getStorageEnergy(room: Room): MyTask[] {
     }]
 }
 
+/**
+ * 中央 link 的取能任务：外矿 link 转发过来的能量要及时搬走，
+ * 否则 link 满了外矿 carrier 就投不进去，只能多走路回主房。
+ */
+export function getCoreLinkEnergy(room: Room): MyTask[] {
+    const link = room.getCoreLink()
+    if (!link) {
+        return []
+    }
+    const energy = link.store.getUsedCapacity(RESOURCE_ENERGY)
+    if (energy <= 0) {
+        return []
+    }
+    const avgCarry = room.avgCarrierCapacity()
+    return [{
+        taskType: 'energyTask',
+        taskFunc: 'getEnergyFromStructure',
+        priority: 2,
+        taskParam: [link.id, RESOURCE_ENERGY],
+        // link 容量 800，按平均载重拆成 1~2 个并发就够了
+        capacity: Math.max(1, Math.min(2, Math.ceil(energy / avgCarry))),
+        targetId: link.id,
+    }]
+}
+
 export function getEnergyTask(room: Room): MyTask[] {
     const containTasks = getContainerEnergy(room)
+    const linkTasks = getCoreLinkEnergy(room)
     const opportunityTasks = getOpportunityEnergy(room)
     const storageTasks = getStorageEnergy(room)
-    return [...containTasks, ...opportunityTasks, ...storageTasks]
+    return [...containTasks, ...linkTasks, ...opportunityTasks, ...storageTasks]
 }
 
 // export function getEnergyWithStorage(room: Room): MyTask[] {
@@ -273,21 +299,24 @@ export function getRemoteHarvestTasks(sourceIds: Id<Source>[], targetRoom: strin
 }
 
 /**
- * 外矿运输任务：去外矿 container 取能，回到主房投递后才结束。
- * taskParam: [外矿 containerId, 外矿房名, 主房名, 主房投递目标]
+ * 外矿运输任务：跟着外矿 container 走，循环往返。
+ * taskParam: [外矿 containerId, 外矿房名, 主房名, 主房投递目标, 主房 linkId?]
+ * linkId 优先于 sinkId：主房有对应 link 时先丢 link，没有就回退普通投递。
  */
 export function getRemoteCarryTasks(
     containerId: Id<StructureContainer>,
     targetRoom: string,
     homeRoom: string,
-    sinkId: Id<any>
+    sinkId?: Id<any>,
+    linkId?: Id<StructureLink>
 ): MyTask[] {
     return [{
         taskType: 'remoteCarryTask',
         taskFunc: 'remoteCarry',
-        taskParam: [containerId, targetRoom, homeRoom, sinkId],
+        taskParam: [containerId, targetRoom, homeRoom, sinkId, linkId],
         priority: 3,
         capacity: remoteSetting.carryCapacity,
+        persistent: true,
         targetId: containerId,
     }]
 }

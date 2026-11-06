@@ -83,18 +83,43 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
     }
     if (controller?.my) {
         // 已经是我们自己的房间，不再算外矿
+        Game.rooms[homeRoomName]?.removeRemoteCarryTasksOfRoom(room.name)
         delete plan.rooms[room.name]
         return
     }
     if (intel.unsafe) {
+        if (state.enabled !== false) {
+            // 停用是明确决定：立刻清掉回运任务，不等 10 tick 扫描
+            Game.rooms[homeRoomName]?.removeRemoteCarryTasksOfRoom(room.name)
+        }
         state.enabled = false
         return
     }
+    const wasEnabled = state.enabled === true
     state.enabled = true
     const sourceStates = state.sources ?? (state.sources = {})
     for (const source of sources) {
         if (!sourceStates[source.id]) {
             sourceStates[source.id] = {}
+        }
+    }
+    // 外矿房开启事件：有视野时直接看 source 旁是否已经有 container，
+    // 有就挂回运任务；没有就交给外矿 harvester 第一次看到 container 时再挂。
+    if (!wasEnabled) {
+        const homeRoom = Game.rooms[homeRoomName]
+        if (homeRoom) {
+            for (const source of sources) {
+                const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
+                    filter: (object: any) => object.structureType === STRUCTURE_CONTAINER
+                })[0] as StructureContainer | undefined
+                if (!container) {
+                    continue
+                }
+                const entry = sourceStates[source.id]
+                entry.containerId = container.id
+                entry.containerPos = [container.pos.x, container.pos.y]
+                homeRoom.registerRemoteCarryTask(room.name, source.id, container.id)
+            }
         }
     }
 }

@@ -61,6 +61,10 @@ export default class RoomExtension extends Room {
         this.initCreepRecycle()
         // 房间初始化（含新 claim 的房和推代码重建）时自动配好相邻外矿计划
         this.syncRemotePlan()
+        // 推代码后房间任务桶是空的，按顶层 remotePlan 里已知的 container 一次性重建回运任务
+        this.rearmRemoteCarryTasks()
+        // 回运任务重建后再补 link 规划：新任务能直接挂上已建好的外矿 link
+        this.syncLinkPlan()
 
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
@@ -75,6 +79,8 @@ export default class RoomExtension extends Room {
         this.containerPos()
         // 布局完成后计算 spawn 到各矿点的距离，供 harvester 提前换班使用
         this.cacheHarvestSpawnDistances()
+        // link 规划要在登记建造任务之前：新工地当 tick 就能进 constructTask
+        this.syncLinkPlan()
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES)
         this.registTask(createBuildTask(constructionSites))
     }
@@ -495,13 +501,21 @@ export default class RoomExtension extends Room {
                     delete this.memory.creepTask[taskType]
                 }
             }
+            if (plan) {
+                plan.carryActive = 0
+                for (const roomName in plan.rooms) {
+                    const state = plan.rooms[roomName]
+                    if (state) {
+                        delete state.carryTaskIds
+                    }
+                }
+            }
             return
         }
         // 侦察兵/claimer 的常驻任务先挂上：新孵化/空闲的它们靠任务领活
         this.syncScoutTask()
         this.syncClaimTask()
         const harvestDesired: MyTask[] = []
-        const carryDesired: MyTask[] = []
         for (const roomName in plan.rooms) {
             const state = plan.rooms[roomName]
             if (!state) {
@@ -522,30 +536,11 @@ export default class RoomExtension extends Room {
                 continue
             }
             harvestDesired.push(...getRemoteHarvestTasks(sourceIds, roomName, this.name))
-            // 只有看得见外矿 container 里有能量时才登记运输任务，避免 carrier 白跑
-            if (!remoteRoom || !state.sources) {
-                continue
-            }
-            const sinkId = this.remoteEnergySink()
-            if (!sinkId) {
-                continue
-            }
-            for (const sourceId in state.sources) {
-                const entry = state.sources[sourceId]
-                if (!entry || !entry.containerId) {
-                    continue
-                }
-                const container = Game.getObjectById<StructureContainer>(entry.containerId)
-                if (!container || container.store.getUsedCapacity(RESOURCE_ENERGY) <= 0) {
-                    continue
-                }
-                carryDesired.push(...getRemoteCarryTasks(entry.containerId, roomName, this.name, sinkId))
-            }
         }
         // 停用/已移出计划的房：无视视野强制清任务，避免旧任务继续吸人
         this.purgeRemoteTasksOf(plan)
         this.syncRemoteBucket('remoteHarvestTask', harvestDesired)
-        this.syncRemoteBucket('remoteCarryTask', carryDesired)
+        // remoteCarryTask 是 container 事件驱动的循环任务，这里不再扫描/补缺
         this.seedRemoteHarvestReservations()
         this.refreshScoutSpawn()
         this.refreshClaimSpawn(plan)
@@ -756,8 +751,713 @@ export default class RoomExtension extends Room {
         if (!plan || plan.enabled === false) {
             return
         }
+        // remoteCarrier 不再专门孵化：本地 carrier 没活时按回运任务存在与否自动转换，
+        // 所以这里只需要补 remoteHarvester。
         this.refreshRemoteHarvesterSpawn(plan)
-        this.refreshRemoteCarrierSpawn(plan)
+    }
+
+    /**
+     * 登记外矿 container 的循环回运任务（幂等）。
+     * 事件来源：外矿 harvester 第一次看到 container / container 换 id / 推代码重建。
+     * 只读写顶层 memory 和主房任务桶，不扫描世界。
+     */
+    registerRemoteCarryTask(remoteRoom: string, sourceId: string, containerId: string, linkId?: Id<StructureLink>): void {
+        // 推代码后房间还没 init：先不建，globalReset 的 rearm 会统一补
+        if (!this.memory.creepTask) {
+            return
+        }
+        const plan = Memory.remotePlan?.[this.name]
+        const state = plan?.rooms?.[remoteRoom]
+        if (!plan || !state) {
+            return
+        }
+        if (!state.carryTaskIds) {
+            state.carryTaskIds = {}
+        }
+        if (state.carryTaskIds[containerId]) {
+            // 任务已经在：只补 link，不重复登记
+            if (linkId) {
+                this.updateRemoteCarryLink(containerId, linkId)
+            }
+            return
+        }
+        const sinkId = this.remoteEnergySink()
+        const effectiveLink = linkId ?? this.remoteLinkOfRoom(remoteRoom)
+        const created = this.registTask(getRemoteCarryTasks(
+            containerId as Id<StructureContainer>, remoteRoom, this.name, sinkId, effectiveLink
+        ))
+        const task = created[0]
+        if (!task) {
+            return
+        }
+        state.carryTaskIds[containerId] = task.id
+        plan.carryActive = (plan.carryActive ?? 0) + 1
+    }
+
+    /**
+     * container 消失/停用：删任务并清 index。
+     */
+    removeRemoteCarryTask(containerId: string): void {
+        this.dropRemoteCarryIndex(containerId)
+        // 目标被确认没了：顺手清掉顶层缓存里的 containerId，
+        // 否则下次推代码 rearm 又会拿旧 id 重建任务。
+        const plan = Memory.remotePlan?.[this.name]
+        for (const roomName in plan?.rooms ?? {}) {
+            const sources = plan.rooms[roomName]?.sources
+            for (const sourceId in sources ?? {}) {
+                if (sources[sourceId]?.containerId === containerId) {
+                    delete sources[sourceId].containerId
+                }
+            }
+        }
+        const buckets = this.memory.creepTask?.remoteCarryTask
+        if (!buckets) {
+            return
+        }
+        for (const key in buckets) {
+            const queue = buckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            const next = queue.filter(task => (task.targetId ?? task.taskParam?.[0]) !== containerId)
+            if (next.length) {
+                buckets[key] = next
+            } else {
+                delete buckets[key]
+            }
+        }
+    }
+
+    /**
+     * 停用/移出计划的房：把它所有回运任务一次清掉。
+     */
+    removeRemoteCarryTasksOfRoom(remoteRoom: string): void {
+        const ids = Memory.remotePlan?.[this.name]?.rooms?.[remoteRoom]?.carryTaskIds
+        if (!ids) {
+            return
+        }
+        for (const containerId in ids) {
+            this.removeRemoteCarryTask(containerId)
+        }
+    }
+
+    /**
+     * 推代码后房间任务桶是空的，但顶层 remotePlan 里的 containerId 还在。
+     * 按这些已知 container 一次性重建任务（不是周期扫描）。
+     */
+    rearmRemoteCarryTasks(): void {
+        if (!this.memory.creepTask) {
+            return
+        }
+        const plan = Memory.remotePlan?.[this.name]
+        if (!plan?.rooms) {
+            return
+        }
+        plan.carryActive = 0
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state) {
+                continue
+            }
+            // 旧任务 id 已经随 Memory.rooms 一起被清了
+            delete state.carryTaskIds
+            if (state.enabled === false) {
+                continue
+            }
+            for (const sourceId in state.sources ?? {}) {
+                const containerId = state.sources[sourceId]?.containerId
+                if (!containerId) {
+                    continue
+                }
+                this.registerRemoteCarryTask(roomName, sourceId, containerId)
+            }
+        }
+    }
+
+    /**
+     * 是否有可领的外矿回运任务。O(1) 读计数器，不给 carrier 额外做遍历。
+     */
+    hasRemoteCarryTask(): boolean {
+        return (Memory.remotePlan?.[this.name]?.carryActive ?? 0) > 0
+    }
+
+    /**
+     * link 建成/发现后，把 linkId 补进对应 container 的任务参数。
+     */
+    updateRemoteCarryLink(containerId: string, linkId: Id<StructureLink>): void {
+        const plan = Memory.remotePlan?.[this.name]
+        let taskId: string | undefined
+        for (const roomName in plan?.rooms ?? {}) {
+            const state = plan.rooms[roomName]
+            if (state?.carryTaskIds?.[containerId]) {
+                taskId = state.carryTaskIds[containerId]
+                break
+            }
+        }
+        if (!taskId) {
+            return
+        }
+        const buckets = this.memory.creepTask?.remoteCarryTask
+        if (!buckets) {
+            return
+        }
+        for (const key in buckets) {
+            for (const task of buckets[key] ?? []) {
+                if (task.id === taskId) {
+                    task.taskParam[4] = linkId
+                    return
+                }
+            }
+        }
+    }
+
+    /**
+     * link 建成事件：坐标对上规划位就把 linkId 记下来并补进外矿任务。
+     */
+    onLinkBuilt(link: StructureLink): void {
+        const pos: [number, number] = [link.pos.x, link.pos.y]
+        const linkId = link.id as Id<StructureLink>
+        const linkPlan = this.memory.linkPlan
+        if (linkPlan?.corePos && this.samePos(linkPlan.corePos, pos)) {
+            linkPlan.coreId = linkId
+        }
+        if (linkPlan?.sources) {
+            for (const sourceId in linkPlan.sources) {
+                const entry = linkPlan.sources[sourceId]
+                if (entry?.pos && this.samePos(entry.pos, pos)) {
+                    entry.id = linkId
+                }
+            }
+        }
+        if (linkPlan?.remotes) {
+            for (const roomName in linkPlan.remotes) {
+                const entry = linkPlan.remotes[roomName]
+                if (entry?.pos && this.samePos(entry.pos, pos)) {
+                    entry.id = linkId
+                }
+            }
+        }
+        // 外矿 link 的 id 要写进顶层 memory（推代码后还在），并把任务参数补上
+        const plan = Memory.remotePlan?.[this.name]
+        for (const roomName in plan?.rooms ?? {}) {
+            const state = plan.rooms[roomName]
+            const remotePos = state?.remoteLinkPos
+            if (!state || !remotePos) {
+                continue
+            }
+            if (!this.samePos(remotePos, pos)) {
+                continue
+            }
+            state.remoteLinkId = linkId
+            for (const containerId in state.carryTaskIds ?? {}) {
+                this.updateRemoteCarryLink(containerId, linkId)
+            }
+        }
+    }
+
+    /**
+     * link 规划/补工地：
+     * - 中央 link：布局里的 L 格（plan1 / plan2_Core）
+     * - 矿点 link：贴着矿点 container，但不贴矿点（优先）
+     * - 外矿 link：主房里靠近通往该外矿的出口，取离出口 3~6 格
+     * 建造优先级：中央 > 外矿（离中央越远越先）> 矿点；
+     * 数量只补到当前 RCL 上限，已建/已有工地的规划位只回填 id。
+     */
+    syncLinkPlan(): void {
+        if (!this.memory.creepTask || !this.controller || !this.controller.my) {
+            return
+        }
+        const corePos = this.layoutLinkPos()
+        if (!corePos) {
+            return
+        }
+        const plan = this.memory.linkPlan ?? (this.memory.linkPlan = {})
+        plan.corePos = corePos
+        const assigned: [number, number][] = [corePos]
+
+        // 矿点 link：container 位置来自 containerPos() 的缓存（全局重置后会重算）
+        const sources = plan.sources ?? (plan.sources = {})
+        for (const sourceId of this.sources()) {
+            const cached = sources[sourceId]?.pos
+            if (cached) {
+                assigned.push(cached)
+                continue
+            }
+            const pos = this.sourceLinkPos(sourceId, assigned)
+            if (pos) {
+                sources[sourceId] = { pos }
+                assigned.push(pos)
+            }
+        }
+
+        // 外矿 link：位置持久化在顶层 remotePlan 里，推代码后不用重新寻路
+        const remotes = plan.remotes ?? (plan.remotes = {})
+        const remotePlan = Memory.remotePlan?.[this.name]
+        for (const roomName in remotePlan?.rooms ?? {}) {
+            const state = remotePlan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            // 还没探明/还没 container 的房先不给 link，别占掉有限的 link 名额
+            if (!this.remoteRoomHasContainer(state)) {
+                continue
+            }
+            let pos = state.remoteLinkPos
+            if (!pos) {
+                pos = this.computeRemoteLinkPos(roomName, assigned)
+                if (pos) {
+                    state.remoteLinkPos = pos
+                }
+            }
+            if (!pos) {
+                continue
+            }
+            remotes[roomName] = { pos }
+            assigned.push(pos)
+        }
+
+        // 回填/清理 id：结构被拆后旧 id 不能留着
+        plan.coreId = this.linkIdAt(corePos)
+        if (plan.coreId === undefined) {
+            delete plan.coreId
+        }
+        for (const sourceId in sources) {
+            const id = this.linkIdAt(sources[sourceId].pos)
+            if (id) {
+                sources[sourceId].id = id
+            } else {
+                delete sources[sourceId].id
+            }
+        }
+        for (const roomName in remotes) {
+            const entry = remotes[roomName]
+            const id = this.linkIdAt(entry.pos)
+            if (id) {
+                entry.id = id
+            } else {
+                delete entry.id
+            }
+            const state = Memory.remotePlan?.[this.name]?.rooms?.[roomName]
+            if (state) {
+                if (id) {
+                    state.remoteLinkId = id
+                } else {
+                    delete state.remoteLinkId
+                }
+            }
+        }
+
+        // 外矿/矿点 link 有能量就转发中央 link。
+        // 不能只在 creep 投递成功当 tick 转发：transfer 是 intent，回合末才结算，
+        // 当 tick 读到的 link.energy 还是 0。放这里按 10 tick 扫描兜底。
+        this.forwardRemoteLinks(plan)
+
+        // 按优先级补工地，数量受 RCL 的 link 上限约束
+        const level = this.controller.level
+        const limit = (CONTROLLER_STRUCTURES[STRUCTURE_LINK] as any)[level] ?? 0
+        const built = this.find(FIND_MY_STRUCTURES, {
+            filter: (structure: Structure) => structure.structureType === STRUCTURE_LINK
+        }).length
+        const sites = this.find(FIND_CONSTRUCTION_SITES, {
+            filter: (site: ConstructionSite) => site.structureType === STRUCTURE_LINK
+        }).length
+        let slots = limit - built - sites
+        plan.order = this.linkBuildOrder(corePos)
+        if (slots <= 0) {
+            return
+        }
+        for (const key of plan.order) {
+            if (slots <= 0) {
+                break
+            }
+            const pos = this.linkPlanPosOfKey(key, plan)
+            if (!pos) {
+                continue
+            }
+            if (this.linkIdAt(pos)) {
+                continue
+            }
+            if (this.siteAt(pos)) {
+                continue
+            }
+            if (!this.linkTileFree(pos)) {
+                continue
+            }
+            if (this.createConstructionSite(pos[0], pos[1], STRUCTURE_LINK) !== OK) {
+                continue
+            }
+            slots--
+            // 当 tick 就把新工地登记进建造队列，不用等下一次 initBuildList
+            const site = this.getPositionAt(pos[0], pos[1])?.lookFor(LOOK_CONSTRUCTION_SITES)[0]
+            if (site && !this.hasBuildTaskFor(site.id)) {
+                this.registTask(createBuildTask([site]))
+            }
+        }
+    }
+
+    /**
+     * 布局里中央 link（大写 L）的坐标，公式和 constructPlan1 / buildLayout 保持一致。
+     */
+    private layoutLinkPos(): [number, number] | undefined {
+        const planType = this.memory.roomPlanType
+        const anchor = planType === 2 ? this.memory.plan2Pos?.core : this.memory.plan1Pos
+        if (!anchor) {
+            return undefined
+        }
+        const map = planType === 2 ? plan2_Core : plan1
+        // plan1: anchor + x - 11；plan2: anchor + x - 7 + 1
+        const offset = planType === 2 ? 1 : 0
+        for (let y = 0; y < map.length; y++) {
+            const row = map[y].split(' ')
+            for (let x = 0; x < row.length; x++) {
+                if (row[x][0] !== 'L') {
+                    continue
+                }
+                return [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset]
+            }
+        }
+        return undefined
+    }
+
+    /**
+     * 矿点 link 位置：贴着矿点 container，但不贴矿点（用户指定的优先规则）。
+     * 没有非贴矿点的空格时才退回到贴矿点的 container 邻格。
+     */
+    private sourceLinkPos(sourceId: string, assigned: [number, number][]): [number, number] | undefined {
+        const container = this.memory.containerPosById?.[sourceId]
+        if (!container) {
+            return undefined
+        }
+        const source = Game.getObjectById<Source>(sourceId as Id<Source>)
+        if (!source) {
+            return undefined
+        }
+        const corePos = this.memory.linkPlan?.corePos
+        const core = corePos ? this.getPositionAt(corePos[0], corePos[1]) : undefined
+        const preferred: RoomPosition[] = []
+        const fallback: RoomPosition[] = []
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (!dx && !dy) {
+                    continue
+                }
+                const x = container[0] + dx
+                const y = container[1] + dy
+                if (assigned.some(item => item[0] === x && item[1] === y)) {
+                    continue
+                }
+                if (!this.linkTileFree([x, y])) {
+                    continue
+                }
+                const pos = this.getPositionAt(x, y)
+                if (!pos) {
+                    continue
+                }
+                // 贴矿点：harvester 站位/采集路径会被 link 占掉，只能兜底
+                if (pos.inRangeTo(source, 1)) {
+                    fallback.push(pos)
+                } else {
+                    preferred.push(pos)
+                }
+            }
+        }
+        const pick = (list: RoomPosition[]): [number, number] | undefined => {
+            if (!list.length) {
+                return undefined
+            }
+            if (!core) {
+                return [list[0].x, list[0].y]
+            }
+            const best = core.findClosestByRange(list)
+            return best ? [best.x, best.y] : undefined
+        }
+        return pick(preferred) ?? pick(fallback)
+    }
+
+    /**
+     * 外矿 link 位置：主房里靠近通往该外矿的出口，沿中央 link -> 出口的路径
+     * 取离出口 3~6 格的第一块空地（太贴边容易被过路 creep 堵，太远省不了路）。
+     */
+    private computeRemoteLinkPos(remoteRoom: string, assigned: [number, number][]): [number, number] | undefined {
+        const exits = Game.map.describeExits(this.name)
+        if (!exits) {
+            return undefined
+        }
+        let dirKey: string | undefined
+        for (const key in exits) {
+            if (exits[key] === remoteRoom) {
+                dirKey = key
+                break
+            }
+        }
+        if (!dirKey) {
+            return undefined
+        }
+        const exitFind: { [dir: string]: FindConstant } = {
+            '1': FIND_EXIT_TOP, '3': FIND_EXIT_RIGHT, '5': FIND_EXIT_BOTTOM, '7': FIND_EXIT_LEFT,
+        }
+        if (exitFind[dirKey] === undefined) {
+            return undefined
+        }
+        const exitTiles = this.find(exitFind[dirKey]) as RoomPosition[]
+        if (!exitTiles.length) {
+            return undefined
+        }
+        const corePos = this.memory.linkPlan?.corePos
+        const core = corePos ? this.getPositionAt(corePos[0], corePos[1]) : undefined
+        if (!core) {
+            return undefined
+        }
+        const exitTile = core.findClosestByPath(exitTiles, {ignoreCreeps: true})
+            ?? core.findClosestByRange(exitTiles)
+        if (!exitTile) {
+            return undefined
+        }
+        const borderDistance = (x: number, y: number): number => {
+            if (dirKey === '3') return 49 - x
+            if (dirKey === '7') return x
+            if (dirKey === '5') return 49 - y
+            return y
+        }
+        const isVertical = dirKey === '1' || dirKey === '5'
+        const path = this.findPath(core, exitTile, {ignoreCreeps: true, ignoreDestructibleStructures: true})
+        // 从出口往回扫：路径上第一块落在 3~6 格带内、没建筑/工地的格子
+        for (let i = path.length - 1; i >= 0; i--) {
+            const step = path[i]
+            const distance = borderDistance(step.x, step.y)
+            if (distance < 3 || distance > 6) {
+                continue
+            }
+            if (assigned.some(item => item[0] === step.x && item[1] === step.y)) {
+                continue
+            }
+            if (!this.linkTileFree([step.x, step.y])) {
+                continue
+            }
+            return [step.x, step.y]
+        }
+        // 路径被建筑占满时，在出口附近小块区域兜底
+        for (const depth of [3, 4, 5, 6]) {
+            for (const along of [0, -1, 1, -2, 2, -3, 3, -4, 4]) {
+                const x = isVertical ? exitTile.x + along : (dirKey === '3' ? 49 - depth : depth)
+                const y = isVertical ? (dirKey === '5' ? 49 - depth : depth) : exitTile.y + along
+                if (x < 0 || x > 49 || y < 0 || y > 49) {
+                    continue
+                }
+                if (assigned.some(item => item[0] === x && item[1] === y)) {
+                    continue
+                }
+                if (!this.linkTileFree([x, y])) {
+                    continue
+                }
+                return [x, y]
+            }
+        }
+        return undefined
+    }
+
+    /**
+     * 外矿房是否已经有可回运的 container（或回运任务）。
+     * 只看过顶层缓存，不扫描世界。
+     */
+    private remoteRoomHasContainer(state: RemoteRoomState): boolean {
+        for (const containerId in state.carryTaskIds ?? {}) {
+            if (containerId) {
+                return true
+            }
+        }
+        for (const sourceId in state.sources ?? {}) {
+            const entry = state.sources[sourceId]
+            if (entry?.containerId || entry?.containerPos) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 建造顺序：中央 > 外矿（离中央越远越先）> 矿点（同样远的先建）。
+     */
+    private linkBuildOrder(corePos: [number, number]): string[] {
+        const plan = this.memory.linkPlan
+        if (!plan) {
+            return []
+        }
+        const remotePlan = Memory.remotePlan?.[this.name]
+        const rangeOf = (pos: [number, number]) =>
+            Math.max(Math.abs(corePos[0] - pos[0]), Math.abs(corePos[1] - pos[1]))
+        const remotes = Object.keys(plan.remotes ?? {})
+            .filter(roomName => remotePlan?.rooms?.[roomName]
+                && remotePlan.rooms[roomName].enabled !== false
+                && this.remoteRoomHasContainer(remotePlan.rooms[roomName])
+                && plan.remotes?.[roomName]?.pos)
+            .sort((a, b) => rangeOf(plan.remotes![b].pos) - rangeOf(plan.remotes![a].pos))
+        const sources = Object.keys(plan.sources ?? {})
+            .filter(sourceId => plan.sources?.[sourceId]?.pos)
+            .sort((a, b) => rangeOf(plan.sources![b].pos) - rangeOf(plan.sources![a].pos))
+        return [
+            'core',
+            ...remotes.map(roomName => `remote:${roomName}`),
+            ...sources.map(sourceId => `source:${sourceId}`),
+        ]
+    }
+
+    /**
+     * 把外矿/矿点 link 里攒下的能量转发给中央 link。
+     * 每个 link 有 20 tick 发送冷却，这里按扫描频率尝试即可；
+     * 中央 link 满了就先不转，等 carrier 取走后再转。
+     */
+    private forwardRemoteLinks(plan: LinkPlan): void {
+        if (!plan.coreId) {
+            return
+        }
+        const core = Game.getObjectById<StructureLink>(plan.coreId)
+        if (!core) {
+            return
+        }
+        if (core.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
+            return
+        }
+        const linkIds: Id<StructureLink>[] = []
+        for (const roomName in plan.remotes ?? {}) {
+            const id = plan.remotes[roomName].id
+            if (id) {
+                linkIds.push(id)
+            }
+        }
+        for (const sourceId in plan.sources ?? {}) {
+            const id = plan.sources[sourceId].id
+            if (id) {
+                linkIds.push(id)
+            }
+        }
+        for (const linkId of linkIds) {
+            if (core.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
+                return
+            }
+            const link = Game.getObjectById<StructureLink>(linkId)
+            if (!link || link.cooldown > 0 || !link.store.getUsedCapacity(RESOURCE_ENERGY)) {
+                continue
+            }
+            link.transferEnergy(core)
+        }
+    }
+
+    private linkPlanPosOfKey(key: string, plan: LinkPlan): [number, number] | undefined {
+        if (key === 'core') {
+            return plan.corePos
+        }
+        if (key.startsWith('remote:')) {
+            return plan.remotes?.[key.slice(7)]?.pos
+        }
+        if (key.startsWith('source:')) {
+            return plan.sources?.[key.slice(7)]?.pos
+        }
+        return undefined
+    }
+
+    private samePos(a: [number, number], b: [number, number]): boolean {
+        return a[0] === b[0] && a[1] === b[1]
+    }
+
+    /**
+     * 指定格子上的 link；没有就返回 undefined。
+     */
+    private linkIdAt(pos: [number, number]): Id<StructureLink> | undefined {
+        const structures = this.getPositionAt(pos[0], pos[1])?.lookFor(LOOK_STRUCTURES) ?? []
+        for (const structure of structures) {
+            if (structure.structureType === STRUCTURE_LINK) {
+                return structure.id as Id<StructureLink>
+            }
+        }
+        return undefined
+    }
+
+    private siteAt(pos: [number, number]): ConstructionSite | undefined {
+        return this.getPositionAt(pos[0], pos[1])?.lookFor(LOOK_CONSTRUCTION_SITES)[0]
+    }
+
+    /**
+     * link 可以放：不是墙、没有建筑、没有工地。
+     */
+    private linkTileFree(pos: [number, number]): boolean {
+        const terrain = this.getTerrain()
+        if (terrain.get(pos[0], pos[1]) === TERRAIN_MASK_WALL) {
+            return false
+        }
+        const position = this.getPositionAt(pos[0], pos[1])
+        if (!position) {
+            return false
+        }
+        if (position.lookFor(LOOK_STRUCTURES).length) {
+            return false
+        }
+        if (position.lookFor(LOOK_CONSTRUCTION_SITES).length) {
+            return false
+        }
+        return true
+    }
+
+    private hasBuildTaskFor(siteId: string): boolean {
+        const buckets = this.memory.creepTask?.constructTask
+        for (const key in buckets ?? {}) {
+            for (const task of buckets[key] ?? []) {
+                if ((task.targetId ?? task.taskParam?.[0]) === siteId) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * 中央 link：link 规划/建好后才有。
+     */
+    getCoreLink(): StructureLink | undefined {
+        const id = this.memory.linkPlan?.coreId
+        if (!id) {
+            return undefined
+        }
+        return Game.getObjectById<StructureLink>(id) ?? undefined
+    }
+
+    /**
+     * 从顶层 memory 里查这个外矿房对应的 link（还在不在由引擎判定）。
+     */
+    private remoteLinkOfRoom(remoteRoom: string): Id<StructureLink> | undefined {
+        const linkId = Memory.remotePlan?.[this.name]?.rooms?.[remoteRoom]?.remoteLinkId
+        if (!linkId) {
+            return undefined
+        }
+        const link = Game.getObjectById<StructureLink>(linkId)
+        return link ? link.id as Id<StructureLink> : undefined
+    }
+
+    /**
+     * 从顶层 index 里删一个 container 的登记，并修正计数器。
+     */
+    private dropRemoteCarryIndex(containerId?: string, remoteRoom?: string): void {
+        if (!containerId) {
+            return
+        }
+        const plan = Memory.remotePlan?.[this.name]
+        if (!plan?.rooms) {
+            return
+        }
+        let removed = false
+        const roomNames = remoteRoom ? [remoteRoom] : Object.keys(plan.rooms)
+        for (const roomName of roomNames) {
+            const state = plan.rooms[roomName]
+            const ids = state?.carryTaskIds
+            if (ids && ids[containerId]) {
+                delete ids[containerId]
+                removed = true
+                break
+            }
+        }
+        if (removed) {
+            plan.carryActive = Math.max(0, (plan.carryActive ?? 0) - 1)
+        }
     }
 
     /**
@@ -882,57 +1582,6 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * 每个"已建好 container"的启用外矿房补一个专用 remoteCarrier。
-     * 专用角色只认 remoteCarryTask，不会被本地 carryTask 长期饿死。
-     */
-    private refreshRemoteCarrierSpawn(plan: RemotePlan): void {
-        let want = 0
-        for (const roomName in plan.rooms) {
-            const state = plan.rooms[roomName]
-            if (!state || state.enabled === false) {
-                continue
-            }
-            const sources = state.sources
-            if (!sources) {
-                continue
-            }
-            // container 建好才派运输，否则 carrier 去了也没东西可拉
-            const hasContainer = Object.keys(sources).some(sourceId => !!sources[sourceId]?.containerId)
-            if (hasContainer) {
-                want += remoteSetting.carriersPerRoom
-            }
-        }
-        if (!want) {
-            return
-        }
-        let alive = 0
-        for (const name in Game.creeps) {
-            const creep = Game.creeps[name]
-            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'remoteCarrier') {
-                alive += 1
-            }
-        }
-        let queued = 0
-        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
-        for (const key in spawnBuckets) {
-            for (const task of spawnBuckets[key] ?? []) {
-                if (task?.taskParam?.[0] === 'remoteCarrier') {
-                    queued += 1
-                }
-            }
-        }
-        if (alive + queued >= want) {
-            return
-        }
-        if (!plan.force && !this.remoteGate()) {
-            return
-        }
-        for (let i = alive + queued; i < want; i++) {
-            this.addToSpawnList('remoteCarrier')
-        }
-    }
-
-    /**
      * 富余能量门槛：主房没有待孵化任务、能量结构满、本地 container 超过高水位。
      * 三条同时满足才认为"有多余能量"，可以拿去养外矿。
      */
@@ -965,10 +1614,10 @@ export default class RoomExtension extends Room {
      * 给 carryTask 自带取能用：carrier 保持 priority 1 的补能任务，
      * 不需要降级成 emptyWorker 去和 worker 抢通用 energyTask。
      */
-    bestEnergyContainer(): StructureContainer | undefined {
+    bestEnergyContainer(): StructureLink | StructureContainer | undefined {
         const level = this.controller ? this.controller.level : 0
         const low = (containerWatermark[level] ?? containerWatermark[0]).low
-        let best: StructureContainer | undefined
+        let best: StructureLink | StructureContainer | undefined
         let bestEnergy = low
         for (const id of this.getContainer()) {
             const container = Game.getObjectById<StructureContainer>(id)
@@ -980,6 +1629,13 @@ export default class RoomExtension extends Room {
                 best = container
                 bestEnergy = energy
             }
+        }
+        // 中央 link 优先搬：外矿 link 转发过来的能量堆在这里，满了外矿 carrier
+        // 就只能绕路回主房投递。link 在基地核心，取一趟很短，有能量就顺路带走；
+        // 取空后下一 tick 自然回退到 container。
+        const core = this.getCoreLink()
+        if (core && core.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            return core
         }
         return best
     }
@@ -1139,10 +1795,18 @@ export default class RoomExtension extends Room {
                 if (!queue || !queue.length) {
                     continue
                 }
-                const next = queue.filter(task => {
+                const next: TaskEntity[] = []
+                for (const task of queue) {
                     const roomName = task?.taskParam?.[1] as string | undefined
-                    return !roomName || !!allowed[roomName]
-                })
+                    if (!roomName || !!allowed[roomName]) {
+                        next.push(task)
+                        continue
+                    }
+                    // 回运任务被清：同步删掉顶层 index，并修正计数器
+                    if (taskType === 'remoteCarryTask') {
+                        this.dropRemoteCarryIndex(task.taskParam?.[0], roomName)
+                    }
+                }
                 if (next.length) {
                     buckets[key] = next
                 } else {
@@ -1418,7 +2082,7 @@ export default class RoomExtension extends Room {
             // 外矿 harvester 不参与自动补员：配额故意为 0，让它 reSpawn=false，
             // 由 refreshRemoteSpawn 按"富余能量"门槛决定要不要孵化
             'remoteHarvester': 0,
-            // 外矿运输同理，由 refreshRemoteCarrierSpawn 按每个外矿房的 container 补员
+            // 外矿运输不特招：本地 carrier 没活时按回运任务自动转换，配额保持 0
             'remoteCarrier': 0,
             // 侦察兵不参与自动补员：refreshScoutSpawn 常驻维持 1 个
             'viewer': 0,
@@ -1847,6 +2511,10 @@ export default class RoomExtension extends Room {
             if (structure.structureType === STRUCTURE_CONTAINER) {
                 this.refreshContainers()
             }
+            // 新建 link：坐标对上规划位时把 linkId 补进对应外矿回运任务
+            if (structure.structureType === STRUCTURE_LINK) {
+                this.onLinkBuilt(structure as StructureLink)
+            }
         }
     }
 
@@ -1924,14 +2592,15 @@ export default class RoomExtension extends Room {
      * 注册任务, 支持同时注册多个
      * @param tasks
      */
-    registTask(tasks: MyTask[]) {
+    registTask(tasks: MyTask[]): TaskEntity[] {
+        const created: TaskEntity[] = []
         for (const task of tasks) {
             const bucketKey = String(task.priority ?? 2)
             const buckets = this.normalizeTaskBuckets(task.taskType)
             if (!buckets[bucketKey]) {
                 buckets[bucketKey] = []
             }
-            buckets[bucketKey].push({
+            const entity: TaskEntity = {
                 id: `${task.taskFunc}-${Game.time}-${Math.random().toString(36).slice(2)}`,
                 taskFunc: task.taskFunc,
                 taskParam: task.taskParam,
@@ -1940,9 +2609,12 @@ export default class RoomExtension extends Room {
                 persistent: task.persistent ?? false,
                 targetId: task.targetId,
                 reservedBy: []
-            })
+            }
+            buckets[bucketKey].push(entity)
             this.memory.creepTask[task.taskType] = buckets
+            created.push(entity)
         }
+        return created
         // console.log()
     }
 
