@@ -24,6 +24,8 @@ export const spawnTable: { [role in Role]: number[] } = {
     'viewer':       [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 外矿运输也不按这张表孵化：由 refreshRemoteSpawn 按"每房配额"补员
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
+    'claimer':      [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]

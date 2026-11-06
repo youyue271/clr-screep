@@ -12,6 +12,9 @@ interface CreepMemory {
     remoteReturn?: boolean
     // 侦察兵当前要探的房间；探完清空，等待新目标
     scoutTarget?: string
+    // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
+    // 每个目标房常驻一只，避免一只 claimer 在多房间之间来回跑
+    claimerTarget?: string
 }
 
 type Role = 'worker'
@@ -23,6 +26,8 @@ type Role = 'worker'
     | 'remoteCarrier'
     // 侦察兵：只有 MOVE 部件，负责探明相邻外矿房并写情报
     | 'viewer'
+    // 占领/保留控制器：CLAIM + MOVE，reserve 由它自动续，claim 只执行显式 claimPlan
+    | 'claimer'
 
 interface Creep {
 

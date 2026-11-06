@@ -140,13 +140,21 @@ const getWorkerBody = function (room: Room) {
 }
 
 
+// 控制器等级 -> claimer 的 CLAIM 部件数。
+// 保留每 tick 只加 CLAIM 部件数（净增 = 部件数 - 1），部件越多缓冲涨得越快；
+// 占领本身只需要 1 个 CLAIM，所以低 RCL 先用 1 个把活干起来。
+const claimerPartsByLevel = [0, 1, 1, 1, 1, 2, 2, 3, 4]
+
 const getClaimerBody = function (room: Room) {
-    let body: any[]
-    let num = Math.floor((room.energyCapacityAvailable * spawnPercent) / 750);
-    if (num > 12) num = 12
+    const level = room.controller?.level ?? 0
+    let num = claimerPartsByLevel[level] ?? 1
     if (num <= 0) num = 1
-    body = calcBodyPart({[CLAIM]: num, [MOVE]: num * 3})
-    return body
+    // 当前容量买不起时逐级下调，避免孵不出来把队列堵死
+    while (num > 1 && CalBodyCost(calcBodyPart({[CLAIM]: num, [MOVE]: num})) > room.energyCapacityAvailable) {
+        num -= 1
+    }
+    // MOVE 与 CLAIM 等量：每格疲劳 = CLAIM 数，每 tick 恢复 2×MOVE，移速稳定 1 tile/tick
+    return calcBodyPart({[CLAIM]: num, [MOVE]: num})
 }
 
 const getAttackerBody = function (room: Room) {
@@ -195,8 +203,14 @@ export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: nu
         case 'viewer':
             return budget >= 100 ? calcBodyPart({[MOVE]: 2}) : undefined
         case 'claimer': {
-            const num = Math.floor(budget / 750)
-            return num > 0 ? calcBodyPart({[CLAIM]: num, [MOVE]: num * 3}) : undefined
+            const level = room.controller?.level ?? 0
+            let num = claimerPartsByLevel[level] ?? 1
+            if (num <= 0) num = 1
+            while (num > 1 && CalBodyCost(calcBodyPart({[CLAIM]: num, [MOVE]: num})) > budget) {
+                num -= 1
+            }
+            const body = calcBodyPart({[CLAIM]: num, [MOVE]: num})
+            return CalBodyCost(body) <= budget ? body : undefined
         }
         case 'attacker': {
             const num = Math.floor(budget / 200)

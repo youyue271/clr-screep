@@ -68,6 +68,13 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
     intel.unsafe = !!intel.hostile
         || !!(controller?.owner && !controller.my)
         || !!(controller?.reservation && controller.reservation.username !== me)
+    // 有视野时用真实保留剩余校正：不是我们的保留就清掉，
+    // 避免别人抢走后 claimer 还按旧时间不去续
+    if (controller?.reservation && controller.reservation.username === me) {
+        intel.reservedUntil = Game.time + controller.reservation.ticksToEnd
+    } else {
+        delete intel.reservedUntil
+    }
 
     const plan = Memory.remotePlan?.[homeRoomName]
     const state = plan?.rooms?.[room.name]

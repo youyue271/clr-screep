@@ -33,7 +33,18 @@ interface MapIntel {
     unsafe?: boolean
     // 从主房走不到（侦察兵导航失败）：地形静态，不再派侦察
     unreachable?: boolean
+    // 我们对该房控制器的保留到期 tick（由 claimer 成功 reserve 后写入）
+    reservedUntil?: number
     sources?: Id<Source>[]
+}
+
+/**
+ * 显式 claim 目标。写在顶层 Memory.claimPlan[房间名]，
+ * 由外部脚本增删；claimer 占领成功或判定不可达后删除该项。
+ */
+interface ClaimTargetState {
+    // GCL 不足等暂时失败时，暂停尝试到该 tick
+    retryAt?: number
 }
 
 interface Memory {
@@ -41,6 +52,8 @@ interface Memory {
     remotePlan?: { [homeRoom: string]: RemotePlan }
     // 房间名 -> 情报
     mapIntel?: { [roomName: string]: MapIntel }
+    // 显式 claim 目标：房间名 -> 状态。外部脚本写入/删除，抗推代码
+    claimPlan?: { [roomName: string]: ClaimTargetState }
 }
 
 interface RoomMemory {
@@ -69,6 +82,10 @@ interface RoomMemory {
     // 布局时计算的 spawn -> 矿点路径长度（tile 数），用于 harvester 提前换班
     harvestSpawnDistance?: { [sourceId: string]: number }
     harvestSpawnPos?: [number, number]
+    // 最近一次 claimer 孵化成功的时间（目标房 -> tick）。
+    // 孵化成功的那一 tick 任务已出队、creep 要下一 tick 才进 Game.creeps，
+    // 用这个标记补上窗口，避免 refreshClaimSpawn 重复排队。
+    claimerSpawnTick?: { [roomName: string]: number }
 }
 
 interface Room {

@@ -45,7 +45,8 @@ export default class RoomExtension extends Room {
             'spawnTask': {},
             'remoteHarvestTask': {},
             'remoteCarryTask': {},
-            'scoutTask': {}
+            'scoutTask': {},
+            'claimTask': {}
         }
 
         this.initResource()
@@ -491,8 +492,9 @@ export default class RoomExtension extends Room {
             }
             return
         }
-        // 侦察兵的常驻任务先挂上：新孵化/空闲的侦察兵靠它领活
+        // 侦察兵/claimer 的常驻任务先挂上：新孵化/空闲的它们靠任务领活
         this.syncScoutTask()
+        this.syncClaimTask()
         const harvestDesired: MyTask[] = []
         const carryDesired: MyTask[] = []
         for (const roomName in plan.rooms) {
@@ -539,6 +541,7 @@ export default class RoomExtension extends Room {
         this.syncRemoteBucket('remoteCarryTask', carryDesired)
         this.seedRemoteHarvestReservations()
         this.refreshScoutSpawn()
+        this.refreshClaimSpawn(plan)
     }
 
     /**
@@ -629,6 +632,101 @@ export default class RoomExtension extends Room {
             }
         }
         this.addToSpawnList('viewer')
+    }
+
+    /**
+     * 常驻 claim/reserve 任务：每个主房一条，priority 4。
+     * 每个目标房在 spawn 时绑定一只 claimer（memory.claimerTarget），
+     * 所以 capacity 要能同时容纳多个 claimer；具体去哪个房由 claimer 自己按绑定执行。
+     */
+    private syncClaimTask(): void {
+        const buckets = this.normalizeTaskBuckets('claimTask')
+        for (const key in buckets) {
+            delete buckets[key]
+        }
+        buckets['4'] = [{
+            id: `claim-${this.name}`,
+            taskFunc: 'claim',
+            taskParam: [this.name],
+            priority: 4,
+            // 每个外矿保留房 + 显式 claim 目标各一只，给足并发
+            capacity: 16,
+            persistent: true,
+            targetId: this.name,
+            reservedBy: [],
+        }]
+    }
+
+    /**
+     * 按目标房维持 claimer（每个目标一只常驻）：
+     * - Memory.claimPlan 有目标：立刻要，不受富余能量门槛限制（用户显式指定）
+     * - 已启用、安全的外矿房：各常驻一只负责续保留，按富余能量门槛孵化
+     * 每只 claimer 孵化时绑定目标房（taskParam[4]），避免一只在多房之间来回跑。
+     */
+    private refreshClaimSpawn(plan: RemotePlan): void {
+        if (plan.enabled === false) {
+            return
+        }
+        // 显式 claim 目标优先：一次只补一个，避免多个目标同时占满 spawn
+        if (Memory.claimPlan) {
+            for (const roomName in Memory.claimPlan) {
+                const entry = Memory.claimPlan[roomName]
+                if (!entry || (entry.retryAt !== undefined && entry.retryAt > Game.time)) {
+                    continue
+                }
+                if (!this.hasClaimerFor(roomName)) {
+                    this.addToSpawnList('claimer', undefined, roomName)
+                }
+                return
+            }
+        }
+        // 外矿保留：房间还在计划里且安全，就一直保持一只驻守 claimer
+        if (!plan.force && !this.remoteGate()) {
+            return
+        }
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            const intel = Memory.mapIntel?.[roomName]
+            if (intel?.unsafe || intel?.unreachable) {
+                continue
+            }
+            if (!this.hasClaimerFor(roomName)) {
+                this.addToSpawnList('claimer', undefined, roomName)
+            }
+        }
+    }
+
+    /**
+     * 目标房是否已经有一只"还能撑一阵"的 claimer（存活或已排队孵化）。
+     * TTL <= 200 不算覆盖：提前排一只接班的，避免控制器出现无人续约的空窗。
+     */
+    private hasClaimerFor(roomName: string): boolean {
+        // 刚孵化成功、creep 还没进 Game.creeps 的窗口
+        const spawnedAt = this.memory.claimerSpawnTick?.[roomName]
+        if (spawnedAt !== undefined && Game.time - spawnedAt <= 20) {
+            return true
+        }
+        for (const creepName in Game.creeps) {
+            const creep = Game.creeps[creepName]
+            if (creep.memory.spawnRoom !== this.name || creep.memory.role !== 'claimer') {
+                continue
+            }
+            if (creep.memory.claimerTarget === roomName && (creep.ticksToLive ?? 0) > 200) {
+                return true
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === 'claimer' && task?.taskParam?.[4] === roomName) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /**
@@ -1171,6 +1269,8 @@ export default class RoomExtension extends Room {
             'remoteCarrier': 0,
             // 侦察兵不参与自动补员：refreshScoutSpawn 常驻维持 1 个
             'viewer': 0,
+            // claimer 同理：refreshClaimSpawn 按 reserve 到期/claimPlan 按需补
+            'claimer': 0,
         }
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName]
@@ -1187,6 +1287,8 @@ export default class RoomExtension extends Room {
                 const outsideHome = creep.room.name !== this.name
                 const savedWork = outsideHome ? creep.memory.currentWork : undefined
                 const savedWorkType = outsideHome ? creep.memory.currentWorkType : undefined
+                // claimer 绑定的目标房也要保住，否则每次推代码都会解绑回主房重孵
+                const savedClaimerTarget = creep.memory.claimerTarget
                 delete Memory.creeps[creepName]
                 creep.remember()
                 creep.memory.spawnRoom = this.name
@@ -1194,6 +1296,9 @@ export default class RoomExtension extends Room {
                     creep.memory.currentWork = savedWork
                     creep.memory.currentWorkType = savedWorkType
                     creep.memory.working = true
+                }
+                if (savedClaimerTarget) {
+                    creep.memory.claimerTarget = savedClaimerTarget
                 }
                 // 推代码会清空所有事件；外矿 creep 不在主房，initCreepRecycle 扫不到，
                 // 这里补一个回收事件，保证死亡后能清内存/按 reSpawn 补员
@@ -1234,7 +1339,7 @@ export default class RoomExtension extends Room {
         }
     }
 
-    addToSpawnList(role: Role, sourceId?: Id<Source>) {
+    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string) {
         if (!this.memory.creepTask) {
             return
         }
@@ -1245,12 +1350,15 @@ export default class RoomExtension extends Room {
         const task: TaskEntity = {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
-            // 第三、四个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
-            // reSpawn 标记。外矿/侦察角色的补员统一由扫描逻辑决定，死亡后不走
+            // 第三、四、五个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
+            // reSpawn 标记、目标房（claimer 绑定要驻守/占领的房）。
+            // 外矿/侦察角色的补员统一由扫描逻辑决定，死亡后不走
             // creepRecycle 无条件重孵：否则两者会在死亡同一 tick 各补一只（竞态超编），
             // 停用房也会继续补人
             taskParam: [role, getBody(role, this), sourceId,
-                role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'],
+                role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
+                && role !== 'claimer',
+                targetRoom],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
@@ -1263,6 +1371,7 @@ export default class RoomExtension extends Room {
                 : role == 'viewer' ? 2
                 : role == 'remoteHarvester' ? 3
                 : role == 'remoteCarrier' ? 3
+                : role == 'claimer' ? 3
                 : 2,
             capacity: 1,
             persistent: false, 

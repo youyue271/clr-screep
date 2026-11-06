@@ -17,6 +17,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'remoteCarrier': ['remoteCarryTask'],
     // 侦察兵只有一个常驻任务，自己从外矿计划里挑要探的房间
     'viewer': ['scoutTask'],
+    // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
+    'claimer': ['claimTask'],
 }
 
 export default class CreepExtension extends Creep {
@@ -42,9 +44,9 @@ export default class CreepExtension extends Creep {
             }
             if (!this.memory.working) {
                 if (!this.getWork()) {
-                    // 外矿 carrier 的空闲处理自己会发移动意图（回家/原地待命），
+                    // 外矿 carrier / claimer 的空闲处理自己会发移动意图（回家/原地待命），
                     // 这里再随机走会覆盖 moveToRoom，导致永远回不了主房
-                    if (this.memory.role !== 'remoteCarrier') {
+                    if (this.memory.role !== 'remoteCarrier' && this.memory.role !== 'claimer') {
                         this.say('🤓 没活辣,随便走走')
                         const directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT]
                         const randIndex = Math.floor(Math.random() * directions.length)
@@ -72,6 +74,11 @@ export default class CreepExtension extends Creep {
             // 先回家再把身上能量交接掉（被别的 carrier 踢出任务时会走到这里）
             if (this.memory.role === 'remoteCarrier') {
                 return this.remoteCarrierIdle()
+            }
+            // claimer 的任务登记在主房队列，在外矿/目标房里领不到任务，先回主房
+            if (this.memory.role === 'claimer' && this.room.name !== this.memory.spawnRoom) {
+                this.moveToRoom(this.memory.spawnRoom)
+                return false
             }
             return false
         }
@@ -176,6 +183,7 @@ export default class CreepExtension extends Creep {
             && this.memory.role !== 'harvester'
             && this.memory.role !== 'remoteHarvester'
             && this.memory.role !== 'viewer'
+            && this.memory.role !== 'claimer'
             && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
             this.changeRole('emptyWorker')
         }
@@ -846,6 +854,162 @@ export default class CreepExtension extends Creep {
         if (state) {
             state.enabled = false
         }
+    }
+
+    /**
+     * claimer 常驻任务：每只 claimer 孵化时绑定一个目标房（memory.claimerTarget）。
+     * - 目标在 Memory.claimPlan 里：执行显式占领，成功后解绑
+     * - 否则当作外矿保留房：一直站在控制器旁每 tick 续约
+     * 保留是按 tick 累积的（每次意图 +CLAIM 部件数，上限 5000），
+     * 单 CLAIM 只能维持现有剩余，所以必须常驻，不能收一次就换房。
+     */
+    claim(homeRoom: string): boolean {
+        const target = this.memory.claimerTarget
+        if (!target) {
+            // 没有绑定目标（旧代码孵化/外部删掉了目标）：回主房等补员逻辑重新分配
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+            }
+            return false
+        }
+        const claimEntry = Memory.claimPlan?.[target]
+        if (claimEntry) {
+            if (claimEntry.retryAt !== undefined && claimEntry.retryAt > Game.time) {
+                // GCL 不足等暂时失败：保留绑定，回主房待命，到点再试
+                if (this.room.name !== homeRoom) {
+                    this.moveToRoom(homeRoom)
+                }
+                return false
+            }
+            return this.tryClaimRoom(homeRoom, target, claimEntry)
+        }
+        if (this.isReserveTargetValid(homeRoom, target)) {
+            return this.tryReserveController(homeRoom, target)
+        }
+        // 房间已不可用（被占/被停用/有敌对）：解绑回主房
+        delete this.memory.claimerTarget
+        if (this.room.name !== homeRoom) {
+            this.moveToRoom(homeRoom)
+        }
+        return false
+    }
+
+    /**
+     * 目标房是否还值得驻守：外矿计划里启用、且情报没有标记不安全/走不到。
+     * 注意推代码后的第一 tick 顶层 Memory 可能还读不到，缺失时按"继续驻守"处理，
+     * 否则所有 claimer 会在一次推送里集体解绑回家。
+     */
+    private isReserveTargetValid(homeRoom: string, roomName: string): boolean {
+        const plan = Memory.remotePlan?.[homeRoom]
+        if (!plan) {
+            return true
+        }
+        if (plan.enabled === false) {
+            return false
+        }
+        const state = plan.rooms?.[roomName]
+        if (state && state.enabled === false) {
+            return false
+        }
+        if (!state) {
+            // 已经不在计划里：通常是我们把它占了；没视野时先保持绑定
+            return !Game.rooms[roomName]?.controller?.my
+        }
+        const intel = Memory.mapIntel?.[roomName]
+        return !(intel?.unsafe || intel?.unreachable)
+    }
+
+    private tryClaimRoom(homeRoom: string, roomName: string, entry: ClaimTargetState): boolean {
+        if (this.room.name !== roomName) {
+            // claim 目标约定与主房相邻：先回主房，再从主房过去
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+                return false
+            }
+            if (!this.moveToRoom(roomName)) {
+                // 走不到：外部脚本可能写错房名，删掉避免每 tick 重试
+                delete Memory.claimPlan?.[roomName]
+                delete this.memory.claimerTarget
+                return false
+            }
+            return false
+        }
+        const controller = this.room.controller
+        if (!controller) {
+            delete Memory.claimPlan?.[roomName]
+            delete this.memory.claimerTarget
+            return false
+        }
+        const res = this.claimController(controller)
+        if (res === OK) {
+            this.say('🚩 占领')
+            delete Memory.claimPlan?.[roomName]
+            // 占领后它就不再是外矿房：立刻从计划里移除，
+            // 避免补员逻辑又孵化一只 claimer 跑过来驻守
+            delete Memory.remotePlan?.[homeRoom]?.rooms?.[roomName]
+            delete this.memory.claimerTarget
+            return false
+        }
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(controller)
+            return false
+        }
+        if (res === ERR_GCL_NOT_ENOUGH) {
+            // GCL 暂时不够：保留目标，过一阵再试，避免每 tick 冲一遍
+            this.say('GCL 不够')
+            entry.retryAt = Game.time + 1000
+            return false
+        }
+        // 有主、被保留满等：刷新情报后放弃，外部脚本可以重新写入
+        recordRoomIntel(homeRoom, this.room)
+        delete Memory.claimPlan?.[roomName]
+        delete this.memory.claimerTarget
+        return false
+    }
+
+    /**
+     * 常驻保留一个控制器：每 tick 都在控制器旁调用 reserveController，
+     * 让 endTime 持续累积，不做"收一次就换房"（那样保留只能撑 1-2 tick）。
+     */
+    private tryReserveController(homeRoom: string, roomName: string): boolean {
+        if (this.room.name !== roomName) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+                return false
+            }
+            this.moveToRoom(roomName)
+            return false
+        }
+        const controller = this.room.controller
+        if (!controller) {
+            return false
+        }
+        if (controller.owner) {
+            // 已经有主：刷新情报（会写 unsafe/停用），下一 tick 由 isReserveTargetValid 解绑
+            recordRoomIntel(homeRoom, this.room)
+            return false
+        }
+        const res = this.reserveController(controller)
+        if (res === OK) {
+            this.say('🛡️ 保留')
+            const me = this.owner?.username
+            const intel = Memory.mapIntel?.[roomName] ?? (Memory.mapIntel[roomName] = {})
+            const parts = this.getActiveBodyparts(CLAIM)
+            // 读到的 ticksToEnd 是本 tick 衰减后的值，意图在回合末才结算：
+            // 结算后 endTime 再 +parts，即到期 tick = 当前 tick + 剩余 + 本次部件数
+            const before = controller.reservation && controller.reservation.username === me
+                ? controller.reservation.ticksToEnd
+                : 0
+            intel.reservedUntil = Game.time + Math.min(CONTROLLER_RESERVE_MAX, before + parts)
+            return false
+        }
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(controller)
+            return false
+        }
+        // 被别人保留满/无权限：用实时状态刷情报，避免反复尝试
+        recordRoomIntel(homeRoom, this.room)
+        return false
     }
 
     /**

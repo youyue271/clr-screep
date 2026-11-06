@@ -118,12 +118,22 @@ export default class SpawnExtension extends Spawn {
                             // 由 refreshRemoteCarrierSpawn 按门槛补员，不走 creepRecycle 无条件重孵
                             reSpawn: task?.taskParam?.[3] !== false,
                             // 提前换班的 harvester 会带上矿点 id
-                            harvestSourceId: task?.taskParam?.[2] as Id<Source> | undefined
+                            harvestSourceId: task?.taskParam?.[2] as Id<Source> | undefined,
+                            // claimer 孵化时绑定目标房，之后只负责这一个房
+                            claimerTarget: task?.taskParam?.[4] as string | undefined
                         },
                         energyStructures: picked.structures
                     })
                     if (res == OK) {
                         /* 孵化成功 */
+                        // claimer 出生有 1 tick 延迟：本 tick 任务已出队、creep 还没进
+                        // Game.creeps，记下目标房，让补员扫描别在这个窗口重复排队
+                        const claimerTarget = task?.taskParam?.[4] as string | undefined
+                        if (claimerTarget) {
+                            const spawnTicks = this.room.memory.claimerSpawnTick
+                                ?? (this.room.memory.claimerSpawnTick = {})
+                            spawnTicks[claimerTarget] = Game.time
+                        }
                         spawnQueue.shift()
                         if (activeKey && spawnQueue.length === 0) {
                             delete spawnBuckets[activeKey]
