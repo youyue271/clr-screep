@@ -798,28 +798,36 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 从计划里挑一个还没有情报的房：没 sources、没被标记 unsafe、也没探过。
+     * 常驻侦察兵轮巡：挑情报最老（scoutedAt 最小）的计划房，停用房也一起复查。
+     * 自动重开靠它兜底：到站后 scout() 会调 recordRoomIntel，安全就恢复 enabled。
+     * 没有 scoutedAt 的房视为 0，优先探。
      */
     private pickScoutTarget(homeRoom: string): string | undefined {
         const plan = Memory.remotePlan?.[homeRoom]
         if (!plan?.rooms) {
             return undefined
         }
-        for (const roomName in plan.rooms) {
-            const state = plan.rooms[roomName]
-            if (!state || state.enabled === false) {
-                continue
-            }
-            if (state.sources && Object.keys(state.sources).length) {
+        // 只从真实相邻房（describeExits）里挑：findExitTo 对非相邻房的行为不可靠，
+        // 盲选会让侦察兵在错误的出口之间来回撞。地形静态，走不通的房直接永久跳过。
+        const exits = Game.map.describeExits(homeRoom) ?? {}
+        let best: string | undefined
+        let bestAt = Infinity
+        for (const dir in exits) {
+            const roomName = exits[dir]
+            if (!roomName || !plan.rooms[roomName]) {
                 continue
             }
             const intel = Memory.mapIntel?.[roomName]
-            if (intel?.unsafe || intel?.scoutedAt) {
+            if (intel?.unreachable) {
                 continue
             }
-            return roomName
+            const at = intel?.scoutedAt ?? 0
+            if (at < bestAt) {
+                bestAt = at
+                best = roomName
+            }
         }
-        return undefined
+        return best
     }
 
     /**
@@ -832,6 +840,8 @@ export default class CreepExtension extends Creep {
         const intel = Memory.mapIntel[roomName] ?? (Memory.mapIntel[roomName] = {})
         intel.scoutedAt = Game.time
         intel.unsafe = true
+        // 从主房走不到（地形/封闭边界），地形不变就不用再试
+        intel.unreachable = true
         const state = Memory.remotePlan?.[homeRoom]?.rooms?.[roomName]
         if (state) {
             state.enabled = false

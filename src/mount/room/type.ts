@@ -31,6 +31,8 @@ interface MapIntel {
     hostile?: boolean
     // 有主 / 被他人 reserve / 有敌对：不再自动选作外矿房
     unsafe?: boolean
+    // 从主房走不到（侦察兵导航失败）：地形静态，不再派侦察
+    unreachable?: boolean
     sources?: Id<Source>[]
 }
 

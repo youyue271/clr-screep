@@ -14,7 +14,9 @@ export const spawnTable: { [role in Role]: number[] } = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester':    [0, 0, 0, 0, 0, 0, 0, 0, 0], // harvester 根据房间source数量动态调整
     'carrier':      [0, 1, 2, 5, 5, 5, 5, 5, 5],
-    'worker':       [0, 3, 6, 9, 9, 7, 7, 7, 3],
+    // RCL3-7 稳态 6 个足够：无工地时升级并发上限 5，有工地时自动压到 2，
+    // 多出来的 worker 会转成 emptyWorker 和 carrier 抢能量，反而拖 econ
+    'worker':       [0, 3, 6, 6, 6, 6, 6, 6, 3],
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
     // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],

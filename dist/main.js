@@ -3260,7 +3260,9 @@ const spawnTable = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     'carrier': [0, 1, 2, 5, 5, 5, 5, 5, 5],
-    'worker': [0, 3, 6, 9, 9, 7, 7, 7, 3],
+    // RCL3-7 稳态 6 个足够：无工地时升级并发上限 5，有工地时自动压到 2，
+    // 多出来的 worker 会转成 emptyWorker 和 carrier 抢能量，反而拖 econ
+    'worker': [0, 3, 6, 6, 6, 6, 6, 6, 3],
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -4663,29 +4665,37 @@ class CreepExtension extends Creep {
         return false;
     }
     /**
-     * 从计划里挑一个还没有情报的房：没 sources、没被标记 unsafe、也没探过。
+     * 常驻侦察兵轮巡：挑情报最老（scoutedAt 最小）的计划房，停用房也一起复查。
+     * 自动重开靠它兜底：到站后 scout() 会调 recordRoomIntel，安全就恢复 enabled。
+     * 没有 scoutedAt 的房视为 0，优先探。
      */
     pickScoutTarget(homeRoom) {
-        var _a, _b;
+        var _a, _b, _c, _d;
         const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom];
         if (!(plan === null || plan === void 0 ? void 0 : plan.rooms)) {
             return undefined;
         }
-        for (const roomName in plan.rooms) {
-            const state = plan.rooms[roomName];
-            if (!state || state.enabled === false) {
+        // 只从真实相邻房（describeExits）里挑：findExitTo 对非相邻房的行为不可靠，
+        // 盲选会让侦察兵在错误的出口之间来回撞。地形静态，走不通的房直接永久跳过。
+        const exits = (_b = Game.map.describeExits(homeRoom)) !== null && _b !== void 0 ? _b : {};
+        let best;
+        let bestAt = Infinity;
+        for (const dir in exits) {
+            const roomName = exits[dir];
+            if (!roomName || !plan.rooms[roomName]) {
                 continue;
             }
-            if (state.sources && Object.keys(state.sources).length) {
+            const intel = (_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[roomName];
+            if (intel === null || intel === void 0 ? void 0 : intel.unreachable) {
                 continue;
             }
-            const intel = (_b = Memory.mapIntel) === null || _b === void 0 ? void 0 : _b[roomName];
-            if ((intel === null || intel === void 0 ? void 0 : intel.unsafe) || (intel === null || intel === void 0 ? void 0 : intel.scoutedAt)) {
-                continue;
+            const at = (_d = intel === null || intel === void 0 ? void 0 : intel.scoutedAt) !== null && _d !== void 0 ? _d : 0;
+            if (at < bestAt) {
+                bestAt = at;
+                best = roomName;
             }
-            return roomName;
         }
-        return undefined;
+        return best;
     }
     /**
      * 侦察兵从主房都走不到的房间：记成 unsafe，之后不再自动选它。
@@ -4698,6 +4708,8 @@ class CreepExtension extends Creep {
         const intel = (_a = Memory.mapIntel[roomName]) !== null && _a !== void 0 ? _a : (Memory.mapIntel[roomName] = {});
         intel.scoutedAt = Game.time;
         intel.unsafe = true;
+        // 从主房走不到（地形/封闭边界），地形不变就不用再试
+        intel.unreachable = true;
         const state = (_d = (_c = (_b = Memory.remotePlan) === null || _b === void 0 ? void 0 : _b[homeRoom]) === null || _c === void 0 ? void 0 : _c.rooms) === null || _d === void 0 ? void 0 : _d[roomName];
         if (state) {
             state.enabled = false;
@@ -5727,12 +5739,17 @@ class RoomExtension extends Room {
         const carryDesired = [];
         for (const roomName in plan.rooms) {
             const state = plan.rooms[roomName];
-            if (!state || state.enabled === false) {
+            if (!state) {
                 continue;
             }
+            // 停用房也要在有视野时复盘：recordRoomIntel 判安全会自动重开，
+            // 敌人在场则保持停用。不需要额外的定时扫描，侦察兵轮巡即可覆盖无视野的房。
             const remoteRoom = Game.rooms[roomName];
             if (remoteRoom) {
                 this.updateRemoteCache(state, remoteRoom);
+            }
+            if (state.enabled === false) {
+                continue;
             }
             const sourceIds = Object.keys((_b = state.sources) !== null && _b !== void 0 ? _b : {});
             if (!sourceIds.length) {
@@ -5828,31 +5845,14 @@ class RoomExtension extends Room {
             }];
     }
     /**
-     * 有房间缺情报且没有存活/排队的侦察兵时，补一个 priority 4 的 viewer。
+     * 常驻一个侦察兵：持续轮巡相邻房，给外矿自动重开和战争情报提供视野。
+     * 只要外矿计划开着就一直保持 1 个（存活或排队都算）。priority 2 与 worker 同档：
+     * 侦察兵只有 100 能量、6 tick 就孵完，排在 4 会被 harvester/外矿任务长期压住。
      */
     refreshScoutSpawn() {
-        var _a, _b, _c, _d;
+        var _a, _b, _c;
         const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[this.name];
         if (!plan || plan.enabled === false) {
-            return;
-        }
-        let needScout = false;
-        for (const roomName in plan.rooms) {
-            const state = plan.rooms[roomName];
-            if (!state || state.enabled === false) {
-                continue;
-            }
-            if (state.sources && Object.keys(state.sources).length) {
-                continue;
-            }
-            const intel = (_b = Memory.mapIntel) === null || _b === void 0 ? void 0 : _b[roomName];
-            if ((intel === null || intel === void 0 ? void 0 : intel.unsafe) || (intel === null || intel === void 0 ? void 0 : intel.scoutedAt)) {
-                continue;
-            }
-            needScout = true;
-            break;
-        }
-        if (!needScout) {
             return;
         }
         for (const creepName in Game.creeps) {
@@ -5863,8 +5863,8 @@ class RoomExtension extends Room {
         }
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
-            for (const task of (_c = spawnBuckets[key]) !== null && _c !== void 0 ? _c : []) {
-                if (((_d = task === null || task === void 0 ? void 0 : task.taskParam) === null || _d === void 0 ? void 0 : _d[0]) === 'viewer') {
+            for (const task of (_b = spawnBuckets[key]) !== null && _b !== void 0 ? _b : []) {
+                if (((_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[0]) === 'viewer') {
                     return;
                 }
             }
@@ -6408,7 +6408,7 @@ class RoomExtension extends Room {
             'remoteHarvester': 0,
             // 外矿运输同理，由 refreshRemoteCarrierSpawn 按每个外矿房的 container 补员
             'remoteCarrier': 0,
-            // 侦察兵同样不参与自动补员，由 refreshScoutSpawn 按需补
+            // 侦察兵不参与自动补员：refreshScoutSpawn 常驻维持 1 个
             'viewer': 0,
         };
         for (const creepName in Game.creeps) {
@@ -6483,8 +6483,11 @@ class RoomExtension extends Room {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
             // 第三、四个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
-            // reSpawn 标记（false 表示死亡后由外矿逻辑补员，creepRecycle 不无条件重孵）
-            taskParam: [role, getBody(role, this), sourceId, role !== 'remoteCarrier'],
+            // reSpawn 标记。外矿/侦察角色的补员统一由扫描逻辑决定，死亡后不走
+            // creepRecycle 无条件重孵：否则两者会在死亡同一 tick 各补一只（竞态超编），
+            // 停用房也会继续补人
+            taskParam: [role, getBody(role, this), sourceId,
+                role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
@@ -6494,7 +6497,7 @@ class RoomExtension extends Room {
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
-                    : role == 'viewer' ? 4
+                    : role == 'viewer' ? 2
                         : role == 'remoteHarvester' ? 3
                             : role == 'remoteCarrier' ? 3
                                 : 2,
