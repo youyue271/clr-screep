@@ -145,7 +145,7 @@ const getWorkerBody = function (room: Room) {
 // 占领本身只需要 1 个 CLAIM，所以低 RCL 先用 1 个把活干起来。
 const claimerPartsByLevel = [0, 1, 1, 1, 1, 2, 2, 3, 4]
 
-const getClaimerBody = function (room: Room) {
+export const getClaimerBody = function (room: Room) {
     const level = room.controller?.level ?? 0
     let num = claimerPartsByLevel[level] ?? 1
     if (num <= 0) num = 1

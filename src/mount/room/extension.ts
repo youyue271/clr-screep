@@ -1,4 +1,4 @@
-import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util/utils";
+import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {containerWatermark, harvestSetting, remoteSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
@@ -670,6 +670,13 @@ export default class RoomExtension extends Room {
      */
     private refreshClaimSpawn(plan: RemotePlan): void {
         if (plan.enabled === false) {
+            return
+        }
+        // claimer 最小体型是 CLAIM+MOVE（650）。容量买不起时排进队列也孵不出来，
+        // 会永远卡在 spawn 队首，把后面同优先级的 remoteHarvester 全部堵死
+        // （官服 RCL2 容量 550 就踩过这个坑）。getClaimerBody 已按容量降级过体型，
+        // 降级到最小仍超容量，说明这个房间现在物理上养不起 claimer，直接不排。
+        if (CalBodyCost(getClaimerBody(this)) > this.energyCapacityAvailable) {
             return
         }
         // 显式 claim 目标优先：一次只补一个，避免多个目标同时占满 spawn
