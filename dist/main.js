@@ -5473,6 +5473,10 @@ class RoomExtension extends Room {
         else {
             if (!this.controller.my) {
                 this.memory.roomType = 2;
+                // 房间已经不是我们的：清掉旧墙标记，将来重新占领时会重新清理
+                if (Memory.legacyWallCleared) {
+                    delete Memory.legacyWallCleared[this.name];
+                }
             }
             else {
                 this.memory.roomType = 0;
@@ -5514,6 +5518,7 @@ class RoomExtension extends Room {
         if (this.memory.creepTask) {
             this.memory.creepTask['constructTask'] = {};
         }
+        this.clearLegacyWalls();
         this.construct(this.controller.level);
         // 确保矿点 container 工地存在：已有 container 会被直接复用，不会另起新点
         this.containerPos();
@@ -7438,6 +7443,46 @@ class RoomExtension extends Room {
             }
         }
         global.room[this.name].terrainMap = mapBuffer;
+    }
+    /**
+     * 清掉前主人留下的 constructedWall。
+     * 引擎把所有 constructedWall 都当无主结构（API 里没有 owner/my），
+     * 无法按归属区分，所以只在每个房间第一次初始化时清一次，
+     * 之后建的墙不会再动。清墙标记放顶层 Memory，能扛住 globalInit 的 delete Memory.rooms。
+     * 有敌对 creep 时 destroy 返回 ERR_BUSY，标记不落，下一轮 initBuildList 自动重试。
+     */
+    clearLegacyWalls() {
+        var _a;
+        if ((_a = Memory.legacyWallCleared) === null || _a === void 0 ? void 0 : _a[this.name]) {
+            return;
+        }
+        if (!this.controller || !this.controller.my) {
+            return;
+        }
+        // ticksToLive 只出现在自动生成的新手区边界墙上，这种墙不能拆
+        const walls = this.find(FIND_STRUCTURES, {
+            filter: (s) => s.structureType === STRUCTURE_WALL && !s.ticksToLive,
+        });
+        let failed = 0;
+        if (walls.length) {
+            let cleared = 0;
+            for (const wall of walls) {
+                if (wall.destroy() === OK) {
+                    cleared++;
+                }
+                else {
+                    failed++;
+                }
+            }
+            loggerInstance.info(`[${this.name}] legacy walls: destroyed ${cleared}, failed ${failed}`);
+            if (failed) {
+                return;
+            }
+        }
+        if (!Memory.legacyWallCleared) {
+            Memory.legacyWallCleared = {};
+        }
+        Memory.legacyWallCleared[this.name] = true;
     }
     calDistance(x, y) {
         if (!global.room[this.name] || !global.room[this.name].terrainMap) {

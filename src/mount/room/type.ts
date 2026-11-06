@@ -54,6 +54,9 @@ interface Memory {
     mapIntel?: { [roomName: string]: MapIntel }
     // 显式 claim 目标：房间名 -> 状态。外部脚本写入/删除，抗推代码
     claimPlan?: { [roomName: string]: ClaimTargetState }
+    // 已经清过一次旧墙的房间。放顶层：globalInit 会 delete Memory.rooms，
+    // 放房间 memory 里会导致每次推代码都重新清一遍，把后来建的墙也拆掉。
+    legacyWallCleared?: { [roomName: string]: boolean }
 }
 
 interface RoomMemory {
