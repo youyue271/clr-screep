@@ -90,14 +90,6 @@ export function upgrade(room: Room): MyTask[] {
     }]
 }
 
-export function construct(ConstructionSiteId: any): MyTask[] {
-    return [{
-        taskType: 'constructTask',
-        taskFunc: 'construct',
-        taskParam: [ConstructionSiteId]
-    }]
-}
-
 export function getContainerEnergy(room: Room): MyTask[] {
     const containerIds = room.getContainer()
     if (!containerIds || !containerIds.length) {

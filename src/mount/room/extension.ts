@@ -2,7 +2,7 @@ import {calcSpawnTicks, calcTicksPerTile, getBody, initializeArray} from "@/util
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {containerWatermark, harvestSetting, remoteSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
-import {construct, createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
+import {createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {planRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
 
@@ -2016,13 +2016,10 @@ export default class RoomExtension extends Room {
             if (finalPos.lookFor(LOOK_STRUCTURES).length || finalPos.lookFor(LOOK_CONSTRUCTION_SITES).length) {
                 return
             }
-            const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
-            if (createResult == OK) {
-                const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0]
-                if (site) {
-                    this.registTask(construct(site.id))
-                }
-            }
+            // 工地任务统一由 initBuildList 的 createBuildTask 按真实工地列表登记，
+            // 这里不再单独注册：以前这里会注册 taskFunc 'construct' 的任务，
+            // 而 Creep 上没有 construct 方法，worker 领到就会每 tick 抛错卡死。
+            this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER)
         })
         this.memory.containerPosById = byId
         this.memory.containerPos = containerPos

@@ -3464,13 +3464,6 @@ function upgrade(room) {
             targetId: room.controller.id
         }];
 }
-function construct(ConstructionSiteId) {
-    return [{
-            taskType: 'constructTask',
-            taskFunc: 'construct',
-            taskParam: [ConstructionSiteId]
-        }];
-}
 function getContainerEnergy(room) {
     var _a, _b;
     const containerIds = room.getContainer();
@@ -7449,13 +7442,10 @@ class RoomExtension extends Room {
             if (finalPos.lookFor(LOOK_STRUCTURES).length || finalPos.lookFor(LOOK_CONSTRUCTION_SITES).length) {
                 return;
             }
-            const createResult = this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER);
-            if (createResult == OK) {
-                const site = finalPos.lookFor(LOOK_CONSTRUCTION_SITES)[0];
-                if (site) {
-                    this.registTask(construct(site.id));
-                }
-            }
+            // 工地任务统一由 initBuildList 的 createBuildTask 按真实工地列表登记，
+            // 这里不再单独注册：以前这里会注册 taskFunc 'construct' 的任务，
+            // 而 Creep 上没有 construct 方法，worker 领到就会每 tick 抛错卡死。
+            this.createConstructionSite(finalPos.x, finalPos.y, STRUCTURE_CONTAINER);
         });
         this.memory.containerPosById = byId;
         this.memory.containerPos = containerPos;
