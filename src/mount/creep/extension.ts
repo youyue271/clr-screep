@@ -35,6 +35,15 @@ export default class CreepExtension extends Creep {
             // console.log(this.ticksToLive)
             return
         }
+        // 外矿房被停用（敌对/被别人占用/已移出计划）后任务会被主房清掉，
+        // 但 creep 手里还留着 currentWork 副本。收到召回标记先回主房，
+        // 到家后原地待命到死：外矿体型不适合本地活，也不能再占外矿名额。
+        if (this.memory.role === 'remoteHarvester' && this.memory.recall) {
+            if (this.room.name !== this.memory.spawnRoom) {
+                this.moveToRoom(this.memory.spawnRoom)
+            }
+            return
+        }
         // harvester 只在本房采集：一旦跑出主房，先回矿点。
         // 否则会领不到任务而随机走，或者被裸坐标的 harvestSource 钉在隔壁房同坐标格上。
         if (this.memory.role === 'harvester' && this.memory.spawnRoom
@@ -113,8 +122,10 @@ export default class CreepExtension extends Creep {
         }
         const TaskList = roleToTask[this.memory.role]
         const now = Game.time
-        // 提前换班孵化出来的 harvester 只认领孵化时指定的矿点
-        const assignedSource = this.memory.role === 'harvester' ? this.memory.harvestSourceId : undefined
+        // 提前换班孵化出来的 harvester / 外矿 harvester 只认领孵化时指定的矿点
+        const assignedSource = (this.memory.role === 'harvester' || this.memory.role === 'remoteHarvester')
+            ? this.memory.harvestSourceId
+            : undefined
         for (const taskType of TaskList) {
             const buckets = room.normalizeTaskBuckets(taskType)
             if (!buckets) {
@@ -139,6 +150,16 @@ export default class CreepExtension extends Creep {
                         queue = [...queue].sort((a, b) =>
                             (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0))
                     }
+                } else if (taskType === 'remoteHarvestTask') {
+                    // 和主矿 harvest 一致：先认孵化时绑定的矿点，再优先没人预约的矿点。
+                    // 不排序的话空闲的外矿 harvester 会按计划房插入顺序抢第一条任务，
+                    // 两个挤同一个矿，另一个矿长期没人。
+                    queue = [...queue].sort((a, b) => {
+                        const aMatched = assignedSource && a?.taskParam?.[0] === assignedSource ? 0 : 1
+                        const bMatched = assignedSource && b?.taskParam?.[0] === assignedSource ? 0 : 1
+                        return aMatched - bMatched
+                            || (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0)
+                    })
                 } else if (taskType === 'energyTask') {
                     // 多个 container / 掉落物时优先去没人预约的，避免所有缺能量的 creep 挤在一个矿点
                     queue = [...queue].sort((a, b) =>
@@ -155,8 +176,9 @@ export default class CreepExtension extends Creep {
                     if (!task.reservedBy) {
                         task.reservedBy = []
                     }
-                    // 清理已经死掉的 creep 留下的预约，否则 persistent 任务会被永久占满
-                    task.reservedBy = task.reservedBy.filter(item => item && Game.creeps[item.name])
+                    // 清理已经死掉/被召回的 creep 留下的预约，否则 persistent 任务会被永久占满
+                    task.reservedBy = task.reservedBy.filter(item =>
+                        item && Game.creeps[item.name] && !Game.creeps[item.name].memory.recall)
                     const existing = task.reservedBy.find(item => item.name === this.name)
                     if (existing) {
                         existing.lastTick = now
@@ -202,6 +224,42 @@ export default class CreepExtension extends Creep {
             this.changeRole('emptyWorker')
         }
         return false
+    }
+
+    /**
+     * 清掉本方 creep 在主房队列里的预约并交还任务。
+     * 外矿 creep 在外矿房执行任务，releaseCurrentWork 用的是当前房间的队列，
+     * 而外矿房没有任务桶，清不到主房的任务预约。
+     */
+    releaseRemoteWork(homeRoom: string): void {
+        const task = this.memory.currentWork
+        const taskType = this.memory.currentWorkType
+        if (task && taskType) {
+            const buckets = Memory.rooms?.[homeRoom]?.creepTask?.[taskType]
+            if (buckets) {
+                const taskId = task.id
+                const taskTargetId = task.targetId ?? task.taskParam?.[0]
+                for (const key in buckets) {
+                    const queue = buckets[key]
+                    if (!queue || !queue.length) {
+                        continue
+                    }
+                    for (const item of queue) {
+                        if (!item || !item.reservedBy) {
+                            continue
+                        }
+                        if (item.id === taskId
+                            || (taskTargetId && (item.targetId === taskTargetId
+                                || item.taskParam?.[0] === taskTargetId))) {
+                            item.reservedBy = item.reservedBy.filter(entry => entry.name !== this.name)
+                        }
+                    }
+                }
+            }
+        }
+        this.memory.working = false
+        this.memory.currentWork = undefined
+        this.memory.currentWorkType = undefined
     }
 
     changeRole(role: Role): boolean {
@@ -639,6 +697,23 @@ export default class CreepExtension extends Creep {
      * taskParam: [sourceId | null, 外矿房名, 主房名]
      */
     remoteHarvest(sourceId: Id<Source> | null, targetRoom: string, homeRoom: string): boolean {
+        // 外矿房被停用/移出计划：主房会把任务清掉，但 creep 手里还留着 currentWork 副本，
+        // 不在这里校验就会一直挖到被敌人打死。交还任务并打召回标记，回主房待命到死。
+        const planState = Memory.remotePlan?.[homeRoom]?.rooms?.[targetRoom]
+        if (!planState || planState.enabled === false) {
+            this.memory.recall = true
+            delete this.memory.harvestSourceId
+            // 任务预约登记在主房队列，而这个 creep 人在外矿房，
+            // releaseCurrentWork 只清当前房间的队列，清不到主房。不手动清的话，
+            // 停用/重开后这条任务会被召回的 creep 一直占满，接班的 creep 领不到。
+            this.releaseRemoteWork(homeRoom)
+            return true
+        }
+        // 任务里带矿点就是绑定：每 tick 都写回 memory，
+        // 换班补员和预约恢复（seedRemoteHarvestReservations）都靠这个字段认人
+        if (sourceId) {
+            this.memory.harvestSourceId = sourceId
+        }
         if (this.room.name !== targetRoom) {
             this.moveToRoom(targetRoom)
             return false

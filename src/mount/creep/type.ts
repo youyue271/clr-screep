@@ -8,6 +8,9 @@ interface CreepMemory {
     reSpawn: boolean
     // 提前换班的 harvester 孵化时指定的矿点，保证接替的是同一个矿
     harvestSourceId?: Id<Source>
+    // 外矿房停用（敌对/被别人占用/已移出计划）后的召回标记：
+    // creep 交还任务回主房原地待命到死，不再被算作该矿点的覆盖
+    recall?: boolean
     // 外矿 carrier 往返标记：已经离开外矿房、正在往回走
     remoteReturn?: boolean
     // 侦察兵当前要探的房间；探完清空，等待新目标
