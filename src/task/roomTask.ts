@@ -36,7 +36,10 @@ export function harvestSource(room: Room) {
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
             // 找不到 source 旁的 container / 工地时退化为直接走到 source 旁边采集
-            taskParam: targetPos ? [sourceId, targetPos.x, targetPos.y] : [sourceId, null, null],
+            // 坐标后面带上房间名：RoomPosition 不能直接存 Memory，裸坐标又只会按当前房间解释
+            taskParam: targetPos
+                ? [sourceId, targetPos.x, targetPos.y, room.name]
+                : [sourceId, null, null, room.name],
             // 平时每个矿点 1 个采集者；容量 2 是为了换班时新旧 harvester 能同时上岗
             capacity: harvestSetting.capacity,
         })

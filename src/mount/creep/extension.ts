@@ -35,6 +35,20 @@ export default class CreepExtension extends Creep {
             // console.log(this.ticksToLive)
             return
         }
+        // harvester 只在本房采集：一旦跑出主房，先回矿点。
+        // 否则会领不到任务而随机走，或者被裸坐标的 harvestSource 钉在隔壁房同坐标格上。
+        if (this.memory.role === 'harvester' && this.memory.spawnRoom
+            && this.room.name !== this.memory.spawnRoom) {
+            const source = this.memory.harvestSourceId
+                ? Game.getObjectById<Source>(this.memory.harvestSourceId as Id<Source>)
+                : undefined
+            if (source) {
+                this.moveTo(source.pos, {range: 1, visualizePathStyle: {stroke: '#ffffff'}})
+            } else {
+                this.moveToRoom(this.memory.spawnRoom)
+            }
+            return
+        }
         let loop = 0
         while (loop < 4) {
             if (!this.memory.role) {
@@ -271,12 +285,25 @@ export default class CreepExtension extends Creep {
         }
     }
 
-    harvestSource(sourceId: Id<any>, containerPosX?: number, ContainerPosY?: number): boolean {
+    harvestSource(sourceId: Id<any>, containerPosX?: number, ContainerPosY?: number, containerRoom?: string): boolean {
         const source: Source = Game.getObjectById(sourceId)
         if (!source) {
             return true
         }
         this.say("⛏️007采矿")
+        // taskParam 里的坐标只是数字，inRangeTo / moveTo 会按 creep 当前房间解释。
+        // creep 一旦跑到别的房间，同坐标的格子会被误判成"已经到位"，于是只 harvest 不移动。
+        // 所以先确认自己在矿点房间，不在就先走回来（container 坐标自带房间名）。
+        const sourceRoom = source.pos.roomName
+        if (this.room.name !== sourceRoom) {
+            if (containerPosX != null && ContainerPosY != null) {
+                this.moveTo(new RoomPosition(containerPosX, ContainerPosY, containerRoom || sourceRoom),
+                    {visualizePathStyle: {stroke: '#ffffff'}})
+            } else {
+                this.moveTo(source.pos, {range: 1, visualizePathStyle: {stroke: '#ffffff'}})
+            }
+            return false
+        }
 
         // 引擎的 harvest 溢出会先填进同一格的 container（_create-energy），
         // 所以站在 container 上持续 harvest 即可；transfer 会白占一个采集 tick。
@@ -297,7 +324,7 @@ export default class CreepExtension extends Creep {
         }
 
         // 没有 container / 工地位置时退化为直接贴着 source 采集
-        if (containerPosX === undefined || ContainerPosY === undefined) {
+        if (containerPosX == null || ContainerPosY == null) {
             if (!this.pos.inRangeTo(source, 1)) {
                 this.moveTo(source, {visualizePathStyle: {stroke: '#ffffff'}})
             } else {
@@ -306,8 +333,9 @@ export default class CreepExtension extends Creep {
             return false
         }
 
-        if (!this.pos.inRangeTo(containerPosX, ContainerPosY, 0)) {
-            this.moveTo(containerPosX, ContainerPosY, {visualizePathStyle: {stroke: '#ffffff'}})
+        const containerPos = new RoomPosition(containerPosX, ContainerPosY, containerRoom || sourceRoom)
+        if (!this.pos.inRangeTo(containerPos, 0)) {
+            this.moveTo(containerPos, {visualizePathStyle: {stroke: '#ffffff'}})
         } else {
             this.harvest(source)
         }

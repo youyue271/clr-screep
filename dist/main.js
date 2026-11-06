@@ -3412,7 +3412,10 @@ function harvestSource(room) {
             taskType: 'harvestTask',
             taskFunc: 'harvestSource',
             // 找不到 source 旁的 container / 工地时退化为直接走到 source 旁边采集
-            taskParam: targetPos ? [sourceId, targetPos.x, targetPos.y] : [sourceId, null, null],
+            // 坐标后面带上房间名：RoomPosition 不能直接存 Memory，裸坐标又只会按当前房间解释
+            taskParam: targetPos
+                ? [sourceId, targetPos.x, targetPos.y, room.name]
+                : [sourceId, null, null, room.name],
             // 平时每个矿点 1 个采集者；容量 2 是为了换班时新旧 harvester 能同时上岗
             capacity: harvestSetting.capacity,
         });
@@ -3904,6 +3907,21 @@ class CreepExtension extends Creep {
             // console.log(this.ticksToLive)
             return;
         }
+        // harvester 只在本房采集：一旦跑出主房，先回矿点。
+        // 否则会领不到任务而随机走，或者被裸坐标的 harvestSource 钉在隔壁房同坐标格上。
+        if (this.memory.role === 'harvester' && this.memory.spawnRoom
+            && this.room.name !== this.memory.spawnRoom) {
+            const source = this.memory.harvestSourceId
+                ? Game.getObjectById(this.memory.harvestSourceId)
+                : undefined;
+            if (source) {
+                this.moveTo(source.pos, { range: 1, visualizePathStyle: { stroke: '#ffffff' } });
+            }
+            else {
+                this.moveToRoom(this.memory.spawnRoom);
+            }
+            return;
+        }
         let loop = 0;
         while (loop < 4) {
             if (!this.memory.role) {
@@ -4139,12 +4157,25 @@ class CreepExtension extends Creep {
             }
         }
     }
-    harvestSource(sourceId, containerPosX, ContainerPosY) {
+    harvestSource(sourceId, containerPosX, ContainerPosY, containerRoom) {
         const source = Game.getObjectById(sourceId);
         if (!source) {
             return true;
         }
         this.say("⛏️007采矿");
+        // taskParam 里的坐标只是数字，inRangeTo / moveTo 会按 creep 当前房间解释。
+        // creep 一旦跑到别的房间，同坐标的格子会被误判成"已经到位"，于是只 harvest 不移动。
+        // 所以先确认自己在矿点房间，不在就先走回来（container 坐标自带房间名）。
+        const sourceRoom = source.pos.roomName;
+        if (this.room.name !== sourceRoom) {
+            if (containerPosX != null && ContainerPosY != null) {
+                this.moveTo(new RoomPosition(containerPosX, ContainerPosY, containerRoom || sourceRoom), { visualizePathStyle: { stroke: '#ffffff' } });
+            }
+            else {
+                this.moveTo(source.pos, { range: 1, visualizePathStyle: { stroke: '#ffffff' } });
+            }
+            return false;
+        }
         // 引擎的 harvest 溢出会先填进同一格的 container（_create-energy），
         // 所以站在 container 上持续 harvest 即可；transfer 会白占一个采集 tick。
         const standingOnContainer = this.pos.lookFor(LOOK_STRUCTURES)
@@ -4162,7 +4193,7 @@ class CreepExtension extends Creep {
             return false;
         }
         // 没有 container / 工地位置时退化为直接贴着 source 采集
-        if (containerPosX === undefined || ContainerPosY === undefined) {
+        if (containerPosX == null || ContainerPosY == null) {
             if (!this.pos.inRangeTo(source, 1)) {
                 this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } });
             }
@@ -4171,8 +4202,9 @@ class CreepExtension extends Creep {
             }
             return false;
         }
-        if (!this.pos.inRangeTo(containerPosX, ContainerPosY, 0)) {
-            this.moveTo(containerPosX, ContainerPosY, { visualizePathStyle: { stroke: '#ffffff' } });
+        const containerPos = new RoomPosition(containerPosX, ContainerPosY, containerRoom || sourceRoom);
+        if (!this.pos.inRangeTo(containerPos, 0)) {
+            this.moveTo(containerPos, { visualizePathStyle: { stroke: '#ffffff' } });
         }
         else {
             this.harvest(source);
@@ -6896,7 +6928,10 @@ class RoomExtension extends Room {
         }
         // 代码推送后预约可能被清空，但 creep 内存里还记着矿点，仍算有效覆盖
         const miners = this.find(FIND_MY_CREEPS).filter(creep => creep.memory.role === 'harvester' && this.harvesterSourceOf(creep) === sourceId);
-        const covered = reservers.concat(miners).some(creep => isHealthy(creep));
+        // 只有在本房里采的才算覆盖：跑丢到隔壁房的 creep 虽然还挂着预约，
+        // 但它根本没在挖这个矿，不能因此不补人
+        const covered = reservers.concat(miners)
+            .some(creep => creep.room.name === this.name && isHealthy(creep));
         if (covered) {
             this.cancelHarvestSpawnTasks(sourceId);
             return true;

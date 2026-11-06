@@ -1476,7 +1476,10 @@ export default class RoomExtension extends Room {
         // 代码推送后预约可能被清空，但 creep 内存里还记着矿点，仍算有效覆盖
         const miners = this.find(FIND_MY_CREEPS).filter(creep =>
             creep.memory.role === 'harvester' && this.harvesterSourceOf(creep) === sourceId)
-        const covered = reservers.concat(miners).some(creep => isHealthy(creep))
+        // 只有在本房里采的才算覆盖：跑丢到隔壁房的 creep 虽然还挂着预约，
+        // 但它根本没在挖这个矿，不能因此不补人
+        const covered = reservers.concat(miners)
+            .some(creep => creep.room.name === this.name && isHealthy(creep))
         if (covered) {
             this.cancelHarvestSpawnTasks(sourceId as string)
             return true
