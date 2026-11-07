@@ -3847,7 +3847,7 @@ function ensureRoom(room, forceSig = false) {
     let st = all[room.name];
     if (!st) {
         st = all[room.name] = {
-            ver: 0, sig: '', sigTick: -1e9, baseCost: null,
+            ver: 0, sig: '', sigTick: -1e9, baseCost: null, interiorCost: null,
             reserved: null, reservedCount: 0, resKey: '', resTick: -1e9,
             fields: new Map(), builds: 0, evictions: 0,
         };
@@ -3859,6 +3859,7 @@ function ensureRoom(room, forceSig = false) {
             st.sig = sig;
             st.ver++;
             st.baseCost = null;
+            st.interiorCost = null;
             st.fields.clear();
         }
     }
@@ -3905,7 +3906,26 @@ function pruneTracks() {
  */
 function getField(room, pos, range) {
     const st = ensureRoom(room);
-    const cost = st.baseCost;
+    // 室内目标的场不允许经过边界格：creep 踩上出口格会在回合结束被引擎送进隔壁房，
+    // 贴边寻路会让它在两房之间每 tick 来回弹。moveToRoom 的目标就是出口格，仍用原表。
+    const onEdge = pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
+    let cost;
+    if (onEdge) {
+        cost = st.baseCost;
+    }
+    else {
+        if (!st.interiorCost) {
+            const inner = st.baseCost.slice();
+            for (let i = 0; i < 50; i++) {
+                inner[i] = FT_WALL;
+                inner[49 * 50 + i] = FT_WALL;
+                inner[i * 50] = FT_WALL;
+                inner[i * 50 + 49] = FT_WALL;
+            }
+            st.interiorCost = inner;
+        }
+        cost = st.interiorCost;
+    }
     const ti = idx(pos.x, pos.y);
     let eff = range > 0 ? range : 0;
     // 目标本身不可走（建筑 / source / 墙）时按 range 1 处理
@@ -5327,6 +5347,12 @@ class CreepExtension extends Creep {
         const resource = Game.getObjectById(id);
         if (!resource) {
             this.removeCurrentWorkFromQueue();
+            return true;
+        }
+        // CARRY 部件全灭：pickup 永远返回 ERR_FULL，守着掉落物只会无限空转并占住任务位。
+        // 和 getEnergyFromStructure 的 withdraw 分支一样，直接自毁补员。
+        if (!this.store.getCapacity()) {
+            this.suicideAndRespawn();
             return true;
         }
         this.say("🫳捡资源去");

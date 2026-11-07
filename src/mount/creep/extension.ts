@@ -480,6 +480,12 @@ export default class CreepExtension extends Creep {
             this.removeCurrentWorkFromQueue()
             return true
         }
+        // CARRY 部件全灭：pickup 永远返回 ERR_FULL，守着掉落物只会无限空转并占住任务位。
+        // 和 getEnergyFromStructure 的 withdraw 分支一样，直接自毁补员。
+        if (!this.store.getCapacity()) {
+            this.suicideAndRespawn()
+            return true
+        }
         this.say("🫳捡资源去")
         const res = this.pickup(resource)
         if (res == ERR_NOT_IN_RANGE) {

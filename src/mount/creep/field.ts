@@ -27,6 +27,9 @@ interface RoomTraffic {
     sig: string
     sigTick: number
     baseCost: Uint8Array | null
+    // 把房间边界格（x/y = 0/49）当墙的代价表：室内目标用它建场，避免路径贴边
+    // 踩上出口格被引擎弹到隔壁房。目标本身在边界时仍用 baseCost。
+    interiorCost: Uint8Array | null
     reserved: Uint8Array | null
     reservedCount: number
     resKey: string
@@ -264,7 +267,7 @@ function ensureRoom(room: Room, forceSig = false): RoomTraffic {
     let st = all[room.name]
     if (!st) {
         st = all[room.name] = {
-            ver: 0, sig: '', sigTick: -1e9, baseCost: null,
+            ver: 0, sig: '', sigTick: -1e9, baseCost: null, interiorCost: null,
             reserved: null, reservedCount: 0, resKey: '', resTick: -1e9,
             fields: new Map(), builds: 0, evictions: 0,
         }
@@ -277,6 +280,7 @@ function ensureRoom(room: Room, forceSig = false): RoomTraffic {
             st.sig = sig
             st.ver++
             st.baseCost = null
+            st.interiorCost = null
             st.fields.clear()
         }
     }
@@ -332,7 +336,25 @@ export interface ResolvedField {
  */
 export function getField(room: Room, pos: RoomPosition, range: number): ResolvedField | null {
     const st = ensureRoom(room)
-    const cost = st.baseCost as Uint8Array
+    // 室内目标的场不允许经过边界格：creep 踩上出口格会在回合结束被引擎送进隔壁房，
+    // 贴边寻路会让它在两房之间每 tick 来回弹。moveToRoom 的目标就是出口格，仍用原表。
+    const onEdge = pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49
+    let cost: Uint8Array
+    if (onEdge) {
+        cost = st.baseCost as Uint8Array
+    } else {
+        if (!st.interiorCost) {
+            const inner = (st.baseCost as Uint8Array).slice()
+            for (let i = 0; i < 50; i++) {
+                inner[i] = FT_WALL
+                inner[49 * 50 + i] = FT_WALL
+                inner[i * 50] = FT_WALL
+                inner[i * 50 + 49] = FT_WALL
+            }
+            st.interiorCost = inner
+        }
+        cost = st.interiorCost
+    }
     const ti = idx(pos.x, pos.y)
     let eff = range > 0 ? range : 0
     // 目标本身不可走（建筑 / source / 墙）时按 range 1 处理
@@ -463,6 +485,7 @@ export function invalidateRoom(room: Room): void {
     st.sig = ''
     st.sigTick = -1e9
     st.baseCost = null
+    st.interiorCost = null
     st.fields.clear()
 }
 
