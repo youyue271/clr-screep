@@ -5528,6 +5528,13 @@ class CreepExtension extends Creep {
                     return false;
                 }
             }
+            // 本房取不到能量时，外矿有回运任务就直接转 remoteCarrier 去外矿取。
+            // 不能先转 emptyWorker：那会去和本房 energyTask 排队，排满就原地空转，
+            // 而且 emptyWorker 不会再看外矿回运任务，carrier 就再也转不过去了。
+            if (this.room.hasRemoteCarryTask()) {
+                this.changeRole('remoteCarrier');
+                return true;
+            }
             // 没有可取的 container（或刚好被别人取空）：退回通用取能
             this.changeRole('emptyWorker');
             return true;
