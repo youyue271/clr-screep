@@ -1,4 +1,4 @@
-import {spawnPercent} from "@/setting";
+import {spawnPercent, spawnPercentFull} from "@/setting";
 
 /**
  * 把 obj2 的原型合并到 obj1 的原型上
@@ -96,6 +96,11 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
 }
 
 
+// 1 CARRY + 2n WORK + n MOVE = 3n + 1 个部件，受 50 部件上限约束：n 最大 16（49 部件）。
+// WORK 越多单位时间采得越快；矿采空后 harvester 会进 sleep 角色等矿重生，
+// 所以大体型只在矿满时爆发采集，不会有"多出来的 WORK 白烧"的问题。
+const HARVEST_MAX_NUM = 16
+
 /**
  //  * 返回harvester的body
  //  * @param room
@@ -109,8 +114,8 @@ const getHarvesterBody = function (room: Room) {
     // spawn 会等能量攒够再孵化，换班余量（孵化 + 路程 + 15 tick）足够。
     const energyBase = room.energyCapacityAvailable
     let num = Math.floor((energyBase - 50) / 250)
-    if (num > 3) {
-        num = 3
+    if (num > HARVEST_MAX_NUM) {
+        num = HARVEST_MAX_NUM
     }
     if (num <= 0) {
         num = 1
@@ -118,11 +123,38 @@ const getHarvesterBody = function (room: Room) {
     return calcBodyPart({[CARRY]: 1, [WORK]: 2 * num, [MOVE]: num})
 }
 
+/**
+ * 本房某一类角色的存活数量。emptyWorker 只是临时取能状态，按 oldRole 统计。
+ * 用来决定体型档位：还有同类活着就拉满，一只不剩（空窗）才用救急体型。
+ */
+function countHomeRole(room: Room, roles: string[]): number {
+    let count = 0
+    for (const name in Game.creeps) {
+        const creep = Game.creeps[name]
+        const home = creep.memory.spawnRoom || creep.room.name
+        if (home !== room.name) {
+            continue
+        }
+        const role = creep.memory.role === 'emptyWorker'
+            ? (creep.memory.oldRole ?? creep.memory.role)
+            : creep.memory.role
+        if (role && roles.includes(role)) {
+            count++
+        }
+    }
+    return count
+}
+
+/** 还有同类存活就按满体型算；一只不剩时退回救急体型，先补出第一只再说。 */
+function bodyPercent(room: Room, roles: string[]): number {
+    return countHomeRole(room, roles) > 0 ? spawnPercentFull : spawnPercent
+}
+
 const getCarrierBody = function (room: Room) {
     let body: any[];
     // 和 worker/harvester 一致：按容量算，避免低能量时孵出 1 CARRY 的“残废” carrier，
-    // 一次只能搬 50 能量、来回跑断腿。
-    const energyBase = room.energyCapacityAvailable * spawnPercent
+    // 一次只能搬 50 能量、来回跑断腿。有同类存活时拉满，空窗时才用救急体型。
+    const energyBase = room.energyCapacityAvailable * bodyPercent(room, ['carrier', 'remoteCarrier'])
     let num = Math.floor(energyBase / 100)
     if (num > 25) num = 25
     if (num <= 0) num = 1
@@ -132,7 +164,8 @@ const getCarrierBody = function (room: Room) {
 
 const getWorkerBody = function (room: Room) {
     let body: any[];
-    let num = Math.floor((room.energyCapacityAvailable * spawnPercent - 150) / 150);
+    const budget = room.energyCapacityAvailable * bodyPercent(room, ['worker'])
+    let num = Math.floor((budget - 150) / 150);
     if (num > 23) num = 23
     if (num <= 0) num = 1
     body = calcBodyPart({[CARRY]: 3, [WORK]: num, [MOVE]: num})
@@ -182,7 +215,8 @@ export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: nu
             if (num <= 0) {
                 return undefined
             }
-            return calcBodyPart({[CARRY]: 1, [WORK]: 2 * Math.min(num, 3), [MOVE]: Math.min(num, 3)})
+            const capped = Math.min(num, HARVEST_MAX_NUM)
+            return calcBodyPart({[CARRY]: 1, [WORK]: 2 * capped, [MOVE]: capped})
         }
         case 'carrier':
         case 'remoteCarrier': {

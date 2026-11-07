@@ -1,4 +1,9 @@
+// carrier / worker 的体型预算占房间能量容量（energyCapacityAvailable）的比例。
+// 分两档：房间里还有同类角色（≥1 只）时用 spawnPercentFull 拉满，
+// 一只都不剩（补员空窗）时才退回 spawnPercent 的救急体型——满体型一次就掏空
+// 房间能量，空窗时容易卡孵；有小体型先顶上，稳住后再产满体型。
 export const spawnPercent = 0.6
+export const spawnPercentFull = 1
 
 // spawn 队列等能量的兜底阈值：任务排队超过这么多 tick 还买不起 body，
 // 就按当前能量换一个买得起的最小体型先孵化。
@@ -33,6 +38,8 @@ export const spawnTable: { [role in Role]: number[] } = {
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
     'claimer':      [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // sleep 是矿采空后的临时状态，从不孵化
+    'sleep':        [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]

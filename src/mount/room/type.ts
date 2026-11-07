@@ -254,6 +254,11 @@ interface Room {
     ensureHarvesterForSource(sourceId: Id<Source>): boolean
 
     /**
+     * 唤醒睡眠中的矿工：恢复原职业和采空中断前保存的任务
+     */
+    wakeCreep(creepName: string): void
+
+    /**
      * 初始化Spawn列表
      */
     initSpawnList(): void

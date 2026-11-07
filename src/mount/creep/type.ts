@@ -31,6 +31,8 @@ type Role = 'worker'
     | 'viewer'
     // 占领/保留控制器：CLAIM + MOVE，reserve 由它自动续，claim 只执行显式 claimPlan
     | 'claimer'
+    // 矿采空后的睡眠态：每 tick 只说 zzz，矿重生时由 wakeCreep 事件唤醒回原职业
+    | 'sleep'
 
 interface Creep {
 
@@ -87,4 +89,9 @@ interface Creep {
      * 一直返回 false，只有主房关掉外矿时才回主房释放任务。
      */
     scout(homeRoom: string): boolean
+    /**
+     * 睡眠态的唯一动作：每 tick 说 zzz。
+     * 唤醒由主房事件队列里的 wakeCreep 负责，不做每 tick 的条件判断。
+     */
+    sleep(): boolean
 }

@@ -1512,7 +1512,7 @@ export default class RoomExtension extends Room {
         for (const name in Game.creeps) {
             const creep = Game.creeps[name]
             if (creep.memory.spawnRoom !== this.name
-                || creep.memory.role !== 'remoteHarvester'
+                || this.workRole(creep) !== 'remoteHarvester'
                 || creep.memory.recall) {
                 continue
             }
@@ -1861,7 +1861,7 @@ export default class RoomExtension extends Room {
         for (const name in Game.creeps) {
             const creep = Game.creeps[name]
             if (creep.memory.spawnRoom !== this.name
-                || creep.memory.role !== 'remoteHarvester'
+                || this.workRole(creep) !== 'remoteHarvester'
                 || creep.memory.recall) {
                 continue
             }
@@ -2103,6 +2103,8 @@ export default class RoomExtension extends Room {
             'viewer': 0,
             // claimer 同理：refreshClaimSpawn 按 reserve 到期/claimPlan 按需补
             'claimer': 0,
+            // sleep 是矿采空后的临时状态，从不孵化
+            'sleep': 0,
         }
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName]
@@ -2137,6 +2139,10 @@ export default class RoomExtension extends Room {
                 }
                 if (savedRecall) {
                     creep.memory.recall = true
+                }
+                // 推代码会清空房间事件：睡眠中的 creep 重新挂唤醒事件，否则会一直睡到死
+                if (creep.memory.currentWork?.taskFunc === 'sleep') {
+                    this.rearmSleep(creep)
                 }
                 // 推代码会清空所有事件；外矿 creep 不在主房，initCreepRecycle 扫不到，
                 // 这里补一个回收事件，保证死亡后能清内存/按 reSpawn 补员
@@ -2268,6 +2274,71 @@ export default class RoomExtension extends Room {
     }
 
     /**
+     * 唤醒睡眠中的矿工：恢复原职业和采空中断前保存的任务。
+     * 只在 currentWork 确实是 sleep 伪任务时动作，重复/过期事件都安全。
+     */
+    wakeCreep(creepName: string): void {
+        const creep = Game.creeps[creepName]
+        if (!creep) {
+            return
+        }
+        const work = creep.memory.currentWork
+        if (!work || work.taskFunc !== 'sleep') {
+            return
+        }
+        const saved = work.taskParam?.[0] as TaskEntity | undefined
+        const savedType = work.taskParam?.[1] as TaskType | undefined
+        const role = (creep.memory.oldRole ?? creep.memory.role) as Role
+        delete creep.memory.oldRole
+        creep.memory.role = role
+        if (saved) {
+            creep.memory.currentWork = saved
+            if (savedType) {
+                creep.memory.currentWorkType = savedType
+            }
+            creep.memory.working = true
+        } else {
+            // 没有存到原任务：清掉伪任务，下一 tick 按职业重新领
+            creep.memory.currentWork = undefined
+            creep.memory.currentWorkType = undefined
+            creep.memory.working = false
+        }
+    }
+
+    /**
+     * 推代码会清空 room 事件队列：给还挂着 sleep 伪任务的 creep 重新登记唤醒。
+     * 矿已经回满就直接唤醒；否则按剩余重生 tick 重挂。只在房间初始化时扫一次。
+     */
+    private rearmSleep(creep: Creep): void {
+        const work = creep.memory.currentWork
+        if (!work || work.taskFunc !== 'sleep') {
+            return
+        }
+        const saved = work.taskParam?.[0] as TaskEntity | undefined
+        const source = saved ? Game.getObjectById<Source>(saved.taskParam?.[0]) : undefined
+        const wait = source?.ticksToRegeneration
+        if (!wait) {
+            // 矿已回满 / 矿点没了：直接唤醒，让任务自己重新校验
+            this.wakeCreep(creep.name)
+            return
+        }
+        this.registEvent({
+            triggerTime: Game.time + Math.max(1, wait) + 1,
+            triggerFunc: 'wakeCreep',
+            param: [creep.name],
+        })
+    }
+
+    /**
+     * 睡眠中的 creep 按原职业（oldRole）统计：覆盖判定不能把它当成"没这号人"。
+     */
+    private workRole(creep: Creep): Role {
+        return creep.memory.role === 'sleep'
+            ? (creep.memory.oldRole ?? creep.memory.role)
+            : creep.memory.role
+    }
+
+    /**
      * 确保某个矿点有健康的 harvester：有就清掉多余替补，没有就排一个指定矿点的替补。
      * @returns false 表示当前无法处理（房间没有 spawn 等）
      */
@@ -2311,7 +2382,7 @@ export default class RoomExtension extends Room {
         }
         // 代码推送后预约可能被清空，但 creep 内存里还记着矿点，仍算有效覆盖
         const miners = this.find(FIND_MY_CREEPS).filter(creep =>
-            creep.memory.role === 'harvester' && this.harvesterSourceOf(creep) === sourceId)
+            this.workRole(creep) === 'harvester' && this.harvesterSourceOf(creep) === sourceId)
         // 只有在本房里采的才算覆盖：跑丢到隔壁房的 creep 虽然还挂着预约，
         // 但它根本没在挖这个矿，不能因此不补人
         const covered = reservers.concat(miners)

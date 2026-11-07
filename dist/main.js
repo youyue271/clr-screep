@@ -3246,7 +3246,12 @@ const errorMapper = function (next) {
     }
 };
 
+// carrier / worker 的体型预算占房间能量容量（energyCapacityAvailable）的比例。
+// 分两档：房间里还有同类角色（≥1 只）时用 spawnPercentFull 拉满，
+// 一只都不剩（补员空窗）时才退回 spawnPercent 的救急体型——满体型一次就掏空
+// 房间能量，空窗时容易卡孵；有小体型先顶上，稳住后再产满体型。
 const spawnPercent = 0.6;
+const spawnPercentFull = 1;
 // spawn 队列等能量的兜底阈值：任务排队超过这么多 tick 还买不起 body，
 // 就按当前能量换一个买得起的最小体型先孵化。
 // 正常补能 100 tick 内早就够了，只在 carrier 全灭之类的饿死场景生效。
@@ -3279,6 +3284,8 @@ const spawnTable = {
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
     'claimer': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // sleep 是矿采空后的临时状态，从不孵化
+    'sleep': [0, 0, 0, 0, 0, 0, 0, 0, 0],
 };
 const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1];
 // 升级并发：有工地时仍用 upgradeTaskCapacity 的基准值，
@@ -3992,6 +3999,8 @@ const roleToTask = {
     'viewer': ['scoutTask'],
     // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
     'claimer': ['claimTask'],
+    // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
+    'sleep': [],
 };
 class CreepExtension extends Creep {
     /**
@@ -4203,6 +4212,7 @@ class CreepExtension extends Creep {
             && this.memory.role !== 'remoteHarvester'
             && this.memory.role !== 'viewer'
             && this.memory.role !== 'claimer'
+            && this.memory.role !== 'sleep'
             && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
             this.changeRole('emptyWorker');
         }
@@ -4329,6 +4339,12 @@ class CreepExtension extends Creep {
         if (!source) {
             return true;
         }
+        // 矿采空：这 tick 不再发 harvest 意图（省一次固定意图 CPU），
+        // 进 sleep 角色等矿重生，醒来由事件恢复任务。
+        if (source.energy === 0) {
+            this.sleepUntilSourceReady(source);
+            return false;
+        }
         this.say("⛏️007采矿");
         // taskParam 里的坐标只是数字，inRangeTo / moveTo 会按 creep 当前房间解释。
         // creep 一旦跑到别的房间，同坐标的格子会被误判成"已经到位"，于是只 harvest 不移动。
@@ -4376,6 +4392,47 @@ class CreepExtension extends Creep {
         else {
             this.harvest(source);
         }
+        return false;
+    }
+    /**
+     * 矿采空后进入睡眠态：
+     * - currentWork 换成 sleep 伪任务（原任务和任务类型存进 taskParam，醒来原样恢复）；
+     * - 不调 releaseCurrentWork：保留矿点任务预约，换班/覆盖判定不会误补人，醒来直接接着挖；
+     * - 在出生房挂 wakeCreep 事件，等矿重生后唤醒，不做每 tick 的条件判断。
+     * 睡眠期间唯一动作是 sleep() 里的 say('zzz')。
+     */
+    sleepUntilSourceReady(source) {
+        var _a, _b;
+        const work = this.memory.currentWork;
+        // 已经在睡（正常不会走到这里）：不要重复登记唤醒事件
+        if (!work || work.taskFunc === 'sleep') {
+            return;
+        }
+        // 醒来后认矿点靠这个字段：换班、覆盖、回收逻辑都读它
+        this.memory.harvestSourceId = source.id;
+        this.memory.oldRole = this.memory.role;
+        this.memory.role = 'sleep';
+        this.memory.currentWork = {
+            id: `sleep-${this.name}`,
+            taskFunc: 'sleep',
+            taskParam: [work, this.memory.currentWorkType],
+            priority: 0,
+            capacity: 1,
+            persistent: true,
+            reservedBy: [],
+        };
+        this.memory.working = true;
+        // 事件挂在出生房：外矿 harvester 也能被主房唤醒（外矿房没视野时不要指望它的房间事件）
+        const eventRoom = (_a = Game.rooms[this.memory.spawnRoom]) !== null && _a !== void 0 ? _a : this.room;
+        eventRoom.registEvent({
+            // 矿重生的那一 tick 之后再醒，醒来若发现还是空的会再睡一轮
+            triggerTime: Game.time + Math.max(1, (_b = source.ticksToRegeneration) !== null && _b !== void 0 ? _b : 1) + 1,
+            triggerFunc: 'wakeCreep',
+            param: [this.name],
+        });
+    }
+    sleep() {
+        this.say('zzz');
         return false;
     }
     getEnergyFromStructure(id, energyType) {
@@ -4770,6 +4827,11 @@ class CreepExtension extends Creep {
                 return false;
             }
             this.memory.harvestSourceId = source.id;
+        }
+        // 外矿采空：同样进 sleep 等重生，不做无意义的 harvest / 修理空转
+        if (source.energy === 0) {
+            this.sleepUntilSourceReady(source);
+            return false;
         }
         const state = this.remoteSourceState(homeRoom, targetRoom, source);
         const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
@@ -5444,6 +5506,10 @@ function getBody(role, room) {
             return getCarrierBody(room);
     }
 }
+// 1 CARRY + 2n WORK + n MOVE = 3n + 1 个部件，受 50 部件上限约束：n 最大 16（49 部件）。
+// WORK 越多单位时间采得越快；矿采空后 harvester 会进 sleep 角色等矿重生，
+// 所以大体型只在矿满时爆发采集，不会有"多出来的 WORK 白烧"的问题。
+const HARVEST_MAX_NUM = 16;
 /**
  //  * 返回harvester的body
  //  * @param room
@@ -5457,19 +5523,45 @@ const getHarvesterBody = function (room) {
     // spawn 会等能量攒够再孵化，换班余量（孵化 + 路程 + 15 tick）足够。
     const energyBase = room.energyCapacityAvailable;
     let num = Math.floor((energyBase - 50) / 250);
-    if (num > 3) {
-        num = 3;
+    if (num > HARVEST_MAX_NUM) {
+        num = HARVEST_MAX_NUM;
     }
     if (num <= 0) {
         num = 1;
     }
     return calcBodyPart({ [CARRY]: 1, [WORK]: 2 * num, [MOVE]: num });
 };
+/**
+ * 本房某一类角色的存活数量。emptyWorker 只是临时取能状态，按 oldRole 统计。
+ * 用来决定体型档位：还有同类活着就拉满，一只不剩（空窗）才用救急体型。
+ */
+function countHomeRole(room, roles) {
+    var _a;
+    let count = 0;
+    for (const name in Game.creeps) {
+        const creep = Game.creeps[name];
+        const home = creep.memory.spawnRoom || creep.room.name;
+        if (home !== room.name) {
+            continue;
+        }
+        const role = creep.memory.role === 'emptyWorker'
+            ? ((_a = creep.memory.oldRole) !== null && _a !== void 0 ? _a : creep.memory.role)
+            : creep.memory.role;
+        if (role && roles.includes(role)) {
+            count++;
+        }
+    }
+    return count;
+}
+/** 还有同类存活就按满体型算；一只不剩时退回救急体型，先补出第一只再说。 */
+function bodyPercent(room, roles) {
+    return countHomeRole(room, roles) > 0 ? spawnPercentFull : spawnPercent;
+}
 const getCarrierBody = function (room) {
     let body;
     // 和 worker/harvester 一致：按容量算，避免低能量时孵出 1 CARRY 的“残废” carrier，
-    // 一次只能搬 50 能量、来回跑断腿。
-    const energyBase = room.energyCapacityAvailable * spawnPercent;
+    // 一次只能搬 50 能量、来回跑断腿。有同类存活时拉满，空窗时才用救急体型。
+    const energyBase = room.energyCapacityAvailable * bodyPercent(room, ['carrier', 'remoteCarrier']);
     let num = Math.floor(energyBase / 100);
     if (num > 25)
         num = 25;
@@ -5480,7 +5572,8 @@ const getCarrierBody = function (room) {
 };
 const getWorkerBody = function (room) {
     let body;
-    let num = Math.floor((room.energyCapacityAvailable * spawnPercent - 150) / 150);
+    const budget = room.energyCapacityAvailable * bodyPercent(room, ['worker']);
+    let num = Math.floor((budget - 150) / 150);
     if (num > 23)
         num = 23;
     if (num <= 0)
@@ -5532,7 +5625,8 @@ function getBodyForEnergy(role, room, energy) {
             if (num <= 0) {
                 return undefined;
             }
-            return calcBodyPart({ [CARRY]: 1, [WORK]: 2 * Math.min(num, 3), [MOVE]: Math.min(num, 3) });
+            const capped = Math.min(num, HARVEST_MAX_NUM);
+            return calcBodyPart({ [CARRY]: 1, [WORK]: 2 * capped, [MOVE]: capped });
         }
         case 'carrier':
         case 'remoteCarrier': {
@@ -5979,9 +6073,17 @@ function findContainerTile(source) {
  * harvester 的采矿站位是固定格（掉落要进同格 container）。
  */
 function harvesterStationTile(creep, roomName) {
-    const work = creep.memory.currentWork;
+    return taskStationTile(creep.memory.currentWork, roomName);
+}
+/**
+ * 睡眠伪任务把原任务存在 taskParam[0]，站位继续按原任务推导。
+ */
+function taskStationTile(work, roomName) {
     if (!work || !work.taskParam) {
         return null;
+    }
+    if (work.taskFunc === 'sleep') {
+        return taskStationTile(work.taskParam[0], roomName);
     }
     if (work.taskFunc === 'harvestSource') {
         const cx = work.taskParam[1];
@@ -6013,7 +6115,7 @@ function computeBlocked(room, st) {
     const creeps = room.find(FIND_MY_CREEPS);
     for (const creep of creeps) {
         const role = creep.memory.role;
-        if (role === 'harvester' || role === 'remoteHarvester') {
+        if (role === 'harvester' || role === 'remoteHarvester' || role === 'sleep') {
             const tile = harvesterStationTile(creep, room.name);
             if (tile !== null && tile >= 0 && tile < FT_SIZE) {
                 tiles[tile] = 1;
@@ -8116,7 +8218,7 @@ class RoomExtension extends Room {
         for (const name in Game.creeps) {
             const creep = Game.creeps[name];
             if (creep.memory.spawnRoom !== this.name
-                || creep.memory.role !== 'remoteHarvester'
+                || this.workRole(creep) !== 'remoteHarvester'
                 || creep.memory.recall) {
                 continue;
             }
@@ -8465,7 +8567,7 @@ class RoomExtension extends Room {
         for (const name in Game.creeps) {
             const creep = Game.creeps[name];
             if (creep.memory.spawnRoom !== this.name
-                || creep.memory.role !== 'remoteHarvester'
+                || this.workRole(creep) !== 'remoteHarvester'
                 || creep.memory.recall) {
                 continue;
             }
@@ -8689,7 +8791,7 @@ class RoomExtension extends Room {
      * Spawn相关
      */
     initSpawn(level) {
-        var _a, _b, _c, _d;
+        var _a, _b, _c, _d, _e;
         console.log("Global init Spawn");
         let spawnNum = {
             'harvester': this.find(FIND_SOURCES).length,
@@ -8705,6 +8807,8 @@ class RoomExtension extends Room {
             'viewer': 0,
             // claimer 同理：refreshClaimSpawn 按 reserve 到期/claimPlan 按需补
             'claimer': 0,
+            // sleep 是矿采空后的临时状态，从不孵化
+            'sleep': 0,
         };
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName];
@@ -8739,6 +8843,10 @@ class RoomExtension extends Room {
                 if (savedRecall) {
                     creep.memory.recall = true;
                 }
+                // 推代码会清空房间事件：睡眠中的 creep 重新挂唤醒事件，否则会一直睡到死
+                if (((_d = creep.memory.currentWork) === null || _d === void 0 ? void 0 : _d.taskFunc) === 'sleep') {
+                    this.rearmSleep(creep);
+                }
                 // 推代码会清空所有事件；外矿 creep 不在主房，initCreepRecycle 扫不到，
                 // 这里补一个回收事件，保证死亡后能清内存/按 reSpawn 补员
                 if (outsideHome && creep.ticksToLive !== undefined) {
@@ -8751,7 +8859,7 @@ class RoomExtension extends Room {
                 // emptyWorker 只是临时取能状态，按原职业统计，否则每次推送代码都会
                 // 把正在取能的 worker 当成缺失，重复排队孵化
                 const role = creep.memory.role === 'emptyWorker'
-                    ? ((_d = creep.memory.oldRole) !== null && _d !== void 0 ? _d : creep.memory.role)
+                    ? ((_e = creep.memory.oldRole) !== null && _e !== void 0 ? _e : creep.memory.role)
                     : creep.memory.role;
                 // 代码推送会清空 Memory.rooms（包括事件），这里给现存的 harvester 重新挂换班事件
                 if (role === 'harvester' || role === 'remoteHarvester') {
@@ -8865,6 +8973,72 @@ class RoomExtension extends Room {
         }
     }
     /**
+     * 唤醒睡眠中的矿工：恢复原职业和采空中断前保存的任务。
+     * 只在 currentWork 确实是 sleep 伪任务时动作，重复/过期事件都安全。
+     */
+    wakeCreep(creepName) {
+        var _a, _b, _c;
+        const creep = Game.creeps[creepName];
+        if (!creep) {
+            return;
+        }
+        const work = creep.memory.currentWork;
+        if (!work || work.taskFunc !== 'sleep') {
+            return;
+        }
+        const saved = (_a = work.taskParam) === null || _a === void 0 ? void 0 : _a[0];
+        const savedType = (_b = work.taskParam) === null || _b === void 0 ? void 0 : _b[1];
+        const role = ((_c = creep.memory.oldRole) !== null && _c !== void 0 ? _c : creep.memory.role);
+        delete creep.memory.oldRole;
+        creep.memory.role = role;
+        if (saved) {
+            creep.memory.currentWork = saved;
+            if (savedType) {
+                creep.memory.currentWorkType = savedType;
+            }
+            creep.memory.working = true;
+        }
+        else {
+            // 没有存到原任务：清掉伪任务，下一 tick 按职业重新领
+            creep.memory.currentWork = undefined;
+            creep.memory.currentWorkType = undefined;
+            creep.memory.working = false;
+        }
+    }
+    /**
+     * 推代码会清空 room 事件队列：给还挂着 sleep 伪任务的 creep 重新登记唤醒。
+     * 矿已经回满就直接唤醒；否则按剩余重生 tick 重挂。只在房间初始化时扫一次。
+     */
+    rearmSleep(creep) {
+        var _a, _b;
+        const work = creep.memory.currentWork;
+        if (!work || work.taskFunc !== 'sleep') {
+            return;
+        }
+        const saved = (_a = work.taskParam) === null || _a === void 0 ? void 0 : _a[0];
+        const source = saved ? Game.getObjectById((_b = saved.taskParam) === null || _b === void 0 ? void 0 : _b[0]) : undefined;
+        const wait = source === null || source === void 0 ? void 0 : source.ticksToRegeneration;
+        if (!wait) {
+            // 矿已回满 / 矿点没了：直接唤醒，让任务自己重新校验
+            this.wakeCreep(creep.name);
+            return;
+        }
+        this.registEvent({
+            triggerTime: Game.time + Math.max(1, wait) + 1,
+            triggerFunc: 'wakeCreep',
+            param: [creep.name],
+        });
+    }
+    /**
+     * 睡眠中的 creep 按原职业（oldRole）统计：覆盖判定不能把它当成"没这号人"。
+     */
+    workRole(creep) {
+        var _a;
+        return creep.memory.role === 'sleep'
+            ? ((_a = creep.memory.oldRole) !== null && _a !== void 0 ? _a : creep.memory.role)
+            : creep.memory.role;
+    }
+    /**
      * 确保某个矿点有健康的 harvester：有就清掉多余替补，没有就排一个指定矿点的替补。
      * @returns false 表示当前无法处理（房间没有 spawn 等）
      */
@@ -8906,7 +9080,7 @@ class RoomExtension extends Room {
             }
         }
         // 代码推送后预约可能被清空，但 creep 内存里还记着矿点，仍算有效覆盖
-        const miners = this.find(FIND_MY_CREEPS).filter(creep => creep.memory.role === 'harvester' && this.harvesterSourceOf(creep) === sourceId);
+        const miners = this.find(FIND_MY_CREEPS).filter(creep => this.workRole(creep) === 'harvester' && this.harvesterSourceOf(creep) === sourceId);
         // 只有在本房里采的才算覆盖：跑丢到隔壁房的 creep 虽然还挂着预约，
         // 但它根本没在挖这个矿，不能因此不补人
         const covered = reservers.concat(miners)
@@ -11553,7 +11727,8 @@ const stateScanner = function () {
  *   + mover 上一 tick 也在原地（stuck >= 1，避免路过碰擦就推人）
  *   + 挡路者这 tick 没有移动意图、有 MOVE 部件、疲劳为 0
  *   → 挡路者如果正在做"换一格照样能干"的工作（build/repair/upgrade/取放资源），
- *     优先把它平移到工作范围内另一个空格继续干；找不到空格才反向对穿。
+ *     优先把它平移到工作范围内另一个空格继续干；工作目标没了（工地完工/建筑被拆）
+ *     或目标附近没空格时，随便找一格可走的空格先让开；实在没地方才反向对穿。
  *     harvest 这类必须钉在站位上的工作绝对不推，mover 自己等。
  *
  * 不需要处理的情况：
@@ -11594,6 +11769,8 @@ const MOVABLE_WORK_RANGE = {
 const IMMOVABLE_TASKS = {
     harvestSource: true,
     remoteHarvest: true,
+    // 睡眠中的矿工还钉在矿点站位上，等矿重生期间不能被推走
+    sleep: true,
 };
 /**
  * 挡路者当前工作的类别：
@@ -11651,6 +11828,28 @@ function relocationDir(blocker, range, roomIndex) {
         }
     }
     return best;
+}
+/**
+ * 兜底让位：工作目标没了（工地完工/建筑被拆）或目标附近没空格时，
+ * 随便找一格可走、本 tick 无人的相邻格先让开，避免直接对穿。
+ * 和 relocationDir 一样跳过房间边界格（会被引擎弹到隔壁房）。
+ * 返回方向；0 表示 8 邻格全被占/不可走，交给后面的对穿。
+ */
+function anyFreeDir(blocker, roomIndex) {
+    const cost = fieldCost(blocker.room);
+    for (let d = 1; d <= 8; d++) {
+        const nx = blocker.pos.x + DIR_DX[d];
+        const ny = blocker.pos.y + DIR_DY[d];
+        if (nx < 1 || nx > 48 || ny < 1 || ny > 48) {
+            continue;
+        }
+        const i = idx(nx, ny);
+        if (cost[i] >= FT_WALL || roomIndex[i] !== undefined) {
+            continue;
+        }
+        return d;
+    }
+    return 0;
 }
 function trafficControl() {
     var _a, _b;
@@ -11729,7 +11928,8 @@ function trafficControl() {
         }
         const workRange = blockerWorkRange(blocker);
         if (workRange > 0) {
-            const reloc = relocationDir(blocker, workRange, roomIndex);
+            // 目标附近优先；目标没了/附近没空格就随便找一格先让开（仍没地方才对穿）
+            const reloc = relocationDir(blocker, workRange, roomIndex) || anyFreeDir(blocker, roomIndex);
             if (reloc) {
                 if (blocker.move(reloc) === OK) {
                     // 本 tick 的格子索引同步更新：后面的 mover 看到的是让位后的位置

@@ -11,7 +11,8 @@
  *   + mover 上一 tick 也在原地（stuck >= 1，避免路过碰擦就推人）
  *   + 挡路者这 tick 没有移动意图、有 MOVE 部件、疲劳为 0
  *   → 挡路者如果正在做"换一格照样能干"的工作（build/repair/upgrade/取放资源），
- *     优先把它平移到工作范围内另一个空格继续干；找不到空格才反向对穿。
+ *     优先把它平移到工作范围内另一个空格继续干；工作目标没了（工地完工/建筑被拆）
+ *     或目标附近没空格时，随便找一格可走的空格先让开；实在没地方才反向对穿。
  *     harvest 这类必须钉在站位上的工作绝对不推，mover 自己等。
  *
  * 不需要处理的情况：
@@ -64,6 +65,8 @@ const MOVABLE_WORK_RANGE: { [taskFunc: string]: number } = {
 const IMMOVABLE_TASKS: { [taskFunc: string]: boolean } = {
     harvestSource: true,
     remoteHarvest: true,
+    // 睡眠中的矿工还钉在矿点站位上，等矿重生期间不能被推走
+    sleep: true,
 }
 
 /**
@@ -122,6 +125,29 @@ function relocationDir(blocker: Creep, range: number, roomIndex: { [tile: number
         }
     }
     return best
+}
+
+/**
+ * 兜底让位：工作目标没了（工地完工/建筑被拆）或目标附近没空格时，
+ * 随便找一格可走、本 tick 无人的相邻格先让开，避免直接对穿。
+ * 和 relocationDir 一样跳过房间边界格（会被引擎弹到隔壁房）。
+ * 返回方向；0 表示 8 邻格全被占/不可走，交给后面的对穿。
+ */
+function anyFreeDir(blocker: Creep, roomIndex: { [tile: number]: Creep | null }): number {
+    const cost = fieldCost(blocker.room)
+    for (let d = 1; d <= 8; d++) {
+        const nx = blocker.pos.x + DIR_DX[d]
+        const ny = blocker.pos.y + DIR_DY[d]
+        if (nx < 1 || nx > 48 || ny < 1 || ny > 48) {
+            continue
+        }
+        const i = idx(nx, ny)
+        if (cost[i] >= FT_WALL || roomIndex[i] !== undefined) {
+            continue
+        }
+        return d
+    }
+    return 0
 }
 
 export function trafficControl(): void {
@@ -205,7 +231,8 @@ export function trafficControl(): void {
 
         const workRange = blockerWorkRange(blocker)
         if (workRange > 0) {
-            const reloc = relocationDir(blocker, workRange, roomIndex)
+            // 目标附近优先；目标没了/附近没空格就随便找一格先让开（仍没地方才对穿）
+            const reloc = relocationDir(blocker, workRange, roomIndex) || anyFreeDir(blocker, roomIndex)
             if (reloc) {
                 if (blocker.move(reloc as DirectionConstant) === OK) {
                     // 本 tick 的格子索引同步更新：后面的 mover 看到的是让位后的位置

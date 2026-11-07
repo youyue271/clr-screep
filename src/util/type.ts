@@ -47,3 +47,5 @@ type BaseRoleConstant =
 type AdvancedRoleConstant =
     | 'attacker'
     | 'remoteBuilder'
+    // sleep 不是可孵化角色，只是让 Role 联合类型能传给 getBody 的签名检查
+    | 'sleep'

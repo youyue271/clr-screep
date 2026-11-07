@@ -110,9 +110,18 @@ function findContainerTile(source: Source): number | null {
  * harvester 的采矿站位是固定格（掉落要进同格 container）。
  */
 export function harvesterStationTile(creep: Creep, roomName: string): number | null {
-    const work = creep.memory.currentWork
+    return taskStationTile(creep.memory.currentWork, roomName)
+}
+
+/**
+ * 睡眠伪任务把原任务存在 taskParam[0]，站位继续按原任务推导。
+ */
+function taskStationTile(work: TaskEntity | undefined, roomName: string): number | null {
     if (!work || !work.taskParam) {
         return null
+    }
+    if (work.taskFunc === 'sleep') {
+        return taskStationTile(work.taskParam[0] as TaskEntity | undefined, roomName)
     }
     if (work.taskFunc === 'harvestSource') {
         const cx = work.taskParam[1]
@@ -145,7 +154,7 @@ function computeBlocked(room: Room, st: RoomTraffic): { key: string, tiles: Uint
     const creeps = room.find(FIND_MY_CREEPS)
     for (const creep of creeps) {
         const role = creep.memory.role
-        if (role === 'harvester' || role === 'remoteHarvester') {
+        if (role === 'harvester' || role === 'remoteHarvester' || role === 'sleep') {
             const tile = harvesterStationTile(creep, room.name)
             if (tile !== null && tile >= 0 && tile < FT_SIZE) {
                 tiles[tile] = 1

@@ -19,6 +19,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'viewer': ['scoutTask'],
     // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
     'claimer': ['claimTask'],
+    // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
+    'sleep': [],
 }
 
 export default class CreepExtension extends Creep {
@@ -229,6 +231,7 @@ export default class CreepExtension extends Creep {
             && this.memory.role !== 'remoteHarvester'
             && this.memory.role !== 'viewer'
             && this.memory.role !== 'claimer'
+            && this.memory.role !== 'sleep'
             && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
             this.changeRole('emptyWorker')
         }
@@ -357,6 +360,12 @@ export default class CreepExtension extends Creep {
         if (!source) {
             return true
         }
+        // 矿采空：这 tick 不再发 harvest 意图（省一次固定意图 CPU），
+        // 进 sleep 角色等矿重生，醒来由事件恢复任务。
+        if (source.energy === 0) {
+            this.sleepUntilSourceReady(source)
+            return false
+        }
         this.say("⛏️007采矿")
         // taskParam 里的坐标只是数字，inRangeTo / moveTo 会按 creep 当前房间解释。
         // creep 一旦跑到别的房间，同坐标的格子会被误判成"已经到位"，于是只 harvest 不移动。
@@ -406,6 +415,48 @@ export default class CreepExtension extends Creep {
         } else {
             this.harvest(source)
         }
+        return false
+    }
+
+    /**
+     * 矿采空后进入睡眠态：
+     * - currentWork 换成 sleep 伪任务（原任务和任务类型存进 taskParam，醒来原样恢复）；
+     * - 不调 releaseCurrentWork：保留矿点任务预约，换班/覆盖判定不会误补人，醒来直接接着挖；
+     * - 在出生房挂 wakeCreep 事件，等矿重生后唤醒，不做每 tick 的条件判断。
+     * 睡眠期间唯一动作是 sleep() 里的 say('zzz')。
+     */
+    sleepUntilSourceReady(source: Source): void {
+        const work = this.memory.currentWork
+        // 已经在睡（正常不会走到这里）：不要重复登记唤醒事件
+        if (!work || work.taskFunc === 'sleep') {
+            return
+        }
+        // 醒来后认矿点靠这个字段：换班、覆盖、回收逻辑都读它
+        this.memory.harvestSourceId = source.id
+        this.memory.oldRole = this.memory.role
+        this.memory.role = 'sleep'
+        this.memory.currentWork = {
+            id: `sleep-${this.name}`,
+            taskFunc: 'sleep',
+            taskParam: [work, this.memory.currentWorkType],
+            priority: 0,
+            capacity: 1,
+            persistent: true,
+            reservedBy: [],
+        }
+        this.memory.working = true
+        // 事件挂在出生房：外矿 harvester 也能被主房唤醒（外矿房没视野时不要指望它的房间事件）
+        const eventRoom = Game.rooms[this.memory.spawnRoom] ?? this.room
+        eventRoom.registEvent({
+            // 矿重生的那一 tick 之后再醒，醒来若发现还是空的会再睡一轮
+            triggerTime: Game.time + Math.max(1, source.ticksToRegeneration ?? 1) + 1,
+            triggerFunc: 'wakeCreep',
+            param: [this.name],
+        })
+    }
+
+    sleep(): boolean {
+        this.say('zzz')
         return false
     }
 
@@ -789,6 +840,11 @@ export default class CreepExtension extends Creep {
                 return false
             }
             this.memory.harvestSourceId = source.id
+        }
+        // 外矿采空：同样进 sleep 等重生，不做无意义的 harvest / 修理空转
+        if (source.energy === 0) {
+            this.sleepUntilSourceReady(source)
+            return false
         }
         const state = this.remoteSourceState(homeRoom, targetRoom, source)
         const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
