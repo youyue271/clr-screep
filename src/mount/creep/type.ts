@@ -13,6 +13,8 @@ interface CreepMemory {
     recall?: boolean
     // 外矿 carrier 往返标记：已经离开外矿房、正在往回走
     remoteReturn?: boolean
+    // 外矿 container 已经消失（外矿房停用/被拆）：本次回程卸完货就结束循环
+    remoteAbort?: boolean
     // 侦察兵当前要探的房间；探完清空，等待新目标
     scoutTarget?: string
     // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
