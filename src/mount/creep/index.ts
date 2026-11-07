@@ -1,7 +1,7 @@
 import CreepExtension from "./extension"
 import {assignPrototype} from "@/util/utils"
 import {detectStructureBlock, getField} from "./field"
-import {escapeDir, idx} from "./fieldCore"
+import {DIR_DX, DIR_DY, escapeDir, idx} from "./fieldCore"
 
 // 引擎 moveTo 默认允许跨最多 16 个房间寻路。当前房间是大片沼泽、隔壁房是平原时，
 // 最便宜的路径会绕出房间再绕回来；而 Room.findPath 收尾时会在第一个房外格子处截断
@@ -32,6 +32,57 @@ function isDynamicTarget(target: any): boolean {
         return true
     }
     return false
+}
+
+/**
+ * 沿距离场把 creep 到目标的整条路径追出来画成折线。
+ * 改走距离场之后原生 moveTo 不再执行，visualizePathStyle 本来是空转的。
+ * 纯装饰：global.visPath === false 时直接返回（默认开）。
+ * 每房间每 tick 复用一个 RoomVisual，避免每只 creep 建一个。
+ */
+function drawFieldPath(creep: Creep, dirs: Uint8Array, style: any): void {
+    const g = global as any
+    if (g.visPath === false) {
+        return
+    }
+    let x = creep.pos.x
+    let y = creep.pos.y
+    const points: { x: number, y: number }[] = [{x, y}]
+    // 与场大小同阶的上限，防止 dirs 里出现自环时死循环
+    for (let i = 0; i < 50; i++) {
+        const d = dirs[idx(x, y)]
+        if (!d) {
+            break
+        }
+        x += DIR_DX[d]
+        y += DIR_DY[d]
+        points.push({x, y})
+    }
+    if (points.length < 2) {
+        return
+    }
+    if (!g.__vis || g.__vis.tick !== Game.time) {
+        g.__vis = {tick: Game.time, rooms: {}}
+    }
+    let vis = g.__vis.rooms[creep.room.name]
+    if (!vis) {
+        vis = g.__vis.rooms[creep.room.name] = new RoomVisual(creep.room.name)
+    }
+    // 官服是 polyline；私服引擎 4.2.20 只有 poly/line。装饰代码绝不能让主循环炸掉。
+    try {
+        const anyVis = vis as any
+        if (typeof anyVis.polyline === 'function') {
+            anyVis.polyline(points, style)
+        } else if (typeof anyVis.poly === 'function') {
+            anyVis.poly(points, style)
+        } else {
+            for (let i = 1; i < points.length; i++) {
+                anyVis.line(points[i - 1].x, points[i - 1].y, points[i].x, points[i].y, style)
+            }
+        }
+    } catch (e) {
+        // 可视化失败不影响移动
+    }
 }
 
 function moveToInRoom(this: Creep, firstArg: any, secondArg?: any, thirdArg?: any): CreepMoveReturnCode {
@@ -101,6 +152,10 @@ function moveToInRoom(this: Creep, firstArg: any, secondArg?: any, thirdArg?: an
     }
 
     const dir = field.dirs[idx(this.pos.x, this.pos.y)]
+    if (dir && opts && opts.visualizePathStyle) {
+        // 渲染用：沿场把整条路追出来，颜色沿用调用处的 visualizePathStyle
+        drawFieldPath(this, field.dirs, opts.visualizePathStyle)
+    }
     if (!dir) {
         if (this.pos.inRangeTo(pos, field.range)) {
             return OK

@@ -18,7 +18,7 @@ export const loop = errorMapper(() => {
     structureControl()
     creepControl()
     roomControl()
-    //generatePixel()
+    generatePixel()
     for (const room in Game.rooms) {
         // getBiggestSquare(11, room)
         // visualize(totalCluster1, room, 15, 12, Game.time % 9)
@@ -74,7 +74,8 @@ function creepControl() {
  * 生成 pixel
  */
 function generatePixel(): void {
-    if (Game.cpu.bucket == 10000) {
+    // 私服没有 Game.cpu.generatePixel（但 bucket 可能是 10000），必须判一下类型
+    if (Game.cpu.bucket == 10000 && typeof Game.cpu.generatePixel === 'function') {
         Game.cpu.generatePixel();
     }
 }
