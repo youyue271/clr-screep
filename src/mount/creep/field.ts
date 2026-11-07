@@ -107,7 +107,7 @@ function findContainerTile(source: Source): number | null {
 
 /**
  * 常驻站位：按任务分配算，不看 creep 当前位置。
- * harvester 的采矿站位是固定格；upgrader 的工位由 upgradeSlot 模块分配后写进 memory。
+ * harvester 的采矿站位是固定格（掉落要进同格 container）。
  */
 export function harvesterStationTile(creep: Creep, roomName: string): number | null {
     const work = creep.memory.currentWork
@@ -136,9 +136,9 @@ export function harvesterStationTile(creep: Creep, roomName: string): number | n
 }
 
 /**
- * 封禁集合 = harvester 常驻站位（任务推导） + upgrader 工位（memory.upgradeSlot）。
- * 两者都是"按任务/分配算"的静态格，不随 creep 当前位置变化：
- * 工位分配/释放、harvester 换岗、结构变化时才会改，场按下面的规则惰性失效。
+ * 封禁集合 = harvester 常驻站位（任务推导）。
+ * 是"按任务算"的静态格，不随 creep 当前位置变化；harvester 换岗、结构变化时才会改，
+ * 场按下面的规则惰性失效。upgrader 不再预分工位，站位由 trafficControl 动态展开。
  */
 function computeBlocked(room: Room, st: RoomTraffic): { key: string, tiles: Uint8Array, count: number } {
     const tiles = new Uint8Array(FT_SIZE)
@@ -149,13 +149,6 @@ function computeBlocked(room: Room, st: RoomTraffic): { key: string, tiles: Uint
             const tile = harvesterStationTile(creep, room.name)
             if (tile !== null && tile >= 0 && tile < FT_SIZE) {
                 tiles[tile] = 1
-            }
-        }
-        const slot = creep.memory.upgradeSlot
-        if (slot && typeof slot[0] === 'number' && typeof slot[1] === 'number') {
-            const i = idx(slot[0], slot[1])
-            if (i >= 0 && i < FT_SIZE) {
-                tiles[i] = 1
             }
         }
     }

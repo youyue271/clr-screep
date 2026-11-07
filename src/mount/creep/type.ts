@@ -18,9 +18,6 @@ interface CreepMemory {
     // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
     // 每个目标房常驻一只，避免一只 claimer 在多房间之间来回跑
     claimerTarget?: string
-    // upgrader 工位（控制器半径 3 内的固定格）：由 upgradeSlot 模块分配，
-    // 同时被写进距离场封禁集合，避免所有 upgrader 挤在同一侧
-    upgradeSlot?: [number, number]
 }
 
 type Role = 'worker'

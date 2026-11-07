@@ -2,7 +2,6 @@ import { getEnergyTask } from "@/task/roomTask";
 import { remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { recordRoomIntel } from "@/global/autoplan/remotePlan";
-import { getUpgradeSlot } from "./upgradeSlot";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
@@ -279,11 +278,6 @@ export default class CreepExtension extends Creep {
         this.releaseCurrentWork()
         this.memory.oldRole = this.memory.role
         this.memory.role = role
-        // 工位跟着 worker 身份走：没能量去取能（emptyWorker）期间保留，
-        // 转成别的职业才释放，避免每趟取能都改一次封禁集合并重建距离场。
-        if (role !== 'worker' && role !== 'emptyWorker') {
-            delete this.memory.upgradeSlot
-        }
         return true
     }
 
@@ -530,31 +524,18 @@ export default class CreepExtension extends Creep {
             return true
         }
         this.say("⚡升本!")
-        // 在升级距离内就先干活，走去工位的路上也不浪费进度（upgradeController 的 range 3）
-        const inRange = this.pos.inRangeTo(controller, 3)
-        if (inRange) {
-            this.upgradeController(controller)
-        }
-        // 工位表算的是"当前房间"的控制器。worker 跑到隔壁房时，getUpgradeSlot 会按
-        // 那边的（可能是中立）控制器找工位，人就站在错误位置不动，任务位还被占着。
-        // 不在任务控制器所在房间时，先走回目标房间，本 tick 不认工位。
+        // 跨房间时先走回控制器所在房，避免用当前房间的坐标解释目标
         if (this.room.name !== controller.pos.roomName) {
             this.moveToRoom(controller.pos.roomName)
             return false
         }
-        const slotTile = getUpgradeSlot(this, controller)
-        if (slotTile < 0) {
-            // 没有可用工位（窄房/控制器被墙围死）：退回原来的 range 3 寻路
-            if (!inRange) {
-                this.moveTo(controller, {range: 3, visualizePathStyle: {stroke: '#ffffff'}})
-            }
+        // upgradeController 的生效距离是 3：在范围里就干活，否则用 range 3 走到位。
+        // 多人站位不再预分工位，由 trafficControl 的"范围内让位"动态展开。
+        if (this.pos.inRangeTo(controller, 3)) {
+            this.upgradeController(controller)
             return false
         }
-        // 已经在工位上就不用再造 RoomPosition / 寻路
-        if (this.pos.y * 50 + this.pos.x !== slotTile) {
-            const slot = new RoomPosition(slotTile % 50, (slotTile / 50) | 0, this.room.name)
-            this.moveTo(slot, {visualizePathStyle: {stroke: '#ffffff'}})
-        }
+        this.moveTo(controller, {range: 3, visualizePathStyle: {stroke: '#ffffff'}})
         return false
     }
 
@@ -680,7 +661,9 @@ export default class CreepExtension extends Creep {
         this.say("🔧维修中")
         const res = this.repair(target)
         if (res == ERR_NOT_IN_RANGE) {
-            this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}})
+            // repair 的生效距离是 3：用 range 3 让距离场停在第一个可修的格，
+            // 不要像以前那样往目标格本身挤，多个 repairer 才能分散站位。
+            this.moveTo(target, {range: 3, visualizePathStyle: {stroke: '#ffffff'}})
             return false
         }
         if (res == OK) {
@@ -705,7 +688,10 @@ export default class CreepExtension extends Creep {
             }
             const res = this.build(target)
             if (res == ERR_NOT_IN_RANGE) {
-                this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}});
+                // build 的生效距离是 3：用 range 3 让距离场停在第一个可建造的格。
+                // 以前目标是 range 0，所有 builder 都往工地那一格挤，站进 range 3 的人
+                // 还会被后面的人推开（对穿反复互换位置），工地只有一个工位在产出。
+                this.moveTo(target, {range: 3, visualizePathStyle: {stroke: '#ffffff'}});
                 return false
             } else if (res == OK) {
                 // 只有这一下会把工地打满时才在下一 tick 触发 onBuild；

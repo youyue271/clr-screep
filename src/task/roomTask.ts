@@ -12,7 +12,6 @@ import {
     upgradeTaskCapacity,
     wallSetting
 } from "@/setting";
-import {upgradeBerths} from "@/mount/creep/upgradeSlot";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -85,10 +84,7 @@ export function upgradeTaskCapacityOf(room: Room): number {
         }
         capacity = Math.max(base, Math.min(upgradeSetting.maxCapacity, workerCount))
     }
-    // 工位数量是硬上限：没有工位的 upgrader 会退回旧行为并重新挤在一起。
-    // 工位表算不出来（窄房/无门）时 capacity 为 0，此时不封顶，保持旧行为。
-    const berths = upgradeBerths(room).capacity
-    return berths > 0 ? Math.min(capacity, berths) : capacity
+    return capacity
 }
 
 export function upgrade(room: Room): MyTask[] {
