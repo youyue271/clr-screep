@@ -13,10 +13,17 @@ export const spawnSetting = {
 export const spawnTable: { [role in Role]: number[] } = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester':    [0, 0, 0, 0, 0, 0, 0, 0, 0], // harvester 根据房间source数量动态调整
-    'carrier':      [0, 1, 2, 5, 5, 5, 5, 5, 5],
-    // RCL3-7 稳态 6 个足够：无工地时升级并发上限 5，有工地时自动压到 2，
-    // 多出来的 worker 会转成 emptyWorker 和 carrier 抢能量，反而拖 econ
-    'worker':       [0, 3, 6, 6, 6, 6, 6, 6, 3],
+    // 配额按"总 WORK/CARRY 部件与产能匹配"定，而不是按人数拍：
+    // carrier 单趟 CARRY 随等级涨（150 → 1250），所以人数从 5 逐级降到 2，
+    // 总运力反而上升。本地升级能量由 worker 自己从 container 取（energyTask），
+    // carrier 只负责 spawn/extension/tower 补能和回运。
+    'carrier':      [0, 1, 5, 4, 3, 2, 2, 2, 2],
+    // 主矿 2 个矿点：RCL2 产能 16/tick，RCL3+ 24/tick。
+    // worker 有效升级速度 ≈ WORK 数 × 0.8（取能往返占两成）：
+    // RCL2 1 WORK/人 → 12 人；RCL3 2 WORK → 10 人；RCL4 4 WORK → 5 人；
+    // RCL5 6 WORK → 3 人；RCL6 8 WORK → 2 人；RCL7 21 WORK、RCL8 23 WORK → 1 人。
+    // RCL2 的 12 就是 upgradeSetting.maxCapacity 的硬上限，再多也只做建造/维修。
+    'worker':       [0, 3, 12, 10, 5, 3, 2, 1, 1],
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
     // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
