@@ -3378,6 +3378,10 @@ const harvestSetting = {
 const remoteSetting = {
     // 同一个外矿 container 同时允许几个 carrier 去拉
     carryCapacity: 2,
+    // 外矿 transport 车补员门槛：外矿 container 至少存了这么多能量才补车。
+    // 不用本地 container 高水位做门槛——运输车本来就是去把外矿满仓的能量搬回来，
+    // 等本地 container 涨起来，外矿早就满仓、harvester 倒不进去只能睡觉了。
+    carrySpawnEnergy: 800,
     // harvester 修外矿 container 的血量阈值：低于 hitsMax * 该值就优先维修
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
@@ -8288,7 +8292,7 @@ class RoomExtension extends Room {
         var _a, _b;
         // 没绑定矿点的老式孵化任务（或老版本转换出来的车）不计入任何矿点的覆盖
         this.cancelUnboundRemoteSpawnTasks('remoteCarrier');
-        if (!plan.force && !this.remoteGate()) {
+        if (!plan.force && !this.remoteCarryGate()) {
             return;
         }
         const body = getBody('remoteCarrier', this);
@@ -8439,6 +8443,50 @@ class RoomExtension extends Room {
             const container = this.containerById(id);
             if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) >= watermark.high) {
                 return true;
+            }
+        }
+        return false;
+    }
+    /**
+     * 外矿运输车专用门槛：本地 container 高水位这条对运输车不成立——
+     * 运输车本来就是去把外矿满仓的能量搬回主房，等本地 container 涨到高水位，
+     * 外矿早就满仓、harvester 倒不进去只能睡觉。
+     * 改成看"外矿是否真的有货可拉"：能量满 + 没有低优先级孵化任务 +
+     * 任一外矿 container 存够一车的量（remoteSetting.carrySpawnEnergy）。
+     */
+    remoteCarryGate() {
+        var _a, _b, _c, _d;
+        if (!this.controller) {
+            return false;
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
+        for (const key in spawnBuckets) {
+            if (Number(key) < 3 && ((_a = spawnBuckets[key]) !== null && _a !== void 0 ? _a : []).length) {
+                return false;
+            }
+        }
+        if (this.energyAvailable < this.energyCapacityAvailable) {
+            return false;
+        }
+        const plan = (_b = Memory.remotePlan) === null || _b === void 0 ? void 0 : _b[this.name];
+        if (!plan || plan.enabled === false) {
+            return false;
+        }
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName];
+            if (!state || state.enabled === false) {
+                continue;
+            }
+            for (const sourceId in (_c = state.sources) !== null && _c !== void 0 ? _c : {}) {
+                const containerId = (_d = state.sources[sourceId]) === null || _d === void 0 ? void 0 : _d.containerId;
+                if (!containerId) {
+                    continue;
+                }
+                const container = Game.getObjectById(containerId);
+                if (container
+                    && container.store.getUsedCapacity(RESOURCE_ENERGY) >= remoteSetting.carrySpawnEnergy) {
+                    return true;
+                }
             }
         }
         return false;

@@ -144,6 +144,10 @@ export const harvestSetting = {
 export const remoteSetting = {
     // 同一个外矿 container 同时允许几个 carrier 去拉
     carryCapacity: 2,
+    // 外矿 transport 车补员门槛：外矿 container 至少存了这么多能量才补车。
+    // 不用本地 container 高水位做门槛——运输车本来就是去把外矿满仓的能量搬回来，
+    // 等本地 container 涨起来，外矿早就满仓、harvester 倒不进去只能睡觉了。
+    carrySpawnEnergy: 800,
     // harvester 修外矿 container 的血量阈值：低于 hitsMax * 该值就优先维修
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）

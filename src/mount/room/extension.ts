@@ -1504,7 +1504,7 @@ export default class RoomExtension extends Room {
     private refreshRemoteCarrierSpawn(plan: RemotePlan): void {
         // 没绑定矿点的老式孵化任务（或老版本转换出来的车）不计入任何矿点的覆盖
         this.cancelUnboundRemoteSpawnTasks('remoteCarrier')
-        if (!plan.force && !this.remoteGate()) {
+        if (!plan.force && !this.remoteCarryGate()) {
             return
         }
         const body = getBody('remoteCarrier', this)
@@ -1660,6 +1660,50 @@ export default class RoomExtension extends Room {
             const container = this.containerById(id)
             if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) >= watermark.high) {
                 return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 外矿运输车专用门槛：本地 container 高水位这条对运输车不成立——
+     * 运输车本来就是去把外矿满仓的能量搬回主房，等本地 container 涨到高水位，
+     * 外矿早就满仓、harvester 倒不进去只能睡觉。
+     * 改成看"外矿是否真的有货可拉"：能量满 + 没有低优先级孵化任务 +
+     * 任一外矿 container 存够一车的量（remoteSetting.carrySpawnEnergy）。
+     */
+    private remoteCarryGate(): boolean {
+        if (!this.controller) {
+            return false
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            if (Number(key) < 3 && (spawnBuckets[key] ?? []).length) {
+                return false
+            }
+        }
+        if (this.energyAvailable < this.energyCapacityAvailable) {
+            return false
+        }
+        const plan = Memory.remotePlan?.[this.name]
+        if (!plan || plan.enabled === false) {
+            return false
+        }
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            for (const sourceId in state.sources ?? {}) {
+                const containerId = state.sources[sourceId]?.containerId
+                if (!containerId) {
+                    continue
+                }
+                const container = Game.getObjectById(containerId as Id<StructureContainer>)
+                if (container
+                    && container.store.getUsedCapacity(RESOURCE_ENERGY) >= remoteSetting.carrySpawnEnergy) {
+                    return true
+                }
             }
         }
         return false
