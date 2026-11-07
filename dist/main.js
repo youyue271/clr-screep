@@ -3300,8 +3300,6 @@ const containerWatermark = [
 ];
 // 单个 container 同时允许几个 creep 取能的上限（按 RCL）
 const containerConcurrency = [0, 1, 2, 3, 4, 4, 5, 5, 5];
-// container 列表的兜底刷新间隔。建成有 buildOver 事件，这里只处理漏网/被拆。
-const containerScanInterval = 100;
 // 掉落物/墓碑的机会队列：按衰减速度 + 距离评分，只保留前几条
 const opportunitySetting = {
     maxTasks: 4,
@@ -3479,7 +3477,7 @@ function getContainerEnergy(room) {
     const avgCarry = room.avgCarrierCapacity();
     const tasks = [];
     for (const containerId of containerIds) {
-        const container = Game.getObjectById(containerId);
+        const container = room.containerById(containerId);
         if (!container) {
             continue;
         }
@@ -4527,10 +4525,10 @@ class CreepExtension extends Creep {
             }
         }
         else {
-            // 高优先级补能任务自带取能：carrier 直接去能量最多的 container 取，
+            // 高优先级补能任务自带取能：carrier 按由近到远去 container 取，
             // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
             // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
-            const source = this.room.bestEnergyContainer();
+            const source = this.room.bestEnergyContainer(this.store.getFreeCapacity(resourceType));
             if (source) {
                 this.say("⚡补能取能");
                 const res = this.withdraw(source, resourceType);
@@ -5246,7 +5244,7 @@ class CreepExtension extends Creep {
             return this.room.storage;
         }
         for (const id of this.room.getContainer()) {
-            const container = Game.getObjectById(id);
+            const container = this.room.containerById(id);
             if (container && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                 return container;
             }
@@ -8029,7 +8027,7 @@ class RoomExtension extends Room {
         const level = this.controller.level;
         const watermark = (_b = containerWatermark[level]) !== null && _b !== void 0 ? _b : containerWatermark[0];
         for (const id of this.getContainer()) {
-            const container = Game.getObjectById(id);
+            const container = this.containerById(id);
             if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) >= watermark.high) {
                 return true;
             }
@@ -8037,35 +8035,42 @@ class RoomExtension extends Room {
         return false;
     }
     /**
-     * 取能量最多的 container（高于低水位才可取）。
+     * 取能 container：按 getContainer() 的顺序（离阵型中心由近到远）扫描，
+     * 先找一车能装满的，没有就退回最近的、高于低水位的那个。
+     * carrier 不需要分散，越近越好；worker 的分散交给任务队列的 reservedBy 排序。
      * 给 carryTask 自带取能用：carrier 保持 priority 1 的补能任务，
      * 不需要降级成 emptyWorker 去和 worker 抢通用 energyTask。
      */
-    bestEnergyContainer() {
+    bestEnergyContainer(freeCapacity = 0) {
         var _a;
         const level = this.controller ? this.controller.level : 0;
         const low = ((_a = containerWatermark[level]) !== null && _a !== void 0 ? _a : containerWatermark[0]).low;
-        let best;
-        let bestEnergy = low;
-        for (const id of this.getContainer()) {
-            const container = Game.getObjectById(id);
-            if (!container) {
-                continue;
-            }
-            const energy = container.store.getUsedCapacity(RESOURCE_ENERGY);
-            if (energy > bestEnergy) {
-                best = container;
-                bestEnergy = energy;
-            }
-        }
         // 中央 link 优先搬：外矿 link 转发过来的能量堆在这里，满了外矿 carrier
         // 就只能绕路回主房投递。link 在基地核心，取一趟很短，有能量就顺路带走；
-        // 取空后下一 tick 自然回退到 container。
+        // 取空后下一 tick 自然回退到 container。后面由专用中央 carrier 接管。
         const core = this.getCoreLink();
         if (core && core.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
             return core;
         }
-        return best;
+        let fallback;
+        for (const id of this.getContainer()) {
+            const container = this.containerById(id);
+            if (!container) {
+                continue;
+            }
+            const energy = container.store.getUsedCapacity(RESOURCE_ENERGY);
+            if (energy <= low) {
+                continue;
+            }
+            if (!fallback) {
+                fallback = container;
+            }
+            // 够装满这一车就直接拿，少跑一趟
+            if (energy >= freeCapacity) {
+                return container;
+            }
+        }
+        return fallback;
     }
     /**
      * 有视野时把外矿矿点/container 的最新情况写回顶层缓存。
@@ -8114,7 +8119,7 @@ class RoomExtension extends Room {
         let best;
         let bestFree = 0;
         for (const id of this.getContainer()) {
-            const container = Game.getObjectById(id);
+            const container = this.containerById(id);
             if (!container) {
                 continue;
             }
@@ -9074,8 +9079,8 @@ class RoomExtension extends Room {
         return global.room[this.name].resources;
     }
     /**
-     * 容器 id 列表。以前取到一次就永久缓存，新 container 建成后永远进不来；
-     * 现在按 containerScanInterval 兜底刷新，建成时由 buildOver 立即刷新。
+     * 容器 id 列表。新建由 buildOver 立即刷新；被拆时由第一个撞到死 id 的
+     * 调用方（containerById）登记下一 tick 的刷新，不再定时全量扫描。
      */
     getContainer() {
         if (!global.room[this.name]) {
@@ -9087,7 +9092,7 @@ class RoomExtension extends Room {
         return global.room[this.name].container;
     }
     refreshContainers() {
-        var _a;
+        var _a, _b;
         if (!global.room[this.name]) {
             global.room[this.name] = {};
         }
@@ -9104,9 +9109,67 @@ class RoomExtension extends Room {
                 containers.push(structure.id);
             }
         }
+        // 按到阵型中心的距离排序：近的排前面，carrier 取能和任务队列的插入顺序都直接受益。
+        // 只排缓存列表，不改 containerPos()：那里的下标还和旧缓存/矿点映射绑定。
+        const anchor = this.memory.roomPlanType === 2 && ((_b = this.memory.plan2Pos) === null || _b === void 0 ? void 0 : _b.core)
+            ? this.memory.plan2Pos.core
+            : this.memory.plan1Pos;
+        if (anchor) {
+            const center = this.getPositionAt(anchor[0], anchor[1]);
+            if (center) {
+                containers.sort((a, b) => {
+                    const containerA = Game.getObjectById(a);
+                    const containerB = Game.getObjectById(b);
+                    if (!containerA || !containerB) {
+                        return 0;
+                    }
+                    return center.getRangeTo(containerA) - center.getRangeTo(containerB);
+                });
+            }
+        }
         global.room[this.name].container = containers;
-        global.room[this.name].lastContainerScan = Game.time;
         return containers;
+    }
+    /**
+     * 按 id 取 container。id 已经失效（container 被拆）时登记下一 tick 的刷新，
+     * 把死 id 从缓存里清掉；正常取到的路径和 Game.getObjectById 一样便宜。
+     */
+    containerById(id) {
+        const container = Game.getObjectById(id);
+        if (!container) {
+            this.requestContainerRefresh();
+        }
+        return container;
+    }
+    /**
+     * 补建 container 工地后的下一 tick：把该位置的工地登记进建造任务。
+     * 工地创建当 tick 查不到，所以要事件延后一 tick。
+     */
+    registerContainerSiteTask(x, y) {
+        const pos = this.getPositionAt(x, y);
+        const site = pos === null || pos === void 0 ? void 0 : pos.lookFor(LOOK_CONSTRUCTION_SITES).find(item => item.structureType === STRUCTURE_CONTAINER);
+        if (site && !this.hasBuildTaskFor(site.id)) {
+            this.registTask(createBuildTask([site]));
+        }
+    }
+    /**
+     * 容器被拆后的缓存清理：下一 tick 重扫一次 container 列表。
+     * 同一 tick 里多个 creep/任务同时撞到死 id 只登记一次。
+     */
+    requestContainerRefresh() {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {};
+        }
+        const cache = global.room[this.name];
+        if (cache.containerRefreshQueuedTick === Game.time) {
+            return;
+        }
+        cache.containerRefreshQueuedTick = Game.time;
+        this.registEvent({
+            triggerTime: Game.time + 1,
+            triggerFunc: 'refreshContainers',
+            param: []
+        });
     }
     /**
      * 存活 carrier 的平均载重。取能任务的并发数按它算：
@@ -9201,10 +9264,23 @@ class RoomExtension extends Room {
             }
             if (cachedPos) {
                 const pos = this.getPositionAt(cachedPos[0], cachedPos[1]);
-                if (pos) {
+                // 能走到这里说明矿点周围已经没有 container / 工地，缓存坐标是旧 container 的位置。
+                // 优先在原位置补工地：坐标不变，路径和 link 规划都不用重算；
+                // 只有原位置已经被别的建筑占了，才丢掉缓存走下面的重新选点。
+                if (pos && !pos.lookFor(LOOK_STRUCTURES).length && !pos.lookFor(LOOK_CONSTRUCTION_SITES).length) {
                     rememberPos(item, pos);
+                    if (this.createConstructionSite(pos.x, pos.y, STRUCTURE_CONTAINER) === OK) {
+                        // 新工地当 tick 查不到（引擎下一 tick 才生效），下 tick 再登记建造任务。
+                        // 下一个 checkRoomLevel 可能要几千 tick，不能等它。
+                        this.registEvent({
+                            triggerTime: Game.time + 1,
+                            triggerFunc: 'registerContainerSiteTask',
+                            param: [pos.x, pos.y]
+                        });
+                    }
+                    return;
                 }
-                return;
+                delete byId[item];
             }
             const direction = [
                 [-1, -1], [-1, 0], [-1, 1],
@@ -9741,11 +9817,8 @@ class RoomScanExtension extends Room {
             cache.lastEnergyStructureScan = now;
             this.refreshEnergyStructures();
         }
-        // 兜底刷新 container 列表（建成有 buildOver 事件，这里处理漏网/被拆）
-        if (cache.lastContainerScan === undefined
-            || now - cache.lastContainerScan >= containerScanInterval) {
-            this.refreshContainers();
-        }
+        // container 列表不再定时扫描：新建由 buildOver 刷新，
+        // 被拆时由 containerById 撞到死 id 后登记下一 tick 的 refreshContainers 事件。
     }
     refreshThreat(cache) {
         var _a;

@@ -104,7 +104,7 @@ export function getContainerEnergy(room: Room): MyTask[] {
     const avgCarry = room.avgCarrierCapacity()
     const tasks: MyTask[] = []
     for (const containerId of containerIds) {
-        const container = Game.getObjectById<StructureContainer>(containerId)
+        const container = room.containerById(containerId)
         if (!container) {
             continue
         }

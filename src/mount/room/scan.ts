@@ -1,4 +1,4 @@
-import {containerScanInterval, energyStructureScanInterval, repairPriority, towerSetting, wallSetting} from "@/setting";
+import {energyStructureScanInterval, repairPriority, towerSetting, wallSetting} from "@/setting";
 
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
@@ -55,11 +55,8 @@ export default class RoomScanExtension extends Room {
             cache.lastEnergyStructureScan = now
             this.refreshEnergyStructures()
         }
-        // 兜底刷新 container 列表（建成有 buildOver 事件，这里处理漏网/被拆）
-        if (cache.lastContainerScan === undefined
-            || now - cache.lastContainerScan >= containerScanInterval) {
-            this.refreshContainers()
-        }
+        // container 列表不再定时扫描：新建由 buildOver 刷新，
+        // 被拆时由 containerById 撞到死 id 后登记下一 tick 的 refreshContainers 事件。
     }
 
     private refreshThreat(cache: RoomGlobalCache): void {

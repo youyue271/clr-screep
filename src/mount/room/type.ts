@@ -159,9 +159,11 @@ interface Room {
     addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
 
     /**
-     * 取能量最多且高于低水位的 container / 中央 link，carryTask 自带取能时用
+     * 按 getContainer() 顺序（离阵型中心由近到远）选容器：优先能装满
+     * freeCapacity 的，否则最近的、高于低水位的那个。中央 link 有能量时优先。
+     * carryTask 自带取能时用。
      */
-    bestEnergyContainer(): StructureLink | StructureContainer | undefined
+    bestEnergyContainer(freeCapacity?: number): StructureLink | StructureContainer | undefined
 
     ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>): void
 
@@ -293,6 +295,21 @@ interface Room {
     getContainer(): Id<StructureContainer>[]
 
     refreshContainers(): Id<StructureContainer>[]
+
+    /**
+     * 按 id 取 container；id 失效时登记下一 tick 的 refreshContainers 事件
+     */
+    containerById(id: Id<StructureContainer>): StructureContainer | undefined
+
+    /**
+     * 登记下一 tick 的容器列表刷新（同一 tick 只登记一次）
+     */
+    requestContainerRefresh(): void
+
+    /**
+     * 补建 container 工地后的下一 tick：把该位置的工地登记进建造任务
+     */
+    registerContainerSiteTask(x: number, y: number): void
 
     avgCarrierCapacity(): number
 

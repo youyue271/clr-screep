@@ -60,9 +60,6 @@ export const containerWatermark = [
 // 单个 container 同时允许几个 creep 取能的上限（按 RCL）
 export const containerConcurrency = [0, 1, 2, 3, 4, 4, 5, 5, 5]
 
-// container 列表的兜底刷新间隔。建成有 buildOver 事件，这里只处理漏网/被拆。
-export const containerScanInterval = 100
-
 // 掉落物/墓碑的机会队列：按衰减速度 + 距离评分，只保留前几条
 export const opportunitySetting = {
     maxTasks: 4,
