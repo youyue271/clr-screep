@@ -4,7 +4,7 @@ import log from "@/util/log";
 import {containerWatermark, harvestSetting, remoteSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
 import {createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
-import {planRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
+import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
 
 export default class RoomExtension extends Room {
     /**
@@ -566,6 +566,9 @@ export default class RoomExtension extends Room {
         if (plan.enabled === false) {
             return
         }
+        // 探明没矿 / highway 的旧条目先清掉：早期未知房会先占坑，
+        // 不清的话会一直占 maxRooms 名额，还会让 claimer 去没有 controller 的房驻守。
+        pruneSourcelessRemoteRooms(plan, Memory.mapIntel)
         let active = 0
         for (const roomName in plan.rooms) {
             if (!Memory.mapIntel?.[roomName]?.unsafe) {
@@ -700,6 +703,11 @@ export default class RoomExtension extends Room {
             }
             const intel = Memory.mapIntel?.[roomName]
             if (intel?.unsafe || intel?.unreachable) {
+                continue
+            }
+            // highway / 探明无 source：没有 controller 可保留，别孵 claimer 去边界打转
+            const sources = intel?.sources
+            if (isHighwayRoom(roomName) || (Array.isArray(sources) && sources.length === 0)) {
                 continue
             }
             if (!this.hasClaimerFor(roomName)) {

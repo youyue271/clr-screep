@@ -1111,6 +1111,17 @@ export default class CreepExtension extends Creep {
      * 否则所有 claimer 会在一次推送里集体解绑回家。
      */
     private isReserveTargetValid(homeRoom: string, roomName: string): boolean {
+        // 侦察已确认没有 source（多是 highway 通道房），或现场看到没有 controller：
+        // 没有可保留的控制器。继续驻守只会让 claimer 在房间出口格上来回弹。
+        const intel = Memory.mapIntel?.[roomName]
+        const sources = intel?.sources
+        if (Array.isArray(sources) && sources.length === 0) {
+            return false
+        }
+        const liveRoom = Game.rooms[roomName]
+        if (liveRoom && !liveRoom.controller) {
+            return false
+        }
         const plan = Memory.remotePlan?.[homeRoom]
         if (!plan) {
             return true
@@ -1126,7 +1137,6 @@ export default class CreepExtension extends Creep {
             // 已经不在计划里：通常是我们把它占了；没视野时先保持绑定
             return !Game.rooms[roomName]?.controller?.my
         }
-        const intel = Memory.mapIntel?.[roomName]
         return !(intel?.unsafe || intel?.unreachable)
     }
 
@@ -1193,6 +1203,13 @@ export default class CreepExtension extends Creep {
         }
         const controller = this.room.controller
         if (!controller) {
+            // highway / 无 controller 房：记下"没矿"让计划与补员逻辑自愈，解绑回家。
+            // 不能只 return —— 停在出口格上会被引擎每 tick 弹回隔壁房（W34S50 实测）。
+            recordRoomIntel(homeRoom, this.room)
+            delete this.memory.claimerTarget
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+            }
             return false
         }
         if (controller.owner) {

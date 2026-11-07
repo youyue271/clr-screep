@@ -3816,6 +3816,42 @@ const colors = {
 const loggerInstance = new logger();
 
 /**
+ * highway 通道房：房间名坐标能被 10 整除（如 W34S50、W40S49）。
+ * 这类房没有 controller、没有 source，不能占领/保留；
+ * 早期规划对"没探过"的相邻房一律当候选，必须靠房名先挡掉。
+ */
+function isHighwayRoom(roomName) {
+    const m = /^([WE])(\d+)([NS])(\d+)$/.exec(roomName);
+    if (!m) {
+        return false;
+    }
+    return parseInt(m[2], 10) % 10 === 0 || parseInt(m[4], 10) % 10 === 0;
+}
+/**
+ * 清掉计划里已经确定没有源的房（highway / 侦察确认无 source）。
+ * 早期规划先于侦察，未知房会先占坑；探明后必须能自愈，
+ * 否则会一直占 maxRooms 名额，并让 claimer 去一个没有 controller 的房常驻
+ * —— 在出口格上原地打转（W34S50 实测）。
+ * 返回被清掉的房名，方便调用方记日志/测试。
+ */
+function pruneSourcelessRemoteRooms(plan, intelMap) {
+    var _a;
+    const removed = [];
+    for (const roomName in plan.rooms) {
+        if (isHighwayRoom(roomName)) {
+            delete plan.rooms[roomName];
+            removed.push(roomName);
+            continue;
+        }
+        const sources = (_a = intelMap === null || intelMap === void 0 ? void 0 : intelMap[roomName]) === null || _a === void 0 ? void 0 : _a.sources;
+        if (Array.isArray(sources) && sources.length === 0) {
+            delete plan.rooms[roomName];
+            removed.push(roomName);
+        }
+    }
+    return removed;
+}
+/**
  * 外矿房自动规划：
  * - 相邻房用 Game.map.describeExits 拿，不需要视野、开销很小
  * - 已知 unsafe（有主/被他人 reserve/有敌对）的房直接排除
@@ -3833,7 +3869,7 @@ function planRemoteRooms(homeRoomName) {
     const candidates = [];
     for (const dir in exits) {
         const name = exits[dir];
-        if (!name || seen[name]) {
+        if (!name || seen[name] || isHighwayRoom(name)) {
             continue;
         }
         seen[name] = true;
@@ -5056,22 +5092,32 @@ class CreepExtension extends Creep {
      */
     isReserveTargetValid(homeRoom, roomName) {
         var _a, _b, _c, _d, _e;
-        const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom];
+        // 侦察已确认没有 source（多是 highway 通道房），或现场看到没有 controller：
+        // 没有可保留的控制器。继续驻守只会让 claimer 在房间出口格上来回弹。
+        const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName];
+        const sources = intel === null || intel === void 0 ? void 0 : intel.sources;
+        if (Array.isArray(sources) && sources.length === 0) {
+            return false;
+        }
+        const liveRoom = Game.rooms[roomName];
+        if (liveRoom && !liveRoom.controller) {
+            return false;
+        }
+        const plan = (_b = Memory.remotePlan) === null || _b === void 0 ? void 0 : _b[homeRoom];
         if (!plan) {
             return true;
         }
         if (plan.enabled === false) {
             return false;
         }
-        const state = (_b = plan.rooms) === null || _b === void 0 ? void 0 : _b[roomName];
+        const state = (_c = plan.rooms) === null || _c === void 0 ? void 0 : _c[roomName];
         if (state && state.enabled === false) {
             return false;
         }
         if (!state) {
             // 已经不在计划里：通常是我们把它占了；没视野时先保持绑定
-            return !((_d = (_c = Game.rooms[roomName]) === null || _c === void 0 ? void 0 : _c.controller) === null || _d === void 0 ? void 0 : _d.my);
+            return !((_e = (_d = Game.rooms[roomName]) === null || _d === void 0 ? void 0 : _d.controller) === null || _e === void 0 ? void 0 : _e.my);
         }
-        const intel = (_e = Memory.mapIntel) === null || _e === void 0 ? void 0 : _e[roomName];
         return !((intel === null || intel === void 0 ? void 0 : intel.unsafe) || (intel === null || intel === void 0 ? void 0 : intel.unreachable));
     }
     tryClaimRoom(homeRoom, roomName, entry) {
@@ -5138,6 +5184,13 @@ class CreepExtension extends Creep {
         }
         const controller = this.room.controller;
         if (!controller) {
+            // highway / 无 controller 房：记下"没矿"让计划与补员逻辑自愈，解绑回家。
+            // 不能只 return —— 停在出口格上会被引擎每 tick 弹回隔壁房（W34S50 实测）。
+            recordRoomIntel(homeRoom, this.room);
+            delete this.memory.claimerTarget;
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom);
+            }
             return false;
         }
         if (controller.owner) {
@@ -7120,6 +7173,9 @@ class RoomExtension extends Room {
         if (plan.enabled === false) {
             return;
         }
+        // 探明没矿 / highway 的旧条目先清掉：早期未知房会先占坑，
+        // 不清的话会一直占 maxRooms 名额，还会让 claimer 去没有 controller 的房驻守。
+        pruneSourcelessRemoteRooms(plan, Memory.mapIntel);
         let active = 0;
         for (const roomName in plan.rooms) {
             if (!((_c = (_b = Memory.mapIntel) === null || _b === void 0 ? void 0 : _b[roomName]) === null || _c === void 0 ? void 0 : _c.unsafe)) {
@@ -7252,6 +7308,11 @@ class RoomExtension extends Room {
             }
             const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName];
             if ((intel === null || intel === void 0 ? void 0 : intel.unsafe) || (intel === null || intel === void 0 ? void 0 : intel.unreachable)) {
+                continue;
+            }
+            // highway / 探明无 source：没有 controller 可保留，别孵 claimer 去边界打转
+            const sources = intel === null || intel === void 0 ? void 0 : intel.sources;
+            if (isHighwayRoom(roomName) || (Array.isArray(sources) && sources.length === 0)) {
                 continue;
             }
             if (!this.hasClaimerFor(roomName)) {
