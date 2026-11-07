@@ -12,6 +12,7 @@ import {
     upgradeTaskCapacity,
     wallSetting
 } from "@/setting";
+import {upgradeBerths} from "@/mount/creep/upgradeSlot";
 
 /**
  * 采集资源Task的包装类, 将room中所有资源转换为采集Task并返回
@@ -58,21 +59,27 @@ export function upgradeTaskCapacityOf(room: Room): number {
     if (!base) {
         return 0
     }
+    let capacity: number
     if (room.find(FIND_CONSTRUCTION_SITES).length > 0) {
         // 有工地时压低升级并发（最多 2 个）：把有能量的 worker 让给建造，
         // 尤其是 priority 1 的 extension 工地；工地清零后再按 worker 数放开。
-        return Math.max(1, Math.min(base, 2))
+        capacity = Math.max(1, Math.min(base, 2))
+    } else {
+        // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
+        const workerCount = room.find(FIND_MY_CREEPS, {
+            filter: creep => {
+                const role = creep.memory.role === 'emptyWorker'
+                    ? creep.memory.oldRole
+                    : creep.memory.role
+                return role === 'worker'
+            }
+        }).length
+        capacity = Math.max(base, Math.min(upgradeSetting.maxCapacity, workerCount))
     }
-    // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
-    const workerCount = room.find(FIND_MY_CREEPS, {
-        filter: creep => {
-            const role = creep.memory.role === 'emptyWorker'
-                ? creep.memory.oldRole
-                : creep.memory.role
-            return role === 'worker'
-        }
-    }).length
-    return Math.max(base, Math.min(upgradeSetting.maxCapacity, workerCount))
+    // 工位数量是硬上限：没有工位的 upgrader 会退回旧行为并重新挤在一起。
+    // 工位表算不出来（窄房/无门）时 capacity 为 0，此时不封顶，保持旧行为。
+    const berths = upgradeBerths(room).capacity
+    return berths > 0 ? Math.min(capacity, berths) : capacity
 }
 
 export function upgrade(room: Room): MyTask[] {

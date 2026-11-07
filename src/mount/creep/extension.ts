@@ -2,6 +2,7 @@ import { getEnergyTask } from "@/task/roomTask";
 import { remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { recordRoomIntel } from "@/global/autoplan/remotePlan";
+import { getUpgradeSlot } from "./upgradeSlot";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
@@ -275,6 +276,11 @@ export default class CreepExtension extends Creep {
         this.releaseCurrentWork()
         this.memory.oldRole = this.memory.role
         this.memory.role = role
+        // 工位跟着 worker 身份走：没能量去取能（emptyWorker）期间保留，
+        // 转成别的职业才释放，避免每趟取能都改一次封禁集合并重建距离场。
+        if (role !== 'worker' && role !== 'emptyWorker') {
+            delete this.memory.upgradeSlot
+        }
         return true
     }
 
@@ -510,17 +516,28 @@ export default class CreepExtension extends Creep {
         if (!controller) {
             return true
         }
-        if (this.store['energy']) {
-            this.say("⚡升本!")
-            if (this.upgradeController(controller) == ERR_NOT_IN_RANGE) {
-                // 升级本来就是 range 3 生效：让场瞄准"能工作的外圈"，
-                // 避免所有人都挤到控制器格/单格进口上
-                this.moveTo(controller, {range: 3, visualizePathStyle: {stroke: '#ffffff'}});
-                return false
-            }
-        } else {
+        if (!this.store['energy']) {
             this.changeRole('emptyWorker')
             return true
+        }
+        this.say("⚡升本!")
+        // 在升级距离内就先干活，走去工位的路上也不浪费进度（upgradeController 的 range 3）
+        const inRange = this.pos.inRangeTo(controller, 3)
+        if (inRange) {
+            this.upgradeController(controller)
+        }
+        const slotTile = getUpgradeSlot(this, controller)
+        if (slotTile < 0) {
+            // 没有可用工位（窄房/控制器被墙围死）：退回原来的 range 3 寻路
+            if (!inRange) {
+                this.moveTo(controller, {range: 3, visualizePathStyle: {stroke: '#ffffff'}})
+            }
+            return false
+        }
+        // 已经在工位上就不用再造 RoomPosition / 寻路
+        if (this.pos.y * 50 + this.pos.x !== slotTile) {
+            const slot = new RoomPosition(slotTile % 50, (slotTile / 50) | 0, this.room.name)
+            this.moveTo(slot, {visualizePathStyle: {stroke: '#ffffff'}})
         }
         return false
     }
