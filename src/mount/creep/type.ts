@@ -8,6 +8,10 @@ interface CreepMemory {
     reSpawn: boolean
     // 提前换班的 harvester 孵化时指定的矿点，保证接替的是同一个矿
     harvestSourceId?: Id<Source>
+    // 外矿运输车孵化时绑定的矿点/外矿房：只领这个矿点 container 的回运任务，
+    // 按"每个矿一只"专门孵化，不再由本地 carrier 转换而来
+    remoteCarrySourceId?: Id<Source>
+    remoteCarryRoom?: string
     // 外矿房停用（敌对/被别人占用/已移出计划）后的召回标记：
     // creep 交还任务回主房原地待命到死，不再被算作该矿点的覆盖
     recall?: boolean
@@ -47,7 +51,7 @@ interface Creep {
      * 如果getWork成功，新工作存入creep的currentWork中
      * 否则，表示creep角色对应的所有工作都做完了
      */
-    getWork(noRemoteConvert?: boolean): boolean
+    getWork(): boolean
 
     /**
      * 主要用于调配相近部件creep的数量关系

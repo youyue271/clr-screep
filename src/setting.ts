@@ -19,22 +19,24 @@ export const spawnTable: { [role in Role]: number[] } = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester':    [0, 0, 0, 0, 0, 0, 0, 0, 0], // harvester 根据房间source数量动态调整
     // 配额按"总 WORK/CARRY 部件与产能匹配"定，而不是按人数拍：
-    // carrier 单趟 CARRY 随等级涨（150 → 1250），所以人数从 5 逐级降到 2，
-    // 总运力反而上升。本地升级能量由 worker 自己从 container 取（energyTask），
+    // 满体型 carrier 单趟 CARRY = 容量/100（RCL2 5 → RCL8 25，250 → 1250），
+    // 按总运力不变配人数：RCL2 3×250≈750、RCL3 2×400=800、RCL4+ 2 只就够。
+    // 保留 2 只作冗余。本地升级能量由 worker 自己从 container 取（energyTask），
     // carrier 只负责 spawn/extension/tower 补能和回运。
-    'carrier':      [0, 1, 5, 4, 3, 2, 2, 2, 2],
-    // 主矿 2 个矿点：RCL2 产能 16/tick，RCL3+ 24/tick。
-    // worker 有效升级速度 ≈ WORK 数 × 0.8（取能往返占两成）：
-    // RCL2 1 WORK/人 → 12 人；RCL3 2 WORK → 10 人；RCL4 4 WORK → 5 人；
-    // RCL5 6 WORK → 3 人；RCL6 8 WORK → 2 人；RCL7 21 WORK、RCL8 23 WORK → 1 人。
-    // RCL2 的 12 就是 upgradeSetting.maxCapacity 的硬上限，再多也只做建造/维修。
-    'worker':       [0, 3, 12, 10, 5, 3, 2, 1, 1],
+    'carrier':      [0, 1, 3, 2, 2, 2, 2, 2, 2],
+    // 主矿 2 个矿点：RCL2 产能 16/tick，RCL3+ 约 24/tick。
+    // 满体型 worker 的 WORK = (容量-150)/150（RCL3 4 WORK、RCL4 7 WORK）。
+    // 每只只带 3 CARRY=150 能量，有效升级速度 ≈ 150 / (往返 tick + 150/WORK)：
+    // RCL2 2 WORK → 10 人；RCL3 4 WORK → 6 人；RCL4 7 WORK → 4 人；
+    // RCL5 11 WORK → 2 人；RCL6+ 1-2 人就吃满产能。
+    // RCL2 的 10 低于 upgradeSetting.maxCapacity=12，不会压到建造/维修。
+    'worker':       [0, 3, 10, 6, 4, 2, 2, 1, 1],
     'emptyWorker':  [0, 0, 0, 0, 0, 0, 0, 0, 0], // emptyWorker不主动孵化
     // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 侦察兵同样不进正常配额：有房间需要情报时才由外矿逻辑补一个
     'viewer':       [0, 0, 0, 0, 0, 0, 0, 0, 0],
-    // 外矿运输也不按这张表孵化：由 refreshRemoteSpawn 按"每房配额"补员
+    // 外矿运输也不按这张表孵化：由 refreshRemoteCarrierSpawn 按"每个矿点一只"补员
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
     'claimer':      [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -146,8 +148,6 @@ export const remoteSetting = {
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
     maxRooms: 4,
-    // 每个"已建好 container"的外矿房配几个专用 remoteCarrier
-    carriersPerRoom: 1,
 }
 
 export const towerSetting = {

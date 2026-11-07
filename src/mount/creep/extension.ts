@@ -92,7 +92,7 @@ export default class CreepExtension extends Creep {
     }
 
 
-    getWork(noRemoteConvert?: boolean): boolean {
+    getWork(): boolean {
         const room = this.room
         if (!room.memory.creepTask) {
             // 外矿房/走廊房没有任务桶：remoteCarrier 不能原地发呆，
@@ -162,6 +162,14 @@ export default class CreepExtension extends Creep {
                         return aMatched - bMatched
                             || (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0)
                     })
+                } else if (taskType === 'remoteCarryTask') {
+                    // 专用运输车只领自己绑定矿点那个 container 的任务，避免几只车挤一个矿
+                    queue = this.boundRemoteCarryQueue(queue)
+                    if (!queue.length) {
+                        continue
+                    }
+                    queue = [...queue].sort((a, b) =>
+                        (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0))
                 } else if (taskType === 'energyTask') {
                     // 多个 container / 掉落物时优先去没人预约的，避免所有缺能量的 creep 挤在一个矿点
                     queue = [...queue].sort((a, b) =>
@@ -214,17 +222,8 @@ export default class CreepExtension extends Creep {
         if (this.memory.role === 'remoteCarrier') {
             return this.remoteCarrierIdle()
         }
-        // 本地 carrier 没活干且身上是空的：有外矿回运任务就转 remoteCarrier。
-        // 带能量的不转：外矿回运是循环任务，带能量转过去没有意义。
-        // 至少留两个本地 carrier 在家补能（含 emptyWorker 临时状态），
-        // 否则 spawn/extension 断供，孵化直接停摆。
-        // noRemoteConvert 防止转过去又领不到任务时在本 tick 内来回转换。
-        if (!noRemoteConvert && this.memory.role === 'carrier' && room.hasRemoteCarryTask()
-            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0
-            && this.localCarrierCount() > 2) {
-            this.changeRole('remoteCarrier')
-            return this.getWork(true)
-        }
+        // 外矿运输由主房按"每个矿点一只"专门孵化（refreshRemoteCarrierSpawn），
+        // 本地 carrier 不再转换成 remoteCarrier。
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
         // harvester / remoteHarvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
@@ -684,14 +683,8 @@ export default class CreepExtension extends Creep {
                     return false
                 }
             }
-            // 本房取不到能量时，外矿有回运任务就直接转 remoteCarrier 去外矿取。
-            // 不能先转 emptyWorker：那会去和本房 energyTask 排队，排满就原地空转，
-            // 而且 emptyWorker 不会再看外矿回运任务，carrier 就再也转不过去了。
-            if (this.room.hasRemoteCarryTask()) {
-                this.changeRole('remoteCarrier')
-                return true
-            }
-            // 没有可取的 container（或刚好被别人取空）：退回通用取能
+            // 本房取不到能量：外矿回运由专用 remoteCarrier 负责，本地 carrier 退回通用取能
+            // （emptyWorker 会去 energyTask 队列排队，等掉落物/其他 container 补上）。
             this.changeRole('emptyWorker')
             return true
         }
@@ -1045,6 +1038,9 @@ export default class CreepExtension extends Creep {
         this.changeRole('carrier')
         delete this.memory.oldRole
         delete this.memory.remoteAbort
+        // 转回本地 carrier 后不再绑定任何外矿矿点
+        delete this.memory.remoteCarrySourceId
+        delete this.memory.remoteCarryRoom
     }
 
     /**
@@ -1428,29 +1424,6 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 本房本地 carrier 数量（emptyWorker 按 oldRole 算 role，remoteCarrier 不算）。
-     * 外矿回运循环会长期占住 creep，要保证家里始终留够 carrier 补能。
-     */
-    private localCarrierCount(): number {
-        const home = this.memory.spawnRoom || this.room.name
-        let count = 0
-        for (const name in Game.creeps) {
-            const creep = Game.creeps[name]
-            const creepHome = creep.memory.spawnRoom || creep.room.name
-            if (creepHome !== home) {
-                continue
-            }
-            const role = creep.memory.role === 'emptyWorker'
-                ? (creep.memory.oldRole ?? creep.memory.role)
-                : creep.memory.role
-            if (role === 'carrier') {
-                count++
-            }
-        }
-        return count
-    }
-
-    /**
      * 外矿 carrier 没任务时的兜底：不在主房就先回去，在主房就把能量交给接收点。
      * 任务可能被别人 removeCurrentWorkFromQueue 踢掉，保证它不会带着货滞留在外矿房。
      */
@@ -1465,10 +1438,55 @@ export default class CreepExtension extends Creep {
                 this.transfer(sink, RESOURCE_ENERGY)
             }
         }
-        // 回到主房还领不到回运任务：转回普通 carrier，本地补能优先。
-        // 如果本地也没活，下一 tick 会按"有没有回运任务"再转回来，不会滞留在外矿角色。
+        // 专用运输车：绑定目标还有效（外矿房没停用、container 还在），留在外矿角色等任务
+        if (this.remoteCarryTargetValid()) {
+            return false
+        }
+        // 绑定目标没了 / 老版本没绑定的车：转回普通 carrier，本地补能优先。
         this.finishRemoteTrip()
         return false
+    }
+
+    /**
+     * 专用运输车只领自己绑定矿点那个 container 的任务；未绑定（老版本转换出来的车）不限制。
+     */
+    private boundRemoteCarryQueue(queue: TaskEntity[]): TaskEntity[] {
+        if (this.memory.role !== 'remoteCarrier') {
+            return queue
+        }
+        const boundContainerId = this.remoteCarryContainerId()
+        if (!boundContainerId) {
+            return queue
+        }
+        return queue.filter(task => task?.taskParam?.[0] === boundContainerId)
+    }
+
+    /**
+     * 专用运输车的绑定目标是否还有效：外矿房没停用、矿点 container 还在。
+     * 停用房/被拆容器要转回普通 carrier，不能一直挂着外矿角色干等。
+     */
+    private remoteCarryTargetValid(): boolean {
+        const sourceId = this.memory.remoteCarrySourceId
+        const remoteRoom = this.memory.remoteCarryRoom
+        if (!sourceId || !remoteRoom) {
+            return false
+        }
+        const state = Memory.remotePlan?.[this.memory.spawnRoom]?.rooms?.[remoteRoom]
+        return !!state && state.enabled !== false && !!state.sources?.[sourceId]?.containerId
+    }
+
+    /**
+     * 专用运输车绑定的矿点对应的 container。
+     * 按顶层 remotePlan 实时解析，container 被拆重建后能自动跟上。
+     */
+    private remoteCarryContainerId(): Id<StructureContainer> | undefined {
+        const sourceId = this.memory.remoteCarrySourceId
+        const remoteRoom = this.memory.remoteCarryRoom
+        if (!sourceId || !remoteRoom) {
+            return undefined
+        }
+        return Memory.remotePlan?.[this.memory.spawnRoom]?.rooms?.[remoteRoom]
+            ?.sources?.[sourceId]?.containerId
     }
 
     /**

@@ -22,7 +22,7 @@ interface RemotePlan {
     // 调试/测试用：忽略"富余能量"门槛，强制孵化外矿 harvester
     force?: boolean
     rooms: { [roomName: string]: RemoteRoomState }
-    // 当前有效的外矿回运任务数，给 carrier -> remoteCarrier 转换做 O(1) 判断
+    // 当前有效的外矿回运任务数（统计/调试用）
     carryActive?: number
 }
 
@@ -215,11 +215,6 @@ interface Room {
      * 推代码后按 Memory.remotePlan 里已知的 containerId 一次性重建回运任务
      */
     rearmRemoteCarryTasks(): void
-
-    /**
-     * 是否有可领的外矿回运任务（O(1)，只看顶层 memory 计数器）
-     */
-    hasRemoteCarryTask(): boolean
 
     /**
      * link 建成后把 linkId 补进对应 container 的回运任务

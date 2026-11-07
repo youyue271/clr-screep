@@ -3265,22 +3265,24 @@ const spawnTable = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 配额按"总 WORK/CARRY 部件与产能匹配"定，而不是按人数拍：
-    // carrier 单趟 CARRY 随等级涨（150 → 1250），所以人数从 5 逐级降到 2，
-    // 总运力反而上升。本地升级能量由 worker 自己从 container 取（energyTask），
+    // 满体型 carrier 单趟 CARRY = 容量/100（RCL2 5 → RCL8 25，250 → 1250），
+    // 按总运力不变配人数：RCL2 3×250≈750、RCL3 2×400=800、RCL4+ 2 只就够。
+    // 保留 2 只作冗余。本地升级能量由 worker 自己从 container 取（energyTask），
     // carrier 只负责 spawn/extension/tower 补能和回运。
-    'carrier': [0, 1, 5, 4, 3, 2, 2, 2, 2],
-    // 主矿 2 个矿点：RCL2 产能 16/tick，RCL3+ 24/tick。
-    // worker 有效升级速度 ≈ WORK 数 × 0.8（取能往返占两成）：
-    // RCL2 1 WORK/人 → 12 人；RCL3 2 WORK → 10 人；RCL4 4 WORK → 5 人；
-    // RCL5 6 WORK → 3 人；RCL6 8 WORK → 2 人；RCL7 21 WORK、RCL8 23 WORK → 1 人。
-    // RCL2 的 12 就是 upgradeSetting.maxCapacity 的硬上限，再多也只做建造/维修。
-    'worker': [0, 3, 12, 10, 5, 3, 2, 1, 1],
+    'carrier': [0, 1, 3, 2, 2, 2, 2, 2, 2],
+    // 主矿 2 个矿点：RCL2 产能 16/tick，RCL3+ 约 24/tick。
+    // 满体型 worker 的 WORK = (容量-150)/150（RCL3 4 WORK、RCL4 7 WORK）。
+    // 每只只带 3 CARRY=150 能量，有效升级速度 ≈ 150 / (往返 tick + 150/WORK)：
+    // RCL2 2 WORK → 10 人；RCL3 4 WORK → 6 人；RCL4 7 WORK → 4 人；
+    // RCL5 11 WORK → 2 人；RCL6+ 1-2 人就吃满产能。
+    // RCL2 的 10 低于 upgradeSetting.maxCapacity=12，不会压到建造/维修。
+    'worker': [0, 3, 10, 6, 4, 2, 2, 1, 1],
     'emptyWorker': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 外矿 harvester 不按这张表自动孵化：配额由 Memory.remotePlan + 富余能量门槛决定
     'remoteHarvester': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 侦察兵同样不进正常配额：有房间需要情报时才由外矿逻辑补一个
     'viewer': [0, 0, 0, 0, 0, 0, 0, 0, 0],
-    // 外矿运输也不按这张表孵化：由 refreshRemoteSpawn 按"每房配额"补员
+    // 外矿运输也不按这张表孵化：由 refreshRemoteCarrierSpawn 按"每个矿点一只"补员
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
     'claimer': [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -3380,8 +3382,6 @@ const remoteSetting = {
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
     maxRooms: 4,
-    // 每个"已建好 container"的外矿房配几个专用 remoteCarrier
-    carriersPerRoom: 1,
 };
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
@@ -4069,7 +4069,7 @@ class CreepExtension extends Creep {
         }
         return;
     }
-    getWork(noRemoteConvert) {
+    getWork() {
         var _a;
         const room = this.room;
         if (!room.memory.creepTask) {
@@ -4144,6 +4144,14 @@ class CreepExtension extends Creep {
                             || ((_d = (_c = a === null || a === void 0 ? void 0 : a.reservedBy) === null || _c === void 0 ? void 0 : _c.length) !== null && _d !== void 0 ? _d : 0) - ((_f = (_e = b === null || b === void 0 ? void 0 : b.reservedBy) === null || _e === void 0 ? void 0 : _e.length) !== null && _f !== void 0 ? _f : 0);
                     });
                 }
+                else if (taskType === 'remoteCarryTask') {
+                    // 专用运输车只领自己绑定矿点那个 container 的任务，避免几只车挤一个矿
+                    queue = this.boundRemoteCarryQueue(queue);
+                    if (!queue.length) {
+                        continue;
+                    }
+                    queue = [...queue].sort((a, b) => { var _a, _b, _c, _d; return ((_b = (_a = a === null || a === void 0 ? void 0 : a.reservedBy) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0) - ((_d = (_c = b === null || b === void 0 ? void 0 : b.reservedBy) === null || _c === void 0 ? void 0 : _c.length) !== null && _d !== void 0 ? _d : 0); });
+                }
                 else if (taskType === 'energyTask') {
                     // 多个 container / 掉落物时优先去没人预约的，避免所有缺能量的 creep 挤在一个矿点
                     queue = [...queue].sort((a, b) => { var _a, _b, _c, _d; return ((_b = (_a = a === null || a === void 0 ? void 0 : a.reservedBy) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0) - ((_d = (_c = b === null || b === void 0 ? void 0 : b.reservedBy) === null || _c === void 0 ? void 0 : _c.length) !== null && _d !== void 0 ? _d : 0); });
@@ -4195,17 +4203,8 @@ class CreepExtension extends Creep {
         if (this.memory.role === 'remoteCarrier') {
             return this.remoteCarrierIdle();
         }
-        // 本地 carrier 没活干且身上是空的：有外矿回运任务就转 remoteCarrier。
-        // 带能量的不转：外矿回运是循环任务，带能量转过去没有意义。
-        // 至少留两个本地 carrier 在家补能（含 emptyWorker 临时状态），
-        // 否则 spawn/extension 断供，孵化直接停摆。
-        // noRemoteConvert 防止转过去又领不到任务时在本 tick 内来回转换。
-        if (!noRemoteConvert && this.memory.role === 'carrier' && room.hasRemoteCarryTask()
-            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0
-            && this.localCarrierCount() > 2) {
-            this.changeRole('remoteCarrier');
-            return this.getWork(true);
-        }
+        // 外矿运输由主房按"每个矿点一只"专门孵化（refreshRemoteCarrierSpawn），
+        // 本地 carrier 不再转换成 remoteCarrier。
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
         // harvester / remoteHarvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
@@ -4669,14 +4668,8 @@ class CreepExtension extends Creep {
                     return false;
                 }
             }
-            // 本房取不到能量时，外矿有回运任务就直接转 remoteCarrier 去外矿取。
-            // 不能先转 emptyWorker：那会去和本房 energyTask 排队，排满就原地空转，
-            // 而且 emptyWorker 不会再看外矿回运任务，carrier 就再也转不过去了。
-            if (this.room.hasRemoteCarryTask()) {
-                this.changeRole('remoteCarrier');
-                return true;
-            }
-            // 没有可取的 container（或刚好被别人取空）：退回通用取能
+            // 本房取不到能量：外矿回运由专用 remoteCarrier 负责，本地 carrier 退回通用取能
+            // （emptyWorker 会去 energyTask 队列排队，等掉落物/其他 container 补上）。
             this.changeRole('emptyWorker');
             return true;
         }
@@ -5030,6 +5023,9 @@ class CreepExtension extends Creep {
         this.changeRole('carrier');
         delete this.memory.oldRole;
         delete this.memory.remoteAbort;
+        // 转回本地 carrier 后不再绑定任何外矿矿点
+        delete this.memory.remoteCarrySourceId;
+        delete this.memory.remoteCarryRoom;
     }
     /**
      * 把 link 里的能量转发中央 link（link→link 瞬发，有冷却和损耗）。
@@ -5411,29 +5407,6 @@ class CreepExtension extends Creep {
         return best;
     }
     /**
-     * 本房本地 carrier 数量（emptyWorker 按 oldRole 算 role，remoteCarrier 不算）。
-     * 外矿回运循环会长期占住 creep，要保证家里始终留够 carrier 补能。
-     */
-    localCarrierCount() {
-        var _a;
-        const home = this.memory.spawnRoom || this.room.name;
-        let count = 0;
-        for (const name in Game.creeps) {
-            const creep = Game.creeps[name];
-            const creepHome = creep.memory.spawnRoom || creep.room.name;
-            if (creepHome !== home) {
-                continue;
-            }
-            const role = creep.memory.role === 'emptyWorker'
-                ? ((_a = creep.memory.oldRole) !== null && _a !== void 0 ? _a : creep.memory.role)
-                : creep.memory.role;
-            if (role === 'carrier') {
-                count++;
-            }
-        }
-        return count;
-    }
-    /**
      * 外矿 carrier 没任务时的兜底：不在主房就先回去，在主房就把能量交给接收点。
      * 任务可能被别人 removeCurrentWorkFromQueue 踢掉，保证它不会带着货滞留在外矿房。
      */
@@ -5448,10 +5421,53 @@ class CreepExtension extends Creep {
                 this.transfer(sink, RESOURCE_ENERGY);
             }
         }
-        // 回到主房还领不到回运任务：转回普通 carrier，本地补能优先。
-        // 如果本地也没活，下一 tick 会按"有没有回运任务"再转回来，不会滞留在外矿角色。
+        // 专用运输车：绑定目标还有效（外矿房没停用、container 还在），留在外矿角色等任务
+        if (this.remoteCarryTargetValid()) {
+            return false;
+        }
+        // 绑定目标没了 / 老版本没绑定的车：转回普通 carrier，本地补能优先。
         this.finishRemoteTrip();
         return false;
+    }
+    /**
+     * 专用运输车只领自己绑定矿点那个 container 的任务；未绑定（老版本转换出来的车）不限制。
+     */
+    boundRemoteCarryQueue(queue) {
+        if (this.memory.role !== 'remoteCarrier') {
+            return queue;
+        }
+        const boundContainerId = this.remoteCarryContainerId();
+        if (!boundContainerId) {
+            return queue;
+        }
+        return queue.filter(task => { var _a; return ((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) === boundContainerId; });
+    }
+    /**
+     * 专用运输车的绑定目标是否还有效：外矿房没停用、矿点 container 还在。
+     * 停用房/被拆容器要转回普通 carrier，不能一直挂着外矿角色干等。
+     */
+    remoteCarryTargetValid() {
+        var _a, _b, _c, _d, _e;
+        const sourceId = this.memory.remoteCarrySourceId;
+        const remoteRoom = this.memory.remoteCarryRoom;
+        if (!sourceId || !remoteRoom) {
+            return false;
+        }
+        const state = (_c = (_b = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[this.memory.spawnRoom]) === null || _b === void 0 ? void 0 : _b.rooms) === null || _c === void 0 ? void 0 : _c[remoteRoom];
+        return !!state && state.enabled !== false && !!((_e = (_d = state.sources) === null || _d === void 0 ? void 0 : _d[sourceId]) === null || _e === void 0 ? void 0 : _e.containerId);
+    }
+    /**
+     * 专用运输车绑定的矿点对应的 container。
+     * 按顶层 remotePlan 实时解析，container 被拆重建后能自动跟上。
+     */
+    remoteCarryContainerId() {
+        var _a, _b, _c, _d, _e, _f;
+        const sourceId = this.memory.remoteCarrySourceId;
+        const remoteRoom = this.memory.remoteCarryRoom;
+        if (!sourceId || !remoteRoom) {
+            return undefined;
+        }
+        return (_f = (_e = (_d = (_c = (_b = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[this.memory.spawnRoom]) === null || _b === void 0 ? void 0 : _b.rooms) === null || _c === void 0 ? void 0 : _c[remoteRoom]) === null || _d === void 0 ? void 0 : _d.sources) === null || _e === void 0 ? void 0 : _e[sourceId]) === null || _f === void 0 ? void 0 : _f.containerId;
     }
     /**
      * 主房接收外矿能量的备选目标：storage 优先，其次任意有空位的 container，
@@ -7527,9 +7543,9 @@ class RoomExtension extends Room {
         if (!plan || plan.enabled === false) {
             return;
         }
-        // remoteCarrier 不再专门孵化：本地 carrier 没活时按回运任务存在与否自动转换，
-        // 所以这里只需要补 remoteHarvester。
+        // 外矿角色都不进 initSpawn 配额：按"每个矿点一只"在这里补员。
         this.refreshRemoteHarvesterSpawn(plan);
+        this.refreshRemoteCarrierSpawn(plan);
     }
     /**
      * 登记外矿 container 的循环回运任务（幂等）。
@@ -7647,13 +7663,6 @@ class RoomExtension extends Room {
                 this.registerRemoteCarryTask(roomName, sourceId, containerId);
             }
         }
-    }
-    /**
-     * 是否有可领的外矿回运任务。O(1) 读计数器，不给 carrier 额外做遍历。
-     */
-    hasRemoteCarryTask() {
-        var _a, _b, _c;
-        return ((_c = (_b = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[this.name]) === null || _b === void 0 ? void 0 : _b.carryActive) !== null && _c !== void 0 ? _c : 0) > 0;
     }
     /**
      * link 建成/发现后，把 linkId 补进对应 container 的任务参数。
@@ -8243,7 +8252,7 @@ class RoomExtension extends Room {
     refreshRemoteHarvesterSpawn(plan) {
         var _a;
         // 旧逻辑留下的、没绑定矿点的孵化任务没法计入任何一个矿点的覆盖，直接清掉
-        this.cancelUnboundRemoteHarvestSpawnTasks();
+        this.cancelUnboundRemoteSpawnTasks('remoteHarvester');
         if (!plan.force && !this.remoteGate()) {
             return;
         }
@@ -8259,12 +8268,12 @@ class RoomExtension extends Room {
             const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25;
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin;
             for (const sourceId in (_a = state.sources) !== null && _a !== void 0 ? _a : {}) {
-                if (this.remoteHarvestCovered(sourceId, threshold)) {
+                if (this.remoteSourceCovered('remoteHarvester', sourceId, threshold)) {
                     // 有健康的人就清掉多余替补，避免扫描间隔内重复排队
-                    this.cancelRemoteHarvestSpawnTasks(sourceId);
+                    this.cancelRemoteSourceSpawnTasks('remoteHarvester', sourceId);
                     continue;
                 }
-                if (this.remoteHarvestPending(sourceId)) {
+                if (this.remoteSourcePending('remoteHarvester', sourceId)) {
                     continue;
                 }
                 this.addToSpawnList('remoteHarvester', sourceId, roomName);
@@ -8272,18 +8281,56 @@ class RoomExtension extends Room {
         }
     }
     /**
-     * 这个矿点是否有健康的外矿 harvester：绑定到该矿点、没被召回、剩余寿命够换班。
-     * 绑定信息优先读 harvestSourceId，推代码后老 creep 退回 currentWork 里的矿点。
+     * 按每个外矿矿点补一只专用 remoteCarrier（和 refreshRemoteHarvesterSpawn 同一套）。
+     * 一只车只负责自己矿点脚下的 container；没有 container 的矿点没东西可运，不补。
      */
-    remoteHarvestCovered(sourceId, threshold) {
+    refreshRemoteCarrierSpawn(plan) {
+        var _a, _b;
+        // 没绑定矿点的老式孵化任务（或老版本转换出来的车）不计入任何矿点的覆盖
+        this.cancelUnboundRemoteSpawnTasks('remoteCarrier');
+        if (!plan.force && !this.remoteGate()) {
+            return;
+        }
+        const body = getBody('remoteCarrier', this);
+        const spawnTicks = calcSpawnTicks(body);
+        const ticksPerTile = calcTicksPerTile(body);
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName];
+            if (!state || state.enabled === false) {
+                continue;
+            }
+            const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25;
+            const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin;
+            for (const sourceId in (_a = state.sources) !== null && _a !== void 0 ? _a : {}) {
+                // 容器还没建好：先不孵化，等 containerId 写回计划再补
+                if (!((_b = state.sources[sourceId]) === null || _b === void 0 ? void 0 : _b.containerId)) {
+                    continue;
+                }
+                if (this.remoteSourceCovered('remoteCarrier', sourceId, threshold)) {
+                    this.cancelRemoteSourceSpawnTasks('remoteCarrier', sourceId);
+                    continue;
+                }
+                if (this.remoteSourcePending('remoteCarrier', sourceId)) {
+                    continue;
+                }
+                this.addToSpawnList('remoteCarrier', sourceId, roomName);
+            }
+        }
+    }
+    /**
+     * 这个矿点是否有健康的外矿角色：绑定到该矿点、没被召回、剩余寿命够换班。
+     * harvester 的绑定信息优先读 harvestSourceId，推代码后老 creep 退回 currentWork 里的矿点；
+     * remoteCarrier 读孵化时写入的 remoteCarrySourceId（老版本转换出来的车没有绑定）。
+     */
+    remoteSourceCovered(role, sourceId, threshold) {
         for (const name in Game.creeps) {
             const creep = Game.creeps[name];
             if (creep.memory.spawnRoom !== this.name
-                || this.workRole(creep) !== 'remoteHarvester'
+                || this.workRole(creep) !== role
                 || creep.memory.recall) {
                 continue;
             }
-            if (this.remoteHarvestSourceOf(creep) !== sourceId) {
+            if (this.remoteSourceOf(role, creep) !== sourceId) {
                 continue;
             }
             if (creep.ticksToLive === undefined || creep.ticksToLive > threshold) {
@@ -8295,12 +8342,12 @@ class RoomExtension extends Room {
     /**
      * 该矿点是否已经排了孵化/正在孵化（spawn 任务或 spawning 中的 creep 带同一矿点）
      */
-    remoteHarvestPending(sourceId) {
+    remoteSourcePending(role, sourceId) {
         var _a, _b, _c, _d;
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
             for (const task of (_a = spawnBuckets[key]) !== null && _a !== void 0 ? _a : []) {
-                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === 'remoteHarvester'
+                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === role
                     && ((_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[2]) === sourceId) {
                     return true;
                 }
@@ -8309,8 +8356,14 @@ class RoomExtension extends Room {
         for (const spawn of this.find(FIND_MY_SPAWNS)) {
             const spawningName = (_d = spawn.spawning) === null || _d === void 0 ? void 0 : _d.name;
             const spawningMemory = spawningName ? Memory.creeps[spawningName] : undefined;
-            if (spawningMemory && spawningMemory.role === 'remoteHarvester'
-                && spawningMemory.harvestSourceId === sourceId) {
+            if (!spawningMemory || spawningMemory.role !== role) {
+                continue;
+            }
+            // 孵化中的 creep 还没进 Game.creeps，只能按 spawn 时写入的内存判断绑定矿点
+            const bound = role === 'remoteCarrier'
+                ? spawningMemory.remoteCarrySourceId
+                : spawningMemory.harvestSourceId;
+            if (bound === sourceId) {
                 return true;
             }
         }
@@ -8320,14 +8373,24 @@ class RoomExtension extends Room {
         var _a, _b, _c;
         return ((_a = creep.memory.harvestSourceId) !== null && _a !== void 0 ? _a : (_c = (_b = creep.memory.currentWork) === null || _b === void 0 ? void 0 : _b.taskParam) === null || _c === void 0 ? void 0 : _c[0]);
     }
-    cancelRemoteHarvestSpawnTasks(sourceId) {
+    /**
+     * creep 绑定的外矿矿点。remoteCarrier 只认 remoteCarrySourceId：
+     * currentWork 里存的是 containerId，不能拿来当矿点用。
+     */
+    remoteSourceOf(role, creep) {
+        if (role === 'remoteCarrier') {
+            return creep.memory.remoteCarrySourceId;
+        }
+        return this.remoteHarvestSourceOf(creep);
+    }
+    cancelRemoteSourceSpawnTasks(role, sourceId) {
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
             const queue = spawnBuckets[key];
             if (!queue || !queue.length) {
                 continue;
             }
-            const next = queue.filter(task => { var _a, _b; return !(((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) === 'remoteHarvester' && ((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[2]) === sourceId); });
+            const next = queue.filter(task => { var _a, _b; return !(((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) === role && ((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[2]) === sourceId); });
             if (next.length) {
                 spawnBuckets[key] = next;
             }
@@ -8336,14 +8399,14 @@ class RoomExtension extends Room {
             }
         }
     }
-    cancelUnboundRemoteHarvestSpawnTasks() {
+    cancelUnboundRemoteSpawnTasks(role) {
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
             const queue = spawnBuckets[key];
             if (!queue || !queue.length) {
                 continue;
             }
-            const next = queue.filter(task => { var _a, _b; return !(((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) === 'remoteHarvester' && !((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[2])); });
+            const next = queue.filter(task => { var _a, _b; return !(((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) === role && !((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[2])); });
             if (next.length) {
                 spawnBuckets[key] = next;
             }
@@ -8594,7 +8657,7 @@ class RoomExtension extends Room {
                 }
             }
         }
-        // 已经排上的外矿 harvester 孵化任务也要撤掉，别把 creep 派去送死
+        // 已经排上的外矿 harvester / remoteCarrier 孵化任务也要撤掉，别把 creep 派去送死
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
             const queue = spawnBuckets[key];
@@ -8603,7 +8666,8 @@ class RoomExtension extends Room {
             }
             const next = queue.filter(task => {
                 var _a, _b;
-                if (((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) !== 'remoteHarvester') {
+                const taskRole = (_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0];
+                if (taskRole !== 'remoteHarvester' && taskRole !== 'remoteCarrier') {
                     return true;
                 }
                 const roomName = (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[4];
@@ -8862,7 +8926,7 @@ class RoomExtension extends Room {
             // 外矿 harvester 不参与自动补员：配额故意为 0，让它 reSpawn=false，
             // 由 refreshRemoteSpawn 按"富余能量"门槛决定要不要孵化
             'remoteHarvester': 0,
-            // 外矿运输不特招：本地 carrier 没活时按回运任务自动转换，配额保持 0
+            // 外矿运输由 refreshRemoteCarrierSpawn 按"每个矿点一只"专门补员，配额保持 0
             'remoteCarrier': 0,
             // 侦察兵不参与自动补员：refreshScoutSpawn 常驻维持 1 个
             'viewer': 0,
@@ -8890,6 +8954,9 @@ class RoomExtension extends Room {
                 // 外矿召回标记也要保住：否则推代码后召回过的 harvester 会重新领任务
                 // 跑回停用房；保住后它继续在主房待命到死
                 const savedRecall = creep.memory.recall;
+                // 专用运输车绑定的矿点/外矿房：丢了会被当成老车转职，补员也会重复孵化
+                const savedCarrySource = creep.memory.remoteCarrySourceId;
+                const savedCarryRoom = creep.memory.remoteCarryRoom;
                 delete Memory.creeps[creepName];
                 creep.remember();
                 creep.memory.spawnRoom = this.name;
@@ -8903,6 +8970,10 @@ class RoomExtension extends Room {
                 }
                 if (savedRecall) {
                     creep.memory.recall = true;
+                }
+                if (savedCarrySource) {
+                    creep.memory.remoteCarrySourceId = savedCarrySource;
+                    creep.memory.remoteCarryRoom = savedCarryRoom;
                 }
                 // 推代码会清空房间事件：睡眠中的 creep 重新挂唤醒事件，否则会一直睡到死
                 if (((_d = creep.memory.currentWork) === null || _d === void 0 ? void 0 : _d.taskFunc) === 'sleep') {
@@ -10367,7 +10438,7 @@ class SpawnExtension extends Spawn {
      * 如果孵化出现问题,refresh carrierList,并将
      */
     work() {
-        var _a, _b, _c, _d, _e, _f, _g;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j;
         // log.debug("spawn working")
         if (this.spawning) {
             // 孵化可视化：显示真实名字（名字规则就是 role + 孵化时刻的 Game.time）
@@ -10457,9 +10528,20 @@ class SpawnExtension extends Spawn {
                             // 由 refreshRemoteCarrierSpawn 按门槛补员，不走 creepRecycle 无条件重孵
                             reSpawn: ((_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[3]) !== false,
                             // 提前换班的 harvester 会带上矿点 id
-                            harvestSourceId: (_d = task === null || task === void 0 ? void 0 : task.taskParam) === null || _d === void 0 ? void 0 : _d[2],
+                            harvestSourceId: role === 'harvester' || role === 'remoteHarvester'
+                                ? (_d = task === null || task === void 0 ? void 0 : task.taskParam) === null || _d === void 0 ? void 0 : _d[2]
+                                : undefined,
+                            // 外矿运输车绑定矿点/外矿房：只运这个矿点脚下的 container
+                            remoteCarrySourceId: role === 'remoteCarrier'
+                                ? (_e = task === null || task === void 0 ? void 0 : task.taskParam) === null || _e === void 0 ? void 0 : _e[2]
+                                : undefined,
+                            remoteCarryRoom: role === 'remoteCarrier'
+                                ? (_f = task === null || task === void 0 ? void 0 : task.taskParam) === null || _f === void 0 ? void 0 : _f[4]
+                                : undefined,
                             // claimer 孵化时绑定目标房，之后只负责这一个房
-                            claimerTarget: (_e = task === null || task === void 0 ? void 0 : task.taskParam) === null || _e === void 0 ? void 0 : _e[4]
+                            claimerTarget: role === 'claimer'
+                                ? (_g = task === null || task === void 0 ? void 0 : task.taskParam) === null || _g === void 0 ? void 0 : _g[4]
+                                : undefined
                         },
                         energyStructures: picked.structures
                     });
@@ -10467,9 +10549,11 @@ class SpawnExtension extends Spawn {
                         /* 孵化成功 */
                         // claimer 出生有 1 tick 延迟：本 tick 任务已出队、creep 还没进
                         // Game.creeps，记下目标房，让补员扫描别在这个窗口重复排队
-                        const claimerTarget = (_f = task === null || task === void 0 ? void 0 : task.taskParam) === null || _f === void 0 ? void 0 : _f[4];
+                        const claimerTarget = role === 'claimer'
+                            ? (_h = task === null || task === void 0 ? void 0 : task.taskParam) === null || _h === void 0 ? void 0 : _h[4]
+                            : undefined;
                         if (claimerTarget) {
-                            const spawnTicks = (_g = this.room.memory.claimerSpawnTick) !== null && _g !== void 0 ? _g : (this.room.memory.claimerSpawnTick = {});
+                            const spawnTicks = (_j = this.room.memory.claimerSpawnTick) !== null && _j !== void 0 ? _j : (this.room.memory.claimerSpawnTick = {});
                             spawnTicks[claimerTarget] = Game.time;
                         }
                         spawnQueue.shift();
