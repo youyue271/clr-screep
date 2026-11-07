@@ -65,15 +65,24 @@ export function upgradeTaskCapacityOf(room: Room): number {
         // 尤其是 priority 1 的 extension 工地；工地清零后再按 worker 数放开。
         capacity = Math.max(1, Math.min(base, 2))
     } else {
-        // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业
-        const workerCount = room.find(FIND_MY_CREEPS, {
-            filter: creep => {
-                const role = creep.memory.role === 'emptyWorker'
-                    ? creep.memory.oldRole
-                    : creep.memory.role
-                return role === 'worker'
+        // emptyWorker 只是临时取能状态，按 oldRole 折算回原职业。
+        // 归属按出生房（spawnRoom）算：worker 跑出主房时既不占本房容量、
+        // 又能一直拿着升级任务位，容量会算少，房里的 worker 反而抢不到任务。
+        // 老 creep 可能没有 spawnRoom，退回按当前房间算。
+        let workerCount = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            const role = creep.memory.role === 'emptyWorker'
+                ? creep.memory.oldRole
+                : creep.memory.role
+            if (role !== 'worker') {
+                continue
             }
-        }).length
+            const home = creep.memory.spawnRoom || (creep.room && creep.room.name)
+            if (home === room.name) {
+                workerCount++
+            }
+        }
         capacity = Math.max(base, Math.min(upgradeSetting.maxCapacity, workerCount))
     }
     // 工位数量是硬上限：没有工位的 upgrader 会退回旧行为并重新挤在一起。

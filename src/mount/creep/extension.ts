@@ -532,6 +532,13 @@ export default class CreepExtension extends Creep {
         if (inRange) {
             this.upgradeController(controller)
         }
+        // 工位表算的是"当前房间"的控制器。worker 跑到隔壁房时，getUpgradeSlot 会按
+        // 那边的（可能是中立）控制器找工位，人就站在错误位置不动，任务位还被占着。
+        // 不在任务控制器所在房间时，先走回目标房间，本 tick 不认工位。
+        if (this.room.name !== controller.pos.roomName) {
+            this.moveToRoom(controller.pos.roomName)
+            return false
+        }
         const slotTile = getUpgradeSlot(this, controller)
         if (slotTile < 0) {
             // 没有可用工位（窄房/控制器被墙围死）：退回原来的 range 3 寻路
