@@ -213,9 +213,12 @@ export default class CreepExtension extends Creep {
         if (this.memory.role === 'remoteCarrier') {
             return this.remoteCarrierIdle()
         }
-        // 本地 carrier 没活干：只看有没有外矿回运任务，有就转 remoteCarrier。
+        // 本地 carrier 没活干且身上是空的：有外矿回运任务就转 remoteCarrier。
+        // 带能量的不转：外矿回来没 link 会直接转回 carrier，带能量转过去只会在
+        // carrier / remoteCarrier 之间每 tick 来回切，白占任务预约。
         // noRemoteConvert 防止转过去又领不到任务时在本 tick 内来回转换。
-        if (!noRemoteConvert && this.memory.role === 'carrier' && room.hasRemoteCarryTask()) {
+        if (!noRemoteConvert && this.memory.role === 'carrier' && room.hasRemoteCarryTask()
+            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
             this.changeRole('remoteCarrier')
             return this.getWork(true)
         }
@@ -882,6 +885,8 @@ export default class CreepExtension extends Creep {
      * 外矿运输：去外矿 container 取能，回到主房投递后才结束任务。
      * 只有回到主房才能返回 true —— releaseCurrentWork 用的是 this.room 的队列，
      * 在外矿房结束任务会把主房队列里的预约漏掉。
+     * 主房只认外矿 link：没有可用 link 就直接转回 carrier，能量交给本地 carryTask；
+     * sinkId 参数保留（任务参数结构不变），不再用于兜底投递。
      */
     remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>, linkId?: Id<StructureLink>): boolean {
         const energy = this.store.getUsedCapacity(RESOURCE_ENERGY)
@@ -923,32 +928,27 @@ export default class CreepExtension extends Creep {
             this.finishRemoteTrip()
             return true
         }
-        // 投递顺序：对应外矿 link > 任务登记的 sink > 普通 carrier 的接收点
+        // 外矿回来只认外矿 link：有可用 link 就投进去。
+        // 没有 link（RCL2 还没建）或 link 满了，直接转回 carrier，
+        // 身上的能量交给本地 carryTask 去补 spawn/extension。
+        // 不再走 storage/container/spawn 兜底、也不原地等——主房满仓时外矿车会一直发愣。
         const link = linkId ? Game.getObjectById<StructureLink>(linkId) : undefined
-        const linkFree = !!link && link.energy < link.energyCapacity
-        const sink = sinkId ? Game.getObjectById(sinkId) as any : undefined
-        const target: AnyStoreStructure | StructureLink | undefined = linkFree
-            ? link
-            : (sink && sink.store && sink.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-                ? sink
-                : this.homeEnergySink())
-        if (!target) {
-            // 主房暂时没地方收：原地待命，不丢货
-            return false
+        if (!link || link.energy >= link.energyCapacity) {
+            delete this.memory.remoteReturn
+            this.finishRemoteTrip()
+            return true
         }
-        this.say(linkFree ? '🔗外矿入link' : '⚡外矿回运')
-        const res = this.transfer(target, RESOURCE_ENERGY)
+        this.say('🔗外矿入link')
+        const res = this.transfer(link, RESOURCE_ENERGY)
         if (res === ERR_NOT_IN_RANGE) {
-            this.moveTo(target, { visualizePathStyle: { stroke: linkFree ? '#66ccff' : '#ffffff' } })
+            this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } })
             return false
         }
         if (res !== OK) {
             return false
         }
-        if (linkFree) {
-            // link 收下了：冷却好了就转发中央 link，不用额外扫描
-            this.trySendLink(link as StructureLink)
-        }
+        // link 收下了：冷却好了就转发中央 link，不用额外扫描
+        this.trySendLink(link)
         delete this.memory.remoteReturn
         // 卸完货：任务保留，转回 carrier；本地有活就干，没活下 tick 再转回来
         this.finishRemoteTrip()
