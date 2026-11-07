@@ -20,13 +20,12 @@ export default class SpawnExtension extends Spawn {
     public work(): void {
         // log.debug("spawn working")
         if (this.spawning) {
-            // 孵化可视化
-            const spawningCreep = Game.creeps[this.spawning.name]
+            // 孵化可视化：显示真实名字（名字规则就是 role + 孵化时刻的 Game.time）
             this.room.visual.text(
-                '🛠️' + spawningCreep.memory.role,
+                '🛠️' + this.spawning.name,
                 this.pos.x + 1,
                 this.pos.y,
-                {align: 'left', opacity: 0.8})
+                {align: 'left', opacity: 0.8, font: "20px"})
             return
         } else {
             const spawnBuckets = this.room.normalizeTaskBuckets('spawnTask')
@@ -55,8 +54,12 @@ export default class SpawnExtension extends Spawn {
                     return
                 }
                 let energyNeeded = CalBodyCost(rolePart)
+                // 下一个孵化的 creep 名字 = role + 孵化时刻的 Game.time。
+                // 本 tick 能量就够时这就是最终名字；还在等能量时每 tick 显示的是
+                // “如果此刻孵化会叫什么”，真正孵化时以那一刻的 Game.time 为准。
+                const nextName = role + Game.time
                 this.room.visual.text(
-                    '🛠️' + role,
+                    '🛠️' + nextName,
                     this.pos.x + 1,
                     this.pos.y,
                     {align: 'left', opacity: 0.8, font: "20px"})
