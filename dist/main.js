@@ -4431,7 +4431,9 @@ class CreepExtension extends Creep {
         if (this.store['energy']) {
             this.say("⚡升本!");
             if (this.upgradeController(controller) == ERR_NOT_IN_RANGE) {
-                this.moveTo(controller, { visualizePathStyle: { stroke: '#ffffff' } });
+                // 升级本来就是 range 3 生效：让场瞄准"能工作的外圈"，
+                // 避免所有人都挤到控制器格/单格进口上
+                this.moveTo(controller, { range: 3, visualizePathStyle: { stroke: '#ffffff' } });
                 return false;
             }
         }
@@ -5720,17 +5722,86 @@ function seedTiles(cx, cy, range, cost) {
     }
     return out;
 }
+/** 该格是否属于目标 (cx,cy,range) 的种子圈（且可走） */
+function isSeedTile(x, y, cx, cy, range, cost) {
+    if (Math.max(Math.abs(x - cx), Math.abs(y - cy)) > range) {
+        return false;
+    }
+    return cost[y * 50 + x] < FT_WALL;
+}
+/**
+ * 场的路径是否会"穿过" t 格：t 的某个邻居的下一步正好指向 t。
+ * 用于判断新封禁一格后，已经缓存的场是否需要作废。
+ */
+function fieldUsesTile(dirs, t) {
+    const x = xOf(t);
+    const y = yOf(t);
+    for (let dir = 1; dir <= 8; dir++) {
+        const px = x - DIR_DX[dir];
+        const py = y - DIR_DY[dir];
+        if (px < 0 || px > 49 || py < 0 || py > 49) {
+            continue;
+        }
+        if (dirs[py * 50 + px] === dir) {
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * 新增封禁 t 后这张场是否需要重建：
+ * - t 在 range>0 的种子圈里 → 需要（否则还会往 t 上走）
+ * - t 是 range=0 的目标本身 → 不需要（getField 对目标格会解除封禁）
+ * - 场里有路穿过 t → 需要
+ */
+function fieldAffectedByBlock(dirs, cost, t, cx, cy, range) {
+    if (range === 0 && t === cy * 50 + cx) {
+        return false;
+    }
+    if (isSeedTile(xOf(t), yOf(t), cx, cy, range, cost)) {
+        return true;
+    }
+    return fieldUsesTile(dirs, t);
+}
+/**
+ * 解除封禁 t 后这张场是否需要重建：
+ * 只有当 t 的某个可走邻居在旧场里是"不可达"（dirs 为 0 且不是种子）时才需要，
+ * 说明那块区域曾被 t 切断；否则旧场依然合法（最多绕远一点），保留。
+ */
+function fieldCutByTile(dirs, cost, t, cx, cy, range) {
+    const x = xOf(t);
+    const y = yOf(t);
+    for (let dir = 1; dir <= 8; dir++) {
+        const px = x + DIR_DX[dir];
+        const py = y + DIR_DY[dir];
+        if (px < 0 || px > 49 || py < 0 || py > 49) {
+            continue;
+        }
+        const p = py * 50 + px;
+        if (cost[p] >= FT_WALL || isSeedTile(px, py, cx, cy, range, cost)) {
+            continue;
+        }
+        if (dirs[p] === 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * 房间内距离场缓存。
  *
- * 每个目标格（+range）维护一张 2500 格的方向表，所有起点共用；
- * 结构变化时整体失效重建。表的运行时查询是无状态的，creep 被推到哪里都自愈。
+ * 每个目标格（+range）维护一张 2500 格的方向表，所有起点共用。
+ * 结构变化时整体失效；封禁集合（常驻站位 + 站定 creep）变化时逐张判断哪些场受影响，
+ * 且都等到下次 getField 用到才重建——一次只重建被查询的那一个目标。
+ * 表的运行时查询是无状态的，creep 被推到哪里都自愈。
  */
 // 结构签名多久校验一次（tick）
 const SIG_INTERVAL = 10;
 // 常驻站位多久重算一次（tick）
 const RES_INTERVAL = 10;
+// 连续几轮检查没挪窝才当成"建筑"（每轮 RES_INTERVAL tick，2 轮 ≈ 20 tick）
+const STILL_CHECKS = 2;
 // 每房间最多缓存多少张表（LRU）
 const MAX_FIELDS = 64;
 const TYPE_IDS = {
@@ -5789,7 +5860,7 @@ function findContainerTile(source) {
 }
 /**
  * 常驻站位：按任务分配算，不看 creep 当前位置。
- * 目前只登记 harvester 的采矿站位（container 格），upgrader 是 range 3 不固定，不登记。
+ * harvester 的采矿站位是固定格；upgrader 之类没有固定格，靠 computeBlocked 里的"站定检测"补。
  */
 function harvesterStandingTile(creep, roomName) {
     const work = creep.memory.currentWork;
@@ -5816,24 +5887,48 @@ function harvesterStandingTile(creep, roomName) {
     }
     return null;
 }
-function computeReserved(room) {
+/**
+ * 封禁集合 = harvester 常驻站位（任务推导） + 站定 creep 的实际所在格。
+ * 站定检测：隔 RES_INTERVAL tick 比一次坐标，两轮没挪窝就当"建筑"挡路；
+ * creep 一移动/死亡，下一轮检查自然把它移出集合（场按下述规则惰性失效）。
+ */
+function computeBlocked(room, st) {
+    var _a, _b;
     const tiles = new Uint8Array(FT_SIZE);
-    let count = 0;
-    const list = [];
-    for (const creep of room.find(FIND_MY_CREEPS)) {
+    const creeps = room.find(FIND_MY_CREEPS);
+    for (const creep of creeps) {
         const role = creep.memory.role;
         if (role !== 'harvester' && role !== 'remoteHarvester') {
             continue;
         }
         const tile = harvesterStandingTile(creep, room.name);
-        if (tile !== null && tile >= 0 && tile < FT_SIZE && !tiles[tile]) {
+        if (tile !== null && tile >= 0 && tile < FT_SIZE) {
             tiles[tile] = 1;
-            count++;
-            list.push(tile);
         }
     }
-    list.sort((a, b) => a - b);
-    return { key: list.join(','), tiles, count };
+    const prev = st.lastPos;
+    const prevStill = (_a = st.still) !== null && _a !== void 0 ? _a : {};
+    const next = {};
+    const nextStill = {};
+    for (const creep of creeps) {
+        const i = idx(creep.pos.x, creep.pos.y);
+        next[creep.name] = i;
+        // 连续几轮检查原地没动 → 站定，当建筑挡路（spawning 的 spawn 位不算）
+        const still = prev && prev[creep.name] === i ? ((_b = prevStill[creep.name]) !== null && _b !== void 0 ? _b : 0) + 1 : 0;
+        nextStill[creep.name] = still;
+        if (still >= STILL_CHECKS && !creep.spawning) {
+            tiles[i] = 1;
+        }
+    }
+    st.lastPos = next;
+    st.still = nextStill;
+    const list = [];
+    for (let i = 0; i < FT_SIZE; i++) {
+        if (tiles[i]) {
+            list.push(i);
+        }
+    }
+    return { key: list.join(','), tiles, count: list.length };
 }
 /** 地形 + 常驻结构（路 / 墙 / 建筑 / 矿 / 控制器）的进入代价 */
 function buildBaseCost(room) {
@@ -5886,13 +5981,59 @@ function buildBaseCost(room) {
     }
     return cost;
 }
+/**
+ * 封禁集合变化后，按"这张场的路径是否真的受影响"逐张决定是否作废，
+ * 不整房清空。场本身仍然在下次 getField 被用到时才重建（一次只建这一个目标）。
+ */
+function invalidateAffectedFields(st, old, next, cost) {
+    if (!st.fields.size) {
+        return;
+    }
+    const added = [];
+    const removed = [];
+    for (let i = 0; i < FT_SIZE; i++) {
+        if (next[i] && !old[i]) {
+            added.push(i);
+        }
+        else if (!next[i] && old[i]) {
+            removed.push(i);
+        }
+    }
+    if (!added.length && !removed.length) {
+        return;
+    }
+    st.fields.forEach((f, key) => {
+        const parts = key.split(',');
+        const cx = +parts[0];
+        const cy = +parts[1];
+        const range = +parts[2];
+        let drop = false;
+        for (const t of added) {
+            if (fieldAffectedByBlock(f.dirs, cost, t, cx, cy, range)) {
+                drop = true;
+                break;
+            }
+        }
+        if (!drop) {
+            for (const t of removed) {
+                if (fieldCutByTile(f.dirs, cost, t, cx, cy, range)) {
+                    drop = true;
+                    break;
+                }
+            }
+        }
+        if (drop) {
+            st.fields.delete(key);
+        }
+    });
+}
 function ensureRoom(room, forceSig = false) {
     const all = stateMap();
     let st = all[room.name];
     if (!st) {
         st = all[room.name] = {
             ver: 0, sig: '', sigTick: -1e9, baseCost: null,
-            reserved: null, reservedCount: 0, resKey: '', resTick: -1e9,
+            reserved: null, reservedCount: 0, resKey: '', resTick: -1e9, lastPos: null, still: null,
             fields: new Map(), builds: 0, evictions: 0,
         };
     }
@@ -5907,20 +6048,42 @@ function ensureRoom(room, forceSig = false) {
         }
     }
     if (st.reserved === null || Game.time - st.resTick >= RES_INTERVAL) {
-        const res = computeReserved(room);
+        const res = computeBlocked(room, st);
         st.resTick = Game.time;
         if (res.key !== st.resKey) {
+            const old = st.reserved;
             st.resKey = res.key;
             st.reserved = res.tiles;
             st.reservedCount = res.count;
-            // 常驻位变化只影响场，不影响基础代价
-            st.fields.clear();
+            // 封禁位变化只影响场，不影响基础代价；逐张判断，能保留的都保留
+            if (!old || !st.baseCost) {
+                st.fields.clear();
+            }
+            else {
+                invalidateAffectedFields(st, old, res.tiles, st.baseCost);
+            }
         }
     }
     if (!st.baseCost) {
         st.baseCost = buildBaseCost(room);
     }
+    pruneTracks();
     return st;
+}
+/** 定期清理已死亡 creep 的卡住记录，避免 global 里的表无限增长 */
+function pruneTracks() {
+    var _a;
+    const g = global;
+    if (Game.time - ((_a = g.ftPruneTick) !== null && _a !== void 0 ? _a : 0) < 100) {
+        return;
+    }
+    g.ftPruneTick = Game.time;
+    const tracks = trackMap();
+    tracks.forEach((_t, name) => {
+        if (!(name in Game.creeps)) {
+            tracks.delete(name);
+        }
+    });
 }
 /**
  * 取到 (pos, range) 的距离场。返回 null 表示无法建场，调用方应回退原生 moveTo。

@@ -506,7 +506,9 @@ export default class CreepExtension extends Creep {
         if (this.store['energy']) {
             this.say("⚡升本!")
             if (this.upgradeController(controller) == ERR_NOT_IN_RANGE) {
-                this.moveTo(controller, {visualizePathStyle: {stroke: '#ffffff'}});
+                // 升级本来就是 range 3 生效：让场瞄准"能工作的外圈"，
+                // 避免所有人都挤到控制器格/单格进口上
+                this.moveTo(controller, {range: 3, visualizePathStyle: {stroke: '#ffffff'}});
                 return false
             }
         } else {

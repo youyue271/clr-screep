@@ -176,3 +176,72 @@ export function seedTiles(cx: number, cy: number, range: number, cost: Uint8Arra
     }
     return out
 }
+
+/** 该格是否属于目标 (cx,cy,range) 的种子圈（且可走） */
+export function isSeedTile(x: number, y: number, cx: number, cy: number, range: number, cost: Uint8Array): boolean {
+    if (Math.max(Math.abs(x - cx), Math.abs(y - cy)) > range) {
+        return false
+    }
+    return cost[y * 50 + x] < FT_WALL
+}
+
+/**
+ * 场的路径是否会"穿过" t 格：t 的某个邻居的下一步正好指向 t。
+ * 用于判断新封禁一格后，已经缓存的场是否需要作废。
+ */
+export function fieldUsesTile(dirs: Uint8Array, t: number): boolean {
+    const x = xOf(t)
+    const y = yOf(t)
+    for (let dir = 1; dir <= 8; dir++) {
+        const px = x - DIR_DX[dir]
+        const py = y - DIR_DY[dir]
+        if (px < 0 || px > 49 || py < 0 || py > 49) {
+            continue
+        }
+        if (dirs[py * 50 + px] === dir) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * 新增封禁 t 后这张场是否需要重建：
+ * - t 在 range>0 的种子圈里 → 需要（否则还会往 t 上走）
+ * - t 是 range=0 的目标本身 → 不需要（getField 对目标格会解除封禁）
+ * - 场里有路穿过 t → 需要
+ */
+export function fieldAffectedByBlock(dirs: Uint8Array, cost: Uint8Array, t: number, cx: number, cy: number, range: number): boolean {
+    if (range === 0 && t === cy * 50 + cx) {
+        return false
+    }
+    if (isSeedTile(xOf(t), yOf(t), cx, cy, range, cost)) {
+        return true
+    }
+    return fieldUsesTile(dirs, t)
+}
+
+/**
+ * 解除封禁 t 后这张场是否需要重建：
+ * 只有当 t 的某个可走邻居在旧场里是"不可达"（dirs 为 0 且不是种子）时才需要，
+ * 说明那块区域曾被 t 切断；否则旧场依然合法（最多绕远一点），保留。
+ */
+export function fieldCutByTile(dirs: Uint8Array, cost: Uint8Array, t: number, cx: number, cy: number, range: number): boolean {
+    const x = xOf(t)
+    const y = yOf(t)
+    for (let dir = 1; dir <= 8; dir++) {
+        const px = x + DIR_DX[dir]
+        const py = y + DIR_DY[dir]
+        if (px < 0 || px > 49 || py < 0 || py > 49) {
+            continue
+        }
+        const p = py * 50 + px
+        if (cost[p] >= FT_WALL || isSeedTile(px, py, cx, cy, range, cost)) {
+            continue
+        }
+        if (dirs[p] === 0) {
+            return true
+        }
+    }
+    return false
+}

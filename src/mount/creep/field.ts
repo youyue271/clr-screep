@@ -1,15 +1,21 @@
 /**
  * 房间内距离场缓存。
  *
- * 每个目标格（+range）维护一张 2500 格的方向表，所有起点共用；
- * 结构变化时整体失效重建。表的运行时查询是无状态的，creep 被推到哪里都自愈。
+ * 每个目标格（+range）维护一张 2500 格的方向表，所有起点共用。
+ * 结构变化时整体失效；封禁集合（常驻站位 + 站定 creep）变化时逐张判断哪些场受影响，
+ * 且都等到下次 getField 用到才重建——一次只重建被查询的那一个目标。
+ * 表的运行时查询是无状态的，creep 被推到哪里都自愈。
  */
-import {buildField, DIR_DX, DIR_DY, FT_SIZE, FT_WALL, idx, seedTiles} from './fieldCore'
+import {
+    buildField, DIR_DX, DIR_DY, fieldAffectedByBlock, fieldCutByTile, FT_SIZE, FT_WALL, idx, seedTiles,
+} from './fieldCore'
 
 // 结构签名多久校验一次（tick）
 const SIG_INTERVAL = 10
 // 常驻站位多久重算一次（tick）
 const RES_INTERVAL = 10
+// 连续几轮检查没挪窝才当成"建筑"（每轮 RES_INTERVAL tick，2 轮 ≈ 20 tick）
+const STILL_CHECKS = 2
 // 每房间最多缓存多少张表（LRU）
 const MAX_FIELDS = 64
 
@@ -27,6 +33,10 @@ interface RoomTraffic {
     reservedCount: number
     resKey: string
     resTick: number
+    // 上一次封禁集合检查时各 creep 所在的格，用来识别"站定"的 creep
+    lastPos: { [name: string]: number } | null
+    // 连续几轮检查都没挪窝（站定越久越像"建筑"，避免临时停顿频繁改集合）
+    still: { [name: string]: number } | null
     fields: Map<string, FieldEntry>
     builds: number
     evictions: number
@@ -100,7 +110,7 @@ function findContainerTile(source: Source): number | null {
 
 /**
  * 常驻站位：按任务分配算，不看 creep 当前位置。
- * 目前只登记 harvester 的采矿站位（container 格），upgrader 是 range 3 不固定，不登记。
+ * harvester 的采矿站位是固定格；upgrader 之类没有固定格，靠 computeBlocked 里的"站定检测"补。
  */
 function harvesterStandingTile(creep: Creep, roomName: string): number | null {
     const work = creep.memory.currentWork
@@ -128,24 +138,47 @@ function harvesterStandingTile(creep: Creep, roomName: string): number | null {
     return null
 }
 
-function computeReserved(room: Room): { key: string, tiles: Uint8Array, count: number } {
+/**
+ * 封禁集合 = harvester 常驻站位（任务推导） + 站定 creep 的实际所在格。
+ * 站定检测：隔 RES_INTERVAL tick 比一次坐标，两轮没挪窝就当"建筑"挡路；
+ * creep 一移动/死亡，下一轮检查自然把它移出集合（场按下述规则惰性失效）。
+ */
+function computeBlocked(room: Room, st: RoomTraffic): { key: string, tiles: Uint8Array, count: number } {
     const tiles = new Uint8Array(FT_SIZE)
-    let count = 0
-    const list: number[] = []
-    for (const creep of room.find(FIND_MY_CREEPS)) {
+    const creeps = room.find(FIND_MY_CREEPS)
+    for (const creep of creeps) {
         const role = creep.memory.role
         if (role !== 'harvester' && role !== 'remoteHarvester') {
             continue
         }
         const tile = harvesterStandingTile(creep, room.name)
-        if (tile !== null && tile >= 0 && tile < FT_SIZE && !tiles[tile]) {
+        if (tile !== null && tile >= 0 && tile < FT_SIZE) {
             tiles[tile] = 1
-            count++
-            list.push(tile)
         }
     }
-    list.sort((a, b) => a - b)
-    return {key: list.join(','), tiles, count}
+    const prev = st.lastPos
+    const prevStill = st.still ?? {}
+    const next: { [name: string]: number } = {}
+    const nextStill: { [name: string]: number } = {}
+    for (const creep of creeps) {
+        const i = idx(creep.pos.x, creep.pos.y)
+        next[creep.name] = i
+        // 连续几轮检查原地没动 → 站定，当建筑挡路（spawning 的 spawn 位不算）
+        const still = prev && prev[creep.name] === i ? (prevStill[creep.name] ?? 0) + 1 : 0
+        nextStill[creep.name] = still
+        if (still >= STILL_CHECKS && !creep.spawning) {
+            tiles[i] = 1
+        }
+    }
+    st.lastPos = next
+    st.still = nextStill
+    const list: number[] = []
+    for (let i = 0; i < FT_SIZE; i++) {
+        if (tiles[i]) {
+            list.push(i)
+        }
+    }
+    return {key: list.join(','), tiles, count: list.length}
 }
 
 /** 地形 + 常驻结构（路 / 墙 / 建筑 / 矿 / 控制器）的进入代价 */
@@ -196,13 +229,59 @@ function buildBaseCost(room: Room): Uint8Array {
     return cost
 }
 
+/**
+ * 封禁集合变化后，按"这张场的路径是否真的受影响"逐张决定是否作废，
+ * 不整房清空。场本身仍然在下次 getField 被用到时才重建（一次只建这一个目标）。
+ */
+function invalidateAffectedFields(st: RoomTraffic, old: Uint8Array, next: Uint8Array, cost: Uint8Array): void {
+    if (!st.fields.size) {
+        return
+    }
+    const added: number[] = []
+    const removed: number[] = []
+    for (let i = 0; i < FT_SIZE; i++) {
+        if (next[i] && !old[i]) {
+            added.push(i)
+        } else if (!next[i] && old[i]) {
+            removed.push(i)
+        }
+    }
+    if (!added.length && !removed.length) {
+        return
+    }
+    st.fields.forEach((f, key) => {
+        const parts = key.split(',')
+        const cx = +parts[0]
+        const cy = +parts[1]
+        const range = +parts[2]
+        let drop = false
+        for (const t of added) {
+            if (fieldAffectedByBlock(f.dirs, cost, t, cx, cy, range)) {
+                drop = true
+                break
+            }
+        }
+        if (!drop) {
+            for (const t of removed) {
+                if (fieldCutByTile(f.dirs, cost, t, cx, cy, range)) {
+                    drop = true
+                    break
+                }
+            }
+        }
+        if (drop) {
+            st.fields.delete(key)
+        }
+    })
+}
+
 function ensureRoom(room: Room, forceSig = false): RoomTraffic {
     const all = stateMap()
     let st = all[room.name]
     if (!st) {
         st = all[room.name] = {
             ver: 0, sig: '', sigTick: -1e9, baseCost: null,
-            reserved: null, reservedCount: 0, resKey: '', resTick: -1e9,
+            reserved: null, reservedCount: 0, resKey: '', resTick: -1e9, lastPos: null, still: null,
             fields: new Map(), builds: 0, evictions: 0,
         }
     }
@@ -219,21 +298,43 @@ function ensureRoom(room: Room, forceSig = false): RoomTraffic {
     }
 
     if (st.reserved === null || Game.time - st.resTick >= RES_INTERVAL) {
-        const res = computeReserved(room)
+        const res = computeBlocked(room, st)
         st.resTick = Game.time
         if (res.key !== st.resKey) {
+            const old = st.reserved
             st.resKey = res.key
             st.reserved = res.tiles
             st.reservedCount = res.count
-            // 常驻位变化只影响场，不影响基础代价
-            st.fields.clear()
+            // 封禁位变化只影响场，不影响基础代价；逐张判断，能保留的都保留
+            if (!old || !st.baseCost) {
+                st.fields.clear()
+            } else {
+                invalidateAffectedFields(st, old, res.tiles, st.baseCost)
+            }
         }
     }
 
     if (!st.baseCost) {
         st.baseCost = buildBaseCost(room)
     }
+
+    pruneTracks()
     return st
+}
+
+/** 定期清理已死亡 creep 的卡住记录，避免 global 里的表无限增长 */
+function pruneTracks(): void {
+    const g = global as any
+    if (Game.time - (g.ftPruneTick ?? 0) < 100) {
+        return
+    }
+    g.ftPruneTick = Game.time
+    const tracks = trackMap()
+    tracks.forEach((_t, name) => {
+        if (!(name in Game.creeps)) {
+            tracks.delete(name)
+        }
+    })
 }
 
 export interface ResolvedField {
