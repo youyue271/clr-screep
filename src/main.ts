@@ -4,6 +4,7 @@ import log from "@/util/log";
 import {stateScanner} from "@/statistic/statistic";
 // import {totalCluster1} from "@/global/autoplan/autoplan";
 import room from "@/mount/room";
+import {trafficControl} from "@/mount/creep/traffic";
 import {testEvent} from "@/event/roomEvent";
 
 export const loop = errorMapper(() => {
@@ -17,6 +18,8 @@ export const loop = errorMapper(() => {
     scanControl()
     structureControl()
     creepControl()
+    // 所有 creep 的 work() 跑完之后统一处理"静止友军挡路"的对穿
+    trafficControl()
     roomControl()
     generatePixel()
     for (const room in Game.rooms) {

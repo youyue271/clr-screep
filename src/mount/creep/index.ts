@@ -179,6 +179,21 @@ function moveToInRoom(this: Creep, firstArg: any, secondArg?: any, thirdArg?: an
  */
 function moveWithBodyCheck(this: Creep, ...args: any[]): CreepMoveReturnCode {
     const res = nativeMove.apply(this, args)
+    if (res === OK) {
+        // 记录本 tick 的移动意图：trafficControl 靠它判断谁这 tick 动过、往哪走。
+        // 原生 moveTo / moveByPath 内部也都走 this.move(...)，所以这里能覆盖全部移动。
+        const target = args[0]
+        let dir = 0
+        if (typeof target === 'number') {
+            dir = target
+        } else if (target && target.pos && target.pos.isNearTo(this.pos)) {
+            dir = this.pos.getDirectionTo(target.pos)
+        }
+        if (dir >= 1 && dir <= 8) {
+            ;(this as any).__moveTick = Game.time
+            ;(this as any).__moveDir = dir
+        }
+    }
     if (res === ERR_NO_BODYPART) {
         this.suicideAndRespawn()
     }

@@ -3650,7 +3650,7 @@ function stateMap() {
     }
     return g.ftStates;
 }
-function trackMap() {
+function trackMap$1() {
     const g = global;
     if (!g.ftTracks) {
         g.ftTracks = new Map();
@@ -3901,7 +3901,7 @@ function pruneTracks() {
         return;
     }
     g.ftPruneTick = Game.time;
-    const tracks = trackMap();
+    const tracks = trackMap$1();
     tracks.forEach((_t, name) => {
         if (!(name in Game.creeps)) {
             tracks.delete(name);
@@ -4006,7 +4006,7 @@ function detectStructureBlock(creep, field) {
     if (!creep.my || creep.fatigue > 0) {
         return false;
     }
-    const tracks = trackMap();
+    const tracks = trackMap$1();
     const t = tracks.get(creep.name);
     const moved = !t || t.x !== creep.pos.x || t.y !== creep.pos.y;
     if (moved) {
@@ -6751,6 +6751,22 @@ function moveToInRoom(firstArg, secondArg, thirdArg) {
  */
 function moveWithBodyCheck(...args) {
     const res = nativeMove.apply(this, args);
+    if (res === OK) {
+        // 记录本 tick 的移动意图：trafficControl 靠它判断谁这 tick 动过、往哪走。
+        // 原生 moveTo / moveByPath 内部也都走 this.move(...)，所以这里能覆盖全部移动。
+        const target = args[0];
+        let dir = 0;
+        if (typeof target === 'number') {
+            dir = target;
+        }
+        else if (target && target.pos && target.pos.isNearTo(this.pos)) {
+            dir = this.pos.getDirectionTo(target.pos);
+        }
+        if (dir >= 1 && dir <= 8) {
+            this.__moveTick = Game.time;
+            this.__moveDir = dir;
+        }
+    }
     if (res === ERR_NO_BODYPART) {
         this.suicideAndRespawn();
     }
@@ -11774,6 +11790,121 @@ const stateScanner = function () {
     // }
 };
 
+/**
+ * 对穿 / 让位。
+ *
+ * 引擎实测（私服 4.2.20）：双方本 tick 都有移动意图时，引擎自己就会让两只 creep
+ * 交换位置；真正卡死的只有"移动方撞上本 tick 没有移动意图的静止友军"这一种。
+ * 距离场和原生寻路都不把 creep 当障碍（不重新绕路），所以静止挡路者会把后面的人
+ * 一直顶在原地。这里在所有 creep 的 work() 跑完之后统一补一刀：
+ *
+ *   mover 这 tick 成功发出过 move 意图
+ *   + 下一步的目标格上正好有一只友军 creep
+ *   + mover 上一 tick 也在原地（stuck >= 1，避免路过碰擦就推人）
+ *   + 挡路者这 tick 没有移动意图、有 MOVE 部件、疲劳为 0
+ *   → 替挡路者补一条反向 move，两只在回合末交换位置。
+ *
+ * 不需要处理的情况：
+ *   - 双方都在动：引擎自动对穿
+ *   - 挡路者是敌人/中立/正在孵化：不碰
+ *   - 同格多只 creep（只可能发生在 spawn 格）：跳过
+ *
+ * global.trafficDisable = true 一键关闭；global.trafficLog = [] 记录交换事件。
+ */
+function trackMap() {
+    const g = global;
+    if (!g.trafficTracks) {
+        g.trafficTracks = {};
+    }
+    return g.trafficTracks;
+}
+function trafficControl() {
+    var _a, _b;
+    const g = global;
+    if (g.trafficDisable) {
+        return;
+    }
+    const tracks = trackMap();
+    // 死亡 creep 的计数每 100 tick 清一次，避免 global 无限增长
+    if (Game.time - ((_a = g.trafficPruneTick) !== null && _a !== void 0 ? _a : 0) >= 100) {
+        g.trafficPruneTick = Game.time;
+        for (const name in tracks) {
+            if (!(name in Game.creeps)) {
+                delete tracks[name];
+            }
+        }
+    }
+    const byRoom = {};
+    const movers = [];
+    for (const name in Game.creeps) {
+        const creep = Game.creeps[name];
+        // 本 tick 位置和上一 tick 相同 → 连续没挪窝；否则清零
+        let t = tracks[name];
+        if (!t || t.tick !== Game.time - 1) {
+            tracks[name] = { x: creep.pos.x, y: creep.pos.y, tick: Game.time, stuck: 0 };
+        }
+        else if (t.x === creep.pos.x && t.y === creep.pos.y) {
+            t.stuck++;
+            t.tick = Game.time;
+        }
+        else {
+            t.x = creep.pos.x;
+            t.y = creep.pos.y;
+            t.tick = Game.time;
+            t.stuck = 0;
+        }
+        const roomName = creep.room.name;
+        const roomIndex = (_b = byRoom[roomName]) !== null && _b !== void 0 ? _b : (byRoom[roomName] = {});
+        const tile = idx(creep.pos.x, creep.pos.y);
+        // null = 这一格上不止一只 creep（只可能发生在 spawn 格），说不清挡路的是谁
+        roomIndex[tile] = roomIndex[tile] === undefined ? creep : null;
+        if (creep.__moveTick === Game.time) {
+            movers.push(creep);
+        }
+    }
+    for (const mover of movers) {
+        const dir = mover.__moveDir;
+        if (!dir || dir < 1 || dir > 8) {
+            continue;
+        }
+        const nx = mover.pos.x + DIR_DX[dir];
+        const ny = mover.pos.y + DIR_DY[dir];
+        if (nx < 0 || nx > 49 || ny < 0 || ny > 49) {
+            continue;
+        }
+        const roomIndex = byRoom[mover.room.name];
+        if (!roomIndex) {
+            continue;
+        }
+        const blocker = roomIndex[idx(nx, ny)];
+        // 没有挡路者 / 挡路者就是自己 / 不是自己的 creep 一律不管
+        if (!blocker || blocker === mover || !blocker.my || blocker.spawning) {
+            continue;
+        }
+        // 它这 tick 也在动：引擎自己会处理对穿
+        if (blocker.__moveTick === Game.time) {
+            continue;
+        }
+        // 疲劳 / 没有 MOVE 部件都发不出有效移动意图
+        if (blocker.fatigue > 0 || blocker.getActiveBodyparts(MOVE) === 0) {
+            continue;
+        }
+        const t = tracks[mover.name];
+        if (!t || t.stuck < 1) {
+            continue;
+        }
+        if (blocker.move(OPPOSITE[dir]) === OK) {
+            if (g.trafficLog) {
+                const log = g.trafficLog;
+                log.push(`${Game.time}:${mover.name}<-${blocker.name}`);
+                if (log.length > 50) {
+                    log.shift();
+                }
+            }
+        }
+    }
+}
+
 const loop = errorMapper(() => {
     mount();
     loggerInstance.warning("+----------------------------" + Game.time + "------------------------------+");
@@ -11784,6 +11915,8 @@ const loop = errorMapper(() => {
     scanControl();
     structureControl();
     creepControl();
+    // 所有 creep 的 work() 跑完之后统一处理"静止友军挡路"的对穿
+    trafficControl();
     roomControl();
     generatePixel();
     for (const room in Game.rooms) {
