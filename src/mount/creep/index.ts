@@ -10,6 +10,7 @@ import {escapeDir, idx} from "./fieldCore"
 // 本 bot 的 moveTo 目标永远在当前房间内（跨房统一走 moveToRoom 的 exit 格），
 // 所以同房间目标统一强制 maxRooms=1，只在当前房间内寻路。
 const nativeMoveTo = Creep.prototype.moveTo as (this: Creep, ...args: any[]) => CreepMoveReturnCode
+const nativeMove = Creep.prototype.move as (this: Creep, ...args: any[]) => CreepMoveReturnCode
 
 function nativeInRoom(this: Creep, isXY: boolean, firstArg: any, secondArg: any, thirdArg: any): CreepMoveReturnCode {
     if (isXY) {
@@ -115,9 +116,24 @@ function moveToInRoom(this: Creep, firstArg: any, secondArg?: any, thirdArg?: an
     return this.move(dir as DirectionConstant)
 }
 
+/**
+ * MOVE 部件全部被打掉后，引擎对方向移动返回 ERR_NO_BODYPART(-12)：
+ * 这种 creep 再也动不了，留着只会占任务名额，直接自毁并立刻补员。
+ * moveTo / moveToRoom 的最终一步都是 this.move(dir)，随机漫步也是，所以只覆盖这里。
+ * 注意：目标已经在范围内时 moveTo 会直接返回 OK，不会触发误杀。
+ */
+function moveWithBodyCheck(this: Creep, ...args: any[]): CreepMoveReturnCode {
+    const res = nativeMove.apply(this, args)
+    if (res === ERR_NO_BODYPART) {
+        this.suicideAndRespawn()
+    }
+    return res
+}
+
 export default () => {
     console.log("+ Mounting Creep extension")
     assignPrototype(Creep, CreepExtension)
     // assignPrototype 之后再覆盖，避免被 CreepExtension 上的同名方法盖掉
     Creep.prototype.moveTo = moveToInRoom as any
+    Creep.prototype.move = moveWithBodyCheck as any
 }

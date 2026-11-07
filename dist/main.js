@@ -4339,6 +4339,13 @@ class CreepExtension extends Creep {
         }
         this.say("🫳偷拿资源");
         if (!this.store.getFreeCapacity()) {
+            // 注意要区分「真的装满了」和「CARRY 被打光、总容量为 0」：
+            // 后者永远装不了货，回切 oldRole 只会和 emptyWorker 来回 ping-pong，
+            // 直接自毁，由 death 事件补员。
+            if (!this.store.getCapacity()) {
+                this.suicideAndRespawn();
+                return true;
+            }
             const targetRole = (_b = this.memory.oldRole) !== null && _b !== void 0 ? _b : this.memory.role;
             if (targetRole) {
                 this.changeRole(targetRole);
@@ -4450,6 +4457,24 @@ class CreepExtension extends Creep {
         this.memory.spawnRoom = this.room.name;
         this.memory.reSpawn = false;
         // console.log(name)
+    }
+    /**
+     * 自毁并立刻安排补员。
+     * 正常死亡要等 spawn 时按自然 TTL 挂的 creepRecycle 事件，
+     * 部件被打光提前死的话会空一个名额很久，所以这里手动给主房挂下一 tick 的事件。
+     * 用 spawnRoom 而不是 this.room：残废 creep 可能死在外矿/走廊房。
+     */
+    suicideAndRespawn() {
+        const spawnRoom = this.memory.spawnRoom ? Game.rooms[this.memory.spawnRoom] : undefined;
+        if (spawnRoom) {
+            spawnRoom.registEvent({
+                triggerTime: Game.time + 1,
+                triggerFunc: 'creepRecycle',
+                param: []
+            });
+        }
+        this.say('💀报废');
+        this.suicide();
     }
     carryEnergy(targetId, resourceType) {
         if (this.store['energy']) {
@@ -6206,6 +6231,7 @@ function detectStructureBlock(creep, field) {
 // 本 bot 的 moveTo 目标永远在当前房间内（跨房统一走 moveToRoom 的 exit 格），
 // 所以同房间目标统一强制 maxRooms=1，只在当前房间内寻路。
 const nativeMoveTo = Creep.prototype.moveTo;
+const nativeMove = Creep.prototype.move;
 function nativeInRoom(isXY, firstArg, secondArg, thirdArg) {
     if (isXY) {
         return nativeMoveTo.call(this, firstArg, secondArg, Object.assign(Object.assign({}, (thirdArg !== null && thirdArg !== void 0 ? thirdArg : {})), { maxRooms: 1 }));
@@ -6302,11 +6328,25 @@ function moveToInRoom(firstArg, secondArg, thirdArg) {
     }
     return this.move(dir);
 }
+/**
+ * MOVE 部件全部被打掉后，引擎对方向移动返回 ERR_NO_BODYPART(-12)：
+ * 这种 creep 再也动不了，留着只会占任务名额，直接自毁并立刻补员。
+ * moveTo / moveToRoom 的最终一步都是 this.move(dir)，随机漫步也是，所以只覆盖这里。
+ * 注意：目标已经在范围内时 moveTo 会直接返回 OK，不会触发误杀。
+ */
+function moveWithBodyCheck(...args) {
+    const res = nativeMove.apply(this, args);
+    if (res === ERR_NO_BODYPART) {
+        this.suicideAndRespawn();
+    }
+    return res;
+}
 var mountCreep = () => {
     console.log("+ Mounting Creep extension");
     assignPrototype(Creep, CreepExtension);
     // assignPrototype 之后再覆盖，避免被 CreepExtension 上的同名方法盖掉
     Creep.prototype.moveTo = moveToInRoom;
+    Creep.prototype.move = moveWithBodyCheck;
 };
 
 const plan1 = [

@@ -62,6 +62,11 @@ interface Creep {
     collectEnergy(id: Id<any>): boolean
     upgrade(controllerId: Id<StructureController>): boolean
     remember(): void
+    /**
+     * 自毁并立刻安排补员：给主房挂下一 tick 的 creepRecycle 事件。
+     * 普通死亡要等 spawn 时按自然 TTL 挂的事件，部件被打光提前死会空名额很久。
+     */
+    suicideAndRespawn(): void
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean
     buildConstructionSite(constructionId: Id<any>):boolean
     /**

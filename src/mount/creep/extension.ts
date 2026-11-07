@@ -422,6 +422,13 @@ export default class CreepExtension extends Creep {
         }
         this.say("🫳偷拿资源")
         if (!this.store.getFreeCapacity()) {
+            // 注意要区分「真的装满了」和「CARRY 被打光、总容量为 0」：
+            // 后者永远装不了货，回切 oldRole 只会和 emptyWorker 来回 ping-pong，
+            // 直接自毁，由 death 事件补员。
+            if (!this.store.getCapacity()) {
+                this.suicideAndRespawn()
+                return true
+            }
             const targetRole = this.memory.oldRole ?? this.memory.role
             if (targetRole) {
                 this.changeRole(targetRole)
@@ -525,6 +532,25 @@ export default class CreepExtension extends Creep {
         this.memory.spawnRoom = this.room.name
         this.memory.reSpawn = false
         // console.log(name)
+    }
+
+    /**
+     * 自毁并立刻安排补员。
+     * 正常死亡要等 spawn 时按自然 TTL 挂的 creepRecycle 事件，
+     * 部件被打光提前死的话会空一个名额很久，所以这里手动给主房挂下一 tick 的事件。
+     * 用 spawnRoom 而不是 this.room：残废 creep 可能死在外矿/走廊房。
+     */
+    suicideAndRespawn(): void {
+        const spawnRoom = this.memory.spawnRoom ? Game.rooms[this.memory.spawnRoom] : undefined
+        if (spawnRoom) {
+            spawnRoom.registEvent({
+                triggerTime: Game.time + 1,
+                triggerFunc: 'creepRecycle',
+                param: []
+            })
+        }
+        this.say('💀报废')
+        this.suicide()
     }
 
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean {
