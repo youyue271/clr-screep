@@ -6817,6 +6817,11 @@ function checkRoomLevelEvent(time) {
 //     }
 // }
 
+// checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
+// 会严重低估升级速度，实测 diff=1 把下一次检查排到了 3 万多 tick 之后，
+// 房间升级后迟迟补不上新等级的工地。封顶后最坏 3000 tick 检查一次。
+// RCL8 分支不走这个封顶（满级后按 ticksToDowngrade 排期，不做周期性轮询）。
+const CHECK_ROOM_LEVEL_MAX_GAP = 3000;
 class RoomExtension extends Room {
     /**
      * 初始化部分
@@ -9490,6 +9495,8 @@ class RoomExtension extends Room {
         const remain = progressTotal - currentProgress;
         this.initBuildList();
         if (this.controller.level == 8) {
+            // TODO: RCL8 不再升级，这里应该改成周期性检查 controller 还有多久降级
+            // （ticksToDowngrade），发现快降级时补升级；现在只是排一次到降级时刻的事件。
             this.registEvent(checkRoomLevelEvent(Game.time + this.controller.ticksToDowngrade + 1));
             return;
         }
@@ -9523,6 +9530,10 @@ class RoomExtension extends Room {
         else {
             // 最低 10 tick，避免接近升级时极限情况下每 tick 都跑一遍 initBuildList
             tickGap = Math.max(10, Math.ceil(remain / diff / 3));
+        }
+        // 封顶见文件顶部 CHECK_ROOM_LEVEL_MAX_GAP 的说明
+        if (tickGap > CHECK_ROOM_LEVEL_MAX_GAP) {
+            tickGap = CHECK_ROOM_LEVEL_MAX_GAP;
         }
         this.registEvent(checkRoomLevelEvent(Game.time + tickGap));
     }
