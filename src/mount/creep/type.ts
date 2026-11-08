@@ -24,6 +24,10 @@ interface CreepMemory {
     // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
     // 每个目标房常驻一只，避免一只 claimer 在多房间之间来回跑
     claimerTarget?: string
+    // 本 tick 已经发出的 transfer 量。transfer 要到回合末才结算，本 tick 读到的
+    // store 还是旧值，只能自己记账推算目标结算后会不会满（Game.time 变了就重置）
+    transferTick?: number
+    transferIssued?: number
 }
 
 type Role = 'worker'

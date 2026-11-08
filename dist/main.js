@@ -4659,9 +4659,19 @@ class CreepExtension extends Creep {
                 return false;
             }
             else if (res == OK) {
-                // 这个persistent不知道是用来干什么的，先不删了
-                // if (this.memory.currentWork?.persistent && !target.store.getFreeCapacity(resourceType)) {
-                if (!target.store.getFreeCapacity(resourceType)) {
+                // transfer 是回合末结算的，本 tick 读到的 store 还是投递前的旧值。
+                // 记下本 tick 已发出的投递量，据此推算结算后目标会不会被填满：
+                // 满了就当场交还任务，work() 同一 tick 接着领下一条，
+                // 不用多等一 tick 去发现「目标已满」白站一回合。
+                if (this.memory.transferTick !== Game.time) {
+                    this.memory.transferTick = Game.time;
+                    this.memory.transferIssued = 0;
+                }
+                const remainEnergy = (this.store.getUsedCapacity(resourceType) || 0)
+                    - (this.memory.transferIssued || 0);
+                const amount = Math.max(0, Math.min(remainEnergy, target.store.getFreeCapacity(resourceType)));
+                this.memory.transferIssued = (this.memory.transferIssued || 0) + amount;
+                if (target.store.getFreeCapacity(resourceType) - amount <= 0) {
                     this.removeCurrentWorkFromQueue();
                     return true;
                 }
