@@ -222,8 +222,27 @@ export default class CreepExtension extends Creep {
         if (this.memory.role === 'remoteCarrier') {
             return this.remoteCarrierIdle()
         }
-        // 外矿运输由主房按"每个矿点一只"专门孵化（refreshRemoteCarrierSpawn），
-        // 本地 carrier 不再转换成 remoteCarrier。
+        // 本地 carrier 有空闲外矿运输位、且本地 carrier 超过保底数量时，转职去跑外矿：
+        // 运输车和本地 carrier 体型完全一样，不用重新孵化。转职后死亡不进 initSpawn
+        // 配额（reSpawn=false），由主房扫描按矿点动态补员；本地保底由 refreshCarrierQuota 兜底。
+        if (this.memory.role === 'carrier'
+            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+            const opening = room.findRemoteCarryOpening()
+            if (opening) {
+                this.changeRole('remoteCarrier')
+                this.memory.remoteCarrySourceId = opening.sourceId
+                this.memory.remoteCarryRoom = opening.remoteRoom
+                delete this.memory.oldRole
+                this.memory.reSpawn = false
+                if (this.getWork()) {
+                    return true
+                }
+                // 名额被别人抢了：退回本地 carrier，别挂着外矿身份发呆
+                this.finishRemoteTrip()
+                return false
+            }
+        }
+        // 外矿运输由主房扫描（refreshRemoteCarrierSpawn）按矿点动态补员；
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
         // 取满后由 getEnergyFromStructure 按 oldRole 回到原职业。
         // harvester / remoteHarvester 不参与（采集不耗能量），emptyWorker 本身不用再转。
@@ -361,12 +380,6 @@ export default class CreepExtension extends Creep {
         if (!source) {
             return true
         }
-        // 矿采空：这 tick 不再发 harvest 意图（省一次固定意图 CPU），
-        // 进 sleep 角色等矿重生，醒来由事件恢复任务。
-        if (source.energy === 0) {
-            this.sleepUntilSourceReady(source)
-            return false
-        }
         this.say("⛏️007采矿")
         // taskParam 里的坐标只是数字，inRangeTo / moveTo 会按 creep 当前房间解释。
         // creep 一旦跑到别的房间，同坐标的格子会被误判成"已经到位"，于是只 harvest 不移动。
@@ -379,6 +392,12 @@ export default class CreepExtension extends Creep {
             } else {
                 this.moveTo(source.pos, {range: 1, visualizePathStyle: {stroke: '#ffffff'}})
             }
+            return false
+        }
+        // 矿采空：先走到矿边再睡，矿重生时人已经在位；没到就继续走下面的 container 逻辑。
+        // 之前放在函数最前面，刚孵化的 harvester 会在半路直接 sleep，醒来还要再跑一趟。
+        if (source.energy === 0 && this.pos.inRangeTo(source, 1)) {
+            this.sleepUntilSourceReady(source)
             return false
         }
 
@@ -846,8 +865,9 @@ export default class CreepExtension extends Creep {
             }
             this.memory.harvestSourceId = source.id
         }
-        // 外矿采空：同样进 sleep 等重生，不做无意义的 harvest / 修理空转
-        if (source.energy === 0) {
+        // 外矿采空：走到矿边再睡，没到位就先走去 container，
+        // 否则进外矿房就直接 sleep，醒来还得从房门口再跑一趟。
+        if (source.energy === 0 && this.pos.inRangeTo(source, 1)) {
             this.sleepUntilSourceReady(source)
             return false
         }

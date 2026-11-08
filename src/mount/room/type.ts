@@ -27,6 +27,16 @@ interface RemotePlan {
 }
 
 /**
+ * 本地 carrier 可以转职去补的外矿运输位。
+ * 由 findRemoteCarryOpening 从 remoteCarryTask 里挑一个还没满员的槽位。
+ */
+interface RemoteCarryOpening {
+    remoteRoom: string
+    sourceId: Id<Source>
+    containerId: Id<StructureContainer>
+}
+
+/**
  * 相邻房间情报缓存（顶层 Memory，和 remotePlan 一样能扛推代码）。
  * 由侦察兵或在外矿房有视野的 creep 写入，供 autoplan 选房。
  */
@@ -329,6 +339,38 @@ interface Room {
     registerContainerSiteTask(x: number, y: number): void
 
     avgCarrierCapacity(): number
+
+    /**
+     * 满体型 carrier 的额定载重：floor(energyCapacityAvailable / 100) 个 CARRY（上限 25）。
+     * 任务并发统一按"资源量 / 这个值"算，和当前活着的 creep 体型无关。
+     */
+    carrierCapacity(): number
+
+    /**
+     * 找一个还没满员的远程回运槽位，给空闲本地 carrier 转职用。
+     * 本地 carrier 没超过保底数量时返回 undefined。
+     */
+    findRemoteCarryOpening(): RemoteCarryOpening | undefined
+
+    /**
+     * 按 harvester 产出的能量动态算 worker 目标人数。
+     */
+    desiredWorkerCount(): number
+
+    /**
+     * 10 tick 扫描调用：worker 人数低于目标时补一个。
+     */
+    refreshWorkerQuota(): void
+
+    /**
+     * 10 tick 扫描调用：本地 carrier 低于保底数量时补一个。
+     */
+    refreshCarrierQuota(): void
+
+    /**
+     * 某个职业的人数（含排队/孵化中的 spawn 任务）。emptyWorker/sleep 按原职业折算。
+     */
+    countRoleWithSpawnQueue(role: Role): number
 
     containerPos(): any[]
 

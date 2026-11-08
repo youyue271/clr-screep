@@ -41,6 +41,9 @@ export default class RoomScanExtension extends Room {
             this.refreshEnergyCarryTasks()
             // 工地状态变化后升级并发要跟着调整
             this.refreshUpgradeTask()
+            // 角色数量按产能/保底动态补员（只补不裁，死亡时再按目标决定是否续）
+            this.refreshWorkerQuota()
+            this.refreshCarrierQuota()
             // 外矿任务和补员：任务登记在主房队列，孵化受"富余能量"门槛控制
             // 先按最新情报补全外矿计划（相邻房、unsafe 过滤），再同步任务/补员
             this.syncRemotePlan()

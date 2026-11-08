@@ -1,7 +1,7 @@
 import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
+import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, workerSetting} from "@/setting";
 import {createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
@@ -770,9 +770,74 @@ export default class RoomExtension extends Room {
         if (!plan || plan.enabled === false) {
             return
         }
+        // 回运任务并发跟着 container 现存能量走，先更新再按最新容量补车
+        this.refreshRemoteCarryCapacity(plan)
         // 外矿角色都不进 initSpawn 配额：按"每个矿点一只"在这里补员。
         this.refreshRemoteHarvesterSpawn(plan)
         this.refreshRemoteCarrierSpawn(plan)
+    }
+
+    /**
+     * 外矿回运任务的动态并发：capacity = ceil(container 能量 / 房间最大 carry 容量)，
+     * 上限 remoteSetting.carryMax；不够一车（< carrierCapacity）时为 0，先攒着。
+     * 没有视野时保持旧值，不能因为看不到就把车全撤了。
+     */
+    private refreshRemoteCarryCapacity(plan: RemotePlan): void {
+        const buckets = this.normalizeTaskBuckets('remoteCarryTask')
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            for (const sourceId in state.sources ?? {}) {
+                const containerId = state.sources[sourceId]?.containerId
+                if (!containerId) {
+                    continue
+                }
+                const container = Game.getObjectById(containerId as Id<StructureContainer>)
+                if (!container) {
+                    // 没视野：保留上一次算出来的并发
+                    continue
+                }
+                const capacity = this.remoteCarryCapacityOf(
+                    container.store.getUsedCapacity(RESOURCE_ENERGY))
+                const task = this.findRemoteCarryTask(buckets, containerId)
+                if (task) {
+                    task.capacity = capacity
+                }
+            }
+        }
+    }
+
+    /**
+     * 按 container 能量算需要几辆车：不足一车返回 0（先攒），
+     * 否则向上取整，上限 remoteSetting.carryMax。
+     */
+    private remoteCarryCapacityOf(energy: number): number {
+        const perTrip = this.carrierCapacity()
+        if (energy < perTrip) {
+            return 0
+        }
+        return Math.min(remoteSetting.carryMax, Math.ceil(energy / perTrip))
+    }
+
+    private findRemoteCarryTask(buckets: TaskBucket, containerId: string): TaskEntity | undefined {
+        for (const key in buckets) {
+            for (const task of buckets[key] ?? []) {
+                if (task && (task.targetId ?? task.taskParam?.[0]) === containerId) {
+                    return task
+                }
+            }
+        }
+        return undefined
+    }
+
+    /**
+     * 外矿 task 当前的目标并发（任务不存在时为 0）。
+     */
+    private remoteCarryTaskCapacityOf(containerId: string): number {
+        const task = this.findRemoteCarryTask(this.normalizeTaskBuckets('remoteCarryTask'), containerId)
+        return task?.capacity ?? 0
     }
 
     /**
@@ -802,8 +867,14 @@ export default class RoomExtension extends Room {
         }
         const sinkId = this.remoteEnergySink()
         const effectiveLink = linkId ?? this.remoteLinkOfRoom(remoteRoom)
+        // 登记时能直接看到 container 就按现存能量定并发，看不到先按一辆车算，
+        // 之后 refreshRemoteCarryCapacity 每 10 tick 按能量动态调整。
+        const container = Game.getObjectById(containerId as Id<StructureContainer>)
+        const capacity = container
+            ? this.remoteCarryCapacityOf(container.store.getUsedCapacity(RESOURCE_ENERGY))
+            : 1
         const created = this.registTask(getRemoteCarryTasks(
-            containerId as Id<StructureContainer>, remoteRoom, this.name, sinkId, effectiveLink
+            containerId as Id<StructureContainer>, remoteRoom, this.name, capacity, sinkId, effectiveLink
         ))
         const task = created[0]
         if (!task) {
@@ -1486,9 +1557,11 @@ export default class RoomExtension extends Room {
     private refreshRemoteHarvesterSpawn(plan: RemotePlan): void {
         // 旧逻辑留下的、没绑定矿点的孵化任务没法计入任何一个矿点的覆盖，直接清掉
         this.cancelUnboundRemoteSpawnTasks('remoteHarvester')
-        if (!plan.force && !this.remoteGate()) {
-            return
-        }
+        // 首次开矿（还没有 container）仍受富余能量门槛限制；
+        // 已经建好 container 的矿点是稳定产线，harvester 死了必须立刻补，
+        // 不能再等本地 container 涨到高水位——否则外矿会整片停摆。
+        const gate = plan.force || this.remoteGate()
+        const validSources = new Set<string>()
         const body = getBody('remoteHarvester', this)
         const spawnTicks = calcSpawnTicks(body)
         const ticksPerTile = calcTicksPerTile(body)
@@ -1501,6 +1574,11 @@ export default class RoomExtension extends Room {
             const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin
             for (const sourceId in state.sources ?? {}) {
+                validSources.add(sourceId)
+                const established = !!state.sources[sourceId]?.containerId
+                if (!established && !gate) {
+                    continue
+                }
                 if (this.remoteSourceCovered('remoteHarvester', sourceId, threshold)) {
                     // 有健康的人就清掉多余替补，避免扫描间隔内重复排队
                     this.cancelRemoteSourceSpawnTasks('remoteHarvester', sourceId)
@@ -1512,6 +1590,8 @@ export default class RoomExtension extends Room {
                 this.addToSpawnList('remoteHarvester', sourceId as Id<Source>, roomName)
             }
         }
+        // 计划里已经没有的矿点（停用房/被移除）：清掉遗留孵化任务
+        this.cancelStaleRemoteSpawnTasks('remoteHarvester', validSources)
     }
 
     /**
@@ -1527,6 +1607,10 @@ export default class RoomExtension extends Room {
         const body = getBody('remoteCarrier', this)
         const spawnTicks = calcSpawnTicks(body)
         const ticksPerTile = calcTicksPerTile(body)
+        // 缺车时优先把空闲本地 carrier 转职（体型完全一样，零孵化成本），
+        // 只有转职名额不够时才占 spawn。扫描间隔内转职会先发生。
+        let convertible = this.convertibleLocalCarrierCount()
+        const validSources = new Set<string>()
         for (const roomName in plan.rooms) {
             const state = plan.rooms[roomName]
             if (!state || state.enabled === false) {
@@ -1536,19 +1620,83 @@ export default class RoomExtension extends Room {
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin
             for (const sourceId in state.sources ?? {}) {
                 // 容器还没建好：先不孵化，等 containerId 写回计划再补
-                if (!state.sources[sourceId]?.containerId) {
+                const containerId = state.sources[sourceId]?.containerId
+                if (!containerId) {
                     continue
                 }
-                if (this.remoteSourceCovered('remoteCarrier', sourceId, threshold)) {
+                validSources.add(sourceId)
+                // 目标数量 = 该 container 当前应派的车数（按能量动态算）
+                const desired = this.remoteCarryTaskCapacityOf(containerId)
+                const pending = this.remoteSourcePending('remoteCarrier', sourceId)
+                const covered = this.remoteSourceCarrierCount(sourceId, threshold) + (pending ? 1 : 0)
+                if (covered >= desired) {
+                    // 车够了：清掉扫描间隔内多排的孵化任务
                     this.cancelRemoteSourceSpawnTasks('remoteCarrier', sourceId)
                     continue
                 }
-                if (this.remoteSourcePending('remoteCarrier', sourceId)) {
+                // 先用可转职的空闲本地 carrier 抵掉缺口，剩下的才占 spawn
+                let missing = desired - covered
+                const converted = Math.min(convertible, missing)
+                convertible -= converted
+                missing -= converted
+                if (missing <= 0) {
+                    continue
+                }
+                // 本扫描每个矿点最多排一只，避免一次把 spawn 塞满
+                if (pending) {
                     continue
                 }
                 this.addToSpawnList('remoteCarrier', sourceId as Id<Source>, roomName)
             }
         }
+        this.cancelStaleRemoteSpawnTasks('remoteCarrier', validSources)
+    }
+
+    /**
+     * 该矿点绑定的健康 remoteCarrier 数量（不含排队/孵化中的）。
+     */
+    private remoteSourceCarrierCount(sourceId: string, threshold: number): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom !== this.name
+                || creep.memory.role !== 'remoteCarrier'
+                || creep.memory.recall
+                || creep.memory.remoteCarrySourceId !== sourceId) {
+                continue
+            }
+            if (creep.ticksToLive === undefined || creep.ticksToLive > threshold) {
+                count++
+            }
+        }
+        return count
+    }
+
+    /**
+     * 算上保底后还能转职出去的空闲本地 carrier 数量。
+     * 只统计空载且 working=false 的，正在跑本地补能的不能被抽走。
+     */
+    private convertibleLocalCarrierCount(): number {
+        const floor = this.localCarrierFloor()
+        let locals = 0
+        let idleEmpty = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom !== this.name || creep.memory.role !== 'carrier') {
+                continue
+            }
+            locals++
+            if (creep.memory.working === false
+                && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                idleEmpty++
+            }
+        }
+        return Math.max(0, Math.min(idleEmpty, locals - floor))
+    }
+
+    private localCarrierFloor(): number {
+        const level = this.controller ? this.controller.level : 0
+        return Math.max(spawnTable.carrier[level] ?? 0, carrierSetting.localFloor)
     }
 
     /**
@@ -1655,6 +1803,31 @@ export default class RoomExtension extends Room {
     }
 
     /**
+     * 清掉绑定矿点已经不在计划里的外矿孵化任务（停用房 / 矿点被移除）。
+     */
+    private cancelStaleRemoteSpawnTasks(role: 'remoteHarvester' | 'remoteCarrier', validSources: Set<string>): void {
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            const next = queue.filter(task => {
+                if (task?.taskParam?.[0] !== role) {
+                    return true
+                }
+                const sourceId = task?.taskParam?.[2]
+                return !sourceId || validSources.has(sourceId)
+            })
+            if (next.length) {
+                spawnBuckets[key] = next
+            } else {
+                delete spawnBuckets[key]
+            }
+        }
+    }
+
+    /**
      * 富余能量门槛：主房没有待孵化任务、能量结构满、本地 container 超过高水位。
      * 三条同时满足才认为"有多余能量"，可以拿去养外矿。
      */
@@ -1686,8 +1859,10 @@ export default class RoomExtension extends Room {
      * 外矿运输车专用门槛：本地 container 高水位这条对运输车不成立——
      * 运输车本来就是去把外矿满仓的能量搬回主房，等本地 container 涨到高水位，
      * 外矿早就满仓、harvester 倒不进去只能睡觉。
-     * 改成看"外矿是否真的有货可拉"：能量满 + 没有低优先级孵化任务 +
+     * 改成看“外矿是否真的有货可拉”：没有低优先级孵化任务 +
      * 任一外矿 container 存够一车的量（remoteSetting.carrySpawnEnergy）。
+     * 不再要求主房能量满：外矿满仓是阻塞状态，优先把车派出去腾地方——
+     * 少一只本地 carrier 的代价远小于外矿 harvester 睡觉。
      */
     private remoteCarryGate(): boolean {
         if (!this.controller) {
@@ -1698,9 +1873,6 @@ export default class RoomExtension extends Room {
             if (Number(key) < 3 && (spawnBuckets[key] ?? []).length) {
                 return false
             }
-        }
-        if (this.energyAvailable < this.energyCapacityAvailable) {
-            return false
         }
         const plan = Memory.remotePlan?.[this.name]
         if (!plan || plan.enabled === false) {
@@ -2630,6 +2802,11 @@ export default class RoomExtension extends Room {
                         if (sourceId) {
                             room.ensureHarvesterForSource(sourceId as Id<Source>)
                         }
+                    } else if (memory.role === 'worker') {
+                        // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命
+                        if (room.countRoleWithSpawnQueue('worker') < room.desiredWorkerCount()) {
+                            room.addToSpawnList('worker')
+                        }
                     } else {
                         room.addToSpawnList(memory.role)
                     }
@@ -3017,6 +3194,179 @@ export default class RoomExtension extends Room {
         cache.avgCarrierCapacity = average
         cache.avgCarrierCapacityTick = Game.time
         return average
+    }
+
+    /**
+     * 房间能造出的满体型 carrier 载重：按 energyCapacityAvailable 算 CARRY 部件数。
+     * 任务并发统一按"资源量 / 这个值"定，不受当前活着的 creep 体型影响。
+     */
+    carrierCapacity(): number {
+        const parts = Math.max(1, Math.min(25, Math.floor(this.energyCapacityAvailable / 100)))
+        return parts * 50
+    }
+
+    /**
+     * worker 目标人数：收入（harvester 数 × 平均产出）除以消耗（WORK 数 × 空耗系数）。
+     * 夹在 RCL 基准配额和基准 + maxExtra 之间，避免大起大落。
+     */
+    desiredWorkerCount(): number {
+        const level = this.controller ? this.controller.level : 0
+        const base = spawnTable.worker[level] ?? 0
+        if (!base) {
+            return 0
+        }
+        const workParts = Math.max(1, Math.floor((this.energyCapacityAvailable - 150) / 150))
+        let harvesters = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom !== this.name) {
+                continue
+            }
+            const role = this.effectiveRole(creep)
+            if (role === 'harvester' || role === 'remoteHarvester') {
+                harvesters++
+            }
+        }
+        if (!harvesters) {
+            return base
+        }
+        const income = harvesters * workerSetting.sourceRate
+        const drain = workParts * workerSetting.drainFactor
+        const dynamic = Math.ceil(income / drain)
+        return Math.max(base, Math.min(base + workerSetting.maxExtra, dynamic))
+    }
+
+    /**
+     * 10 tick 扫描：worker 人数低于目标时补一个。
+     * 只补不裁——多出来的 worker 会自然去做建造/维修，死亡后由 creepRecycle 按目标决定是否补。
+     */
+    refreshWorkerQuota(): void {
+        const desired = this.desiredWorkerCount()
+        if (!desired) {
+            return
+        }
+        if (this.countRoleWithSpawnQueue('worker') < desired) {
+            this.addToSpawnList('worker')
+        }
+    }
+
+    /**
+     * 10 tick 扫描：本地 carrier 低于保底数量时补一个。
+     * 转职去外矿的车会让本地数量下降，这里负责兜底。
+     */
+    refreshCarrierQuota(): void {
+        const floor = this.localCarrierFloor()
+        if (!floor) {
+            return
+        }
+        if (this.countRoleWithSpawnQueue('carrier') < floor) {
+            this.addToSpawnList('carrier')
+        }
+    }
+
+    /**
+     * 找一个还没满员的远程回运槽位，给空闲本地 carrier 转职用。
+     * 本地 carrier 没超过保底数量时不外派，保证主房补能不断档。
+     */
+    findRemoteCarryOpening(): RemoteCarryOpening | undefined {
+        if (!this.controller) {
+            return undefined
+        }
+        const floor = this.localCarrierFloor()
+        let locals = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'carrier') {
+                locals++
+            }
+        }
+        if (locals <= floor) {
+            return undefined
+        }
+        const buckets = this.normalizeTaskBuckets('remoteCarryTask')
+        const keys = Object.keys(buckets).map(Number).sort((a, b) => a - b)
+        for (const key of keys) {
+            for (const task of buckets[String(key)] ?? []) {
+                if (!task) {
+                    continue
+                }
+                const capacity = task.capacity ?? 0
+                if (capacity <= 0) {
+                    continue
+                }
+                // 和 getWork 一样先清死掉/被召回的预约，避免名额被僵尸占着
+                const reserved = (task.reservedBy ?? []).filter(item =>
+                    item && Game.creeps[item.name] && !Game.creeps[item.name].memory.recall)
+                if (reserved.length >= capacity) {
+                    continue
+                }
+                const containerId = (task.targetId ?? task.taskParam?.[0]) as string | undefined
+                if (!containerId) {
+                    continue
+                }
+                const found = this.remoteSourceOfContainer(containerId)
+                if (!found) {
+                    continue
+                }
+                return {
+                    remoteRoom: found.roomName,
+                    sourceId: found.sourceId as Id<Source>,
+                    containerId: containerId as Id<StructureContainer>,
+                }
+            }
+        }
+        return undefined
+    }
+
+    /**
+     * 从顶层 remotePlan 反查 container 属于哪个外矿房/矿点。
+     */
+    private remoteSourceOfContainer(containerId: string): { roomName: string, sourceId: string } | undefined {
+        const plan = Memory.remotePlan?.[this.name]
+        for (const roomName in plan?.rooms ?? {}) {
+            const state = plan.rooms[roomName]
+            if (!state || state.enabled === false) {
+                continue
+            }
+            for (const sourceId in state.sources ?? {}) {
+                if (state.sources[sourceId]?.containerId === containerId) {
+                    return {roomName, sourceId}
+                }
+            }
+        }
+        return undefined
+    }
+
+    /**
+     * 实际职业：emptyWorker（临时取能）和 sleep（矿采空）都按原职业算。
+     */
+    private effectiveRole(creep: Creep): Role {
+        if (creep.memory.role === 'emptyWorker' && creep.memory.oldRole) {
+            return creep.memory.oldRole
+        }
+        return this.workRole(creep)
+    }
+
+    /**
+     * 某个职业的人数（含排队/孵化中的 spawn 任务）。
+     */
+    countRoleWithSpawnQueue(role: Role): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name && this.effectiveRole(creep) === role) {
+                count++
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === role) {
+                    count++
+                }
+            }
+        }
+        return count
     }
 
     sources(): Id<Source> [] {

@@ -113,7 +113,7 @@ export function getContainerEnergy(room: Room): MyTask[] {
     if (!maxConcurrency) {
         return []
     }
-    const avgCarry = room.avgCarrierCapacity()
+    const maxCarry = room.carrierCapacity()
     const tasks: MyTask[] = []
     for (const containerId of containerIds) {
         const container = room.containerById(containerId)
@@ -130,7 +130,7 @@ export function getContainerEnergy(room: Room): MyTask[] {
         // 大 carrier 一次能取多，需要的并发自然下降。
         const capacity = energy >= watermark.high
             ? maxConcurrency
-            : Math.max(1, Math.min(maxConcurrency, Math.ceil(usable / avgCarry)))
+            : Math.max(1, Math.min(maxConcurrency, Math.ceil(usable / maxCarry)))
         tasks.push({
             taskType: 'energyTask',
             taskFunc: 'getEnergyFromStructure',
@@ -148,7 +148,7 @@ export function getContainerEnergy(room: Room): MyTask[] {
  * 只保留前 opportunitySetting.maxTasks 条。
  */
 export function getOpportunityEnergy(room: Room): MyTask[] {
-    const avgCarry = room.avgCarrierCapacity()
+    const maxCarry = room.carrierCapacity()
     const spawn = room.find(FIND_MY_SPAWNS)[0]
     const candidates: {
         id: Id<any>
@@ -194,7 +194,10 @@ export function getOpportunityEnergy(room: Room): MyTask[] {
         taskFunc: candidate.taskFunc,
         priority: 1,
         taskParam: [candidate.id, RESOURCE_ENERGY],
-        capacity: candidate.amount >= avgCarry ? opportunitySetting.maxCapacity : 1
+        // 并发按这一堆资源能装满几整车算，大堆掉落物一次派一队人去捡，
+        // 小堆仍然只派一个人。上限 opportunitySetting.maxCapacity。
+        capacity: Math.max(1, Math.min(opportunitySetting.maxCapacity,
+            Math.ceil(candidate.amount / maxCarry)))
     }))
 }
 
@@ -209,8 +212,8 @@ export function getStorageEnergy(room: Room): MyTask[] {
     if (usable <= 0) {
         return []
     }
-    const avgCarry = room.avgCarrierCapacity()
-    const capacity = Math.max(1, Math.min(storageSetting.maxCapacity, Math.ceil(usable / avgCarry)))
+    const maxCarry = room.carrierCapacity()
+    const capacity = Math.max(1, Math.min(storageSetting.maxCapacity, Math.ceil(usable / maxCarry)))
     return [{
         taskType: 'energyTask',
         taskFunc: 'getEnergyFromStructure',
@@ -233,14 +236,14 @@ export function getCoreLinkEnergy(room: Room): MyTask[] {
     if (energy <= 0) {
         return []
     }
-    const avgCarry = room.avgCarrierCapacity()
+    const maxCarry = room.carrierCapacity()
     return [{
         taskType: 'energyTask',
         taskFunc: 'getEnergyFromStructure',
         priority: 2,
         taskParam: [link.id, RESOURCE_ENERGY],
-        // link 容量 800，按平均载重拆成 1~2 个并发就够了
-        capacity: Math.max(1, Math.min(2, Math.ceil(energy / avgCarry))),
+        // link 容量 800，按满体型载重拆成 1~2 个并发就够了
+        capacity: Math.max(1, Math.min(2, Math.ceil(energy / maxCarry))),
         targetId: link.id,
     }]
 }
@@ -314,11 +317,14 @@ export function getRemoteHarvestTasks(sourceIds: Id<Source>[], targetRoom: strin
  * 外矿运输任务：跟着外矿 container 走，循环往返。
  * taskParam: [外矿 containerId, 外矿房名, 主房名, 主房投递目标, 主房 linkId?]
  * linkId 优先于 sinkId：主房有对应 link 时先丢 link，没有就回退普通投递。
+ * capacity 不再固定：登记时按 container 当前能量算，之后每 10 tick 由
+ * refreshRemoteCarryCapacity 按"能量 / 房间最大 carry 容量"动态更新。
  */
 export function getRemoteCarryTasks(
     containerId: Id<StructureContainer>,
     targetRoom: string,
     homeRoom: string,
+    capacity: number,
     sinkId?: Id<any>,
     linkId?: Id<StructureLink>
 ): MyTask[] {
@@ -327,7 +333,8 @@ export function getRemoteCarryTasks(
         taskFunc: 'remoteCarry',
         taskParam: [containerId, targetRoom, homeRoom, sinkId, linkId],
         priority: 3,
-        capacity: remoteSetting.carryCapacity,
+        // 至少 1：刚登记时还没看到 container 就按一辆车算，等有视野再按能量调整
+        capacity: Math.max(1, Math.min(remoteSetting.carryMax, capacity)),
         persistent: true,
         targetId: containerId,
     }]

@@ -44,6 +44,26 @@ export const spawnTable: { [role in Role]: number[] } = {
     'sleep':        [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
+// 本地 carrier 保底数量：运输车和本地 carrier 体型完全一样，
+// 外矿缺车时优先把空闲的本地 carrier 转职过去，但本地至少留这么多，
+// 否则 spawn/extension 补能会断档。
+export const carrierSetting = {
+    localFloor: 4,
+}
+
+// worker 人数按可用产能动态决定（不是按固定配额）：
+// 主矿 + 外矿的 harvester 按平均产出 sourceRate 能量/tick 估算收入，
+// 满体型 worker 的 WORK 数决定消耗速度 drainFactor（含走路/建造/维修的空耗）。
+// 人数 = ceil(收入 / 消耗)，夹在 [spawnTable.worker[level], 基准 + maxExtra] 之间。
+export const workerSetting = {
+    // 每个 harvester（含外矿）的平均产出：3000 能量 / 300 tick
+    sourceRate: 10,
+    // 每个 WORK 部件的能量消耗速度（升级 1/tick，建造/维修/走路折算后约 1.5）
+    drainFactor: 1.5,
+    // 在 RCL 基准配额之上最多再追加几个 worker
+    maxExtra: 4,
+}
+
 export const upgradeTaskCapacity = [0, 2, 2, 5, 5, 4, 4, 4, 1]
 
 // 升级并发：有工地时仍用 upgradeTaskCapacity 的基准值，
@@ -79,8 +99,9 @@ export const containerConcurrency = [0, 1, 2, 3, 4, 4, 5, 5, 5]
 // 掉落物/墓碑的机会队列：按衰减速度 + 距离评分，只保留前几条
 export const opportunitySetting = {
     maxTasks: 4,
-    // 单条机会任务最多允许几个 creep
-    maxCapacity: 2,
+    // 单条机会任务最多允许几个 creep。按"资源量 / 房间最大 carry 容量"动态算，
+    // 这里只是上限：大堆掉落物可以一次派一队人去捡。
+    maxCapacity: 6,
 }
 
 // storage 储备：低于 reserveEnergy 不再向外派取能任务
@@ -157,8 +178,9 @@ export const harvestSetting = {
 
 // 外矿（"富余能量才做"的添头）
 export const remoteSetting = {
-    // 同一个外矿 container 同时允许几个 carrier 去拉
-    carryCapacity: 2,
+    // 同一个外矿 container 最多同时派几辆车：任务并发按
+    // ceil(container 能量 / 房间最大 carry 容量) 动态算，这里只是上限。
+    carryMax: 4,
     // 外矿 transport 车补员门槛：外矿 container 至少存了这么多能量才补车。
     // 不用本地 container 高水位做门槛——运输车本来就是去把外矿满仓的能量搬回来，
     // 等本地 container 涨起来，外矿早就满仓、harvester 倒不进去只能睡觉了。
