@@ -176,7 +176,7 @@ const getWorkerBody = function (room: Room) {
 // 控制器等级 -> claimer 的 CLAIM 部件数。
 // 保留每 tick 只加 CLAIM 部件数（净增 = 部件数 - 1），部件越多缓冲涨得越快；
 // 占领本身只需要 1 个 CLAIM，所以低 RCL 先用 1 个把活干起来。
-const claimerPartsByLevel = [0, 1, 1, 1, 1, 2, 2, 3, 4]
+const claimerPartsByLevel = [0, 1, 1, 1, 2, 2, 2, 3, 4]
 
 export const getClaimerBody = function (room: Room) {
     const level = room.controller?.level ?? 0
