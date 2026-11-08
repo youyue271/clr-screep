@@ -131,6 +131,21 @@ export const wallSetting = {
     minStorageEnergy: 50000,
 }
 
+// 布局外的道路：连接锚点用完整布局道路网（所有 r 格，不管当前等级），
+// 一次规划到 RCL8 的最终走向，再按等级分段施工——
+// RCL3 铺的本地段就是最终路网的一部分，后续等级只往外延伸。
+export const roadSetting = {
+    // 本地段：矿点 container + controller
+    localMinLevel: 3,
+    // 外矿段：主房里通往各外矿出口的 remoteLinkPos
+    remoteMinLevel: 4,
+    // 矿物段：矿物位置（FIND_MINERALS）
+    mineralMinLevel: 5,
+    // 每房工地上限（MAX_CONSTRUCTION_SITES）打满时的重试间隔。
+    // 到上限就挂一个这么 tick 之后的回调事件，不用定时扫描。
+    siteRetryTicks: 3000,
+}
+
 export const harvestSetting = {
     // 每个矿点允许的采集者数量：平时 1 个，换班时新旧 harvester 可以同时占用
     capacity: 2,

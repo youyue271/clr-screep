@@ -98,6 +98,8 @@ interface RoomMemory {
     claimerSpawnTick?: { [roomName: string]: number }
     // link 规划：位置在建房时算好，id 在建成/推代码后回填
     linkPlan?: LinkPlan
+    // 布局外的道路规划：几何一次算到 RCL8，按等级分段施工
+    roadPlan?: RoadPlan
 }
 
 interface LinkPlan {
@@ -109,6 +111,21 @@ interface LinkPlan {
     remotes?: { [roomName: string]: { pos: [number, number], id?: Id<StructureLink> } }
     // 按距离排好的建造顺序，key 形如 core / source:xxx / remote:xxx
     order?: string[]
+}
+
+/**
+ * 布局外的道路（布局道路网 -> 矿点 container / controller / 外矿出口 / 矿物）。
+ * 几何一次算到 RCL8，等级只决定哪一段先放行施工。
+ */
+interface RoadPlan {
+    // 规划签名：布局锚点 + 目标集合。变了才重新寻路
+    signature?: string
+    // 按开建等级分段的道路格：{3: [...], 4: [...], 5: [...]}
+    segments?: { [level: string]: [number, number][] }
+    // 当前等级已放行、还没挂成工地的道路格（受 100 工地上限分批）
+    pending?: [number, number][]
+    // 工地上限打满后下一次重试的 tick，避免重复挂回调
+    retryAt?: number
 }
 
 interface Room {
@@ -336,4 +353,14 @@ interface Room {
     showRoomPlan(): void
 
     construct(level: number): void
+
+    /**
+     * 规划/续建布局外的道路：签名不变不寻路，只按等级放行分段。
+     */
+    syncRoadPlan(): void
+
+    /**
+     * 把当前等级已放行的道路格挂成工地（受 100 工地上限分批）。
+     */
+    flushRoadSites(): void
 }

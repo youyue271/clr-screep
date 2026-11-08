@@ -1,7 +1,7 @@
 import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, initializeArray} from "@/util/utils";
 import {mapping, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {containerWatermark, harvestSetting, remoteSetting, repairSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
+import {containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting} from "@/setting";
 import {createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
@@ -87,8 +87,13 @@ export default class RoomExtension extends Room {
         this.cacheHarvestSpawnDistances()
         // link 规划要在登记建造任务之前：新工地当 tick 就能进 constructTask
         this.syncLinkPlan()
+        // 跳过已经挂过任务的工地（syncLinkPlan 当 tick 挂过 link 工地）
         const constructionSites = this.find(FIND_CONSTRUCTION_SITES)
+            .filter(site => !this.hasBuildTaskFor(site.id))
         this.registTask(createBuildTask(constructionSites))
+        // 布局外的道路：几何一次算到 RCL8，按等级分段施工；
+        // 放在工地批量登记之后，新挂的道路工地由 flushRoadSites 自己登记，避免重复
+        this.syncRoadPlan()
     }
 
     /**
@@ -1000,6 +1005,7 @@ export default class RoomExtension extends Room {
         // 外矿 link：位置持久化在顶层 remotePlan 里，推代码后不用重新寻路
         const remotes = plan.remotes ?? (plan.remotes = {})
         const remotePlan = Memory.remotePlan?.[this.name]
+        let remoteLinkChanged = false
         for (const roomName in remotePlan?.rooms ?? {}) {
             const state = remotePlan.rooms[roomName]
             if (!state || state.enabled === false) {
@@ -1014,6 +1020,8 @@ export default class RoomExtension extends Room {
                 pos = this.computeRemoteLinkPos(roomName, assigned)
                 if (pos) {
                     state.remoteLinkPos = pos
+                    // 新确定了外矿出口位置：道路目标集合变了
+                    remoteLinkChanged = true
                 }
             }
             if (!pos) {
@@ -1070,35 +1078,38 @@ export default class RoomExtension extends Room {
         }).length
         let slots = limit - built - sites
         plan.order = this.linkBuildOrder(corePos)
-        if (slots <= 0) {
-            return
+        if (slots > 0) {
+            for (const key of plan.order) {
+                if (slots <= 0) {
+                    break
+                }
+                const pos = this.linkPlanPosOfKey(key, plan)
+                if (!pos) {
+                    continue
+                }
+                if (this.linkIdAt(pos)) {
+                    continue
+                }
+                if (this.siteAt(pos)) {
+                    continue
+                }
+                if (!this.linkTileFree(pos)) {
+                    continue
+                }
+                if (this.createConstructionSite(pos[0], pos[1], STRUCTURE_LINK) !== OK) {
+                    continue
+                }
+                slots--
+                // 当 tick 就把新工地登记进建造队列，不用等下一次 initBuildList
+                const site = this.getPositionAt(pos[0], pos[1])?.lookFor(LOOK_CONSTRUCTION_SITES)[0]
+                if (site && !this.hasBuildTaskFor(site.id)) {
+                    this.registTask(createBuildTask([site]))
+                }
+            }
         }
-        for (const key of plan.order) {
-            if (slots <= 0) {
-                break
-            }
-            const pos = this.linkPlanPosOfKey(key, plan)
-            if (!pos) {
-                continue
-            }
-            if (this.linkIdAt(pos)) {
-                continue
-            }
-            if (this.siteAt(pos)) {
-                continue
-            }
-            if (!this.linkTileFree(pos)) {
-                continue
-            }
-            if (this.createConstructionSite(pos[0], pos[1], STRUCTURE_LINK) !== OK) {
-                continue
-            }
-            slots--
-            // 当 tick 就把新工地登记进建造队列，不用等下一次 initBuildList
-            const site = this.getPositionAt(pos[0], pos[1])?.lookFor(LOOK_CONSTRUCTION_SITES)[0]
-            if (site && !this.hasBuildTaskFor(site.id)) {
-                this.registTask(createBuildTask([site]))
-            }
+        // 新确定了外矿出口位置：道路目标集合变了，立刻补一次道路规划
+        if (remoteLinkChanged) {
+            this.syncRoadPlan()
         }
     }
 
@@ -2708,6 +2719,10 @@ export default class RoomExtension extends Room {
                 this.onLinkBuilt(structure as StructureLink)
             }
         }
+        // 工地建成 = 槽位释放：把道路 pending 里的下一批挂上（异步续批，不等轮询）
+        if (this.memory.roadPlan?.pending?.length) {
+            this.flushRoadSites()
+        }
     }
 
     checkRoomLevel() {
@@ -3602,5 +3617,303 @@ export default class RoomExtension extends Room {
                 }
             }
         }
+    }
+
+    /**
+     * 布局外的道路规划：一次算到 RCL8 的最终路网，按等级分段施工。
+     * 连接锚点用完整布局道路网（所有 r 格，不按当前等级过滤），
+     * 所以 RCL3 铺的本地段就是最终路网的一部分，后续等级只往外延伸。
+     * 签名不含等级：升级不会重算几何，只会让 flushRoadSites 放行下一段。
+     */
+    syncRoadPlan(): void {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
+        // 推代码后 creep 可能先于 room.init 跑（recordRoomIntel 会调到这里），
+        // global.room 还没建好就先跳过，下一次 initBuildList 会补
+        if (!global.room[this.name]) {
+            return
+        }
+        if (this.controller.level < roadSetting.localMinLevel) {
+            return
+        }
+        if (!this.memory.plan1Pos && !this.memory.plan2Pos) {
+            return
+        }
+        const plan = this.memory.roadPlan ?? (this.memory.roadPlan = {})
+        const targets = this.roadPlanTargets()
+        const signature = this.roadPlanSignature(targets)
+        if (plan.signature !== signature) {
+            plan.signature = signature
+            plan.segments = this.computeRoadSegments(targets)
+            // 目标集合变了，已放行但还没挂的格子作废，按新分段重新放行
+            plan.pending = []
+        }
+        this.flushRoadSites()
+    }
+
+    /**
+     * 把当前等级已放行的道路格挂成工地。
+     * 每房最多 MAX_CONSTRUCTION_SITES 个工地：打满就挂一个 siteRetryTicks 后的
+     * 回调事件，等槽位释放再试，不做定时扫描。
+     */
+    flushRoadSites(): void {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
+        const plan = this.memory.roadPlan
+        if (!plan) {
+            return
+        }
+        let pending = plan.pending
+        if (!pending?.length) {
+            pending = this.releaseRoadTiles(plan)
+        }
+        if (!pending.length) {
+            return
+        }
+        const slots = MAX_CONSTRUCTION_SITES - this.find(FIND_CONSTRUCTION_SITES).length
+        if (slots <= 0) {
+            this.scheduleRoadRetry(plan)
+            return
+        }
+        const created: ConstructionSite[] = []
+        const left: [number, number][] = []
+        for (let i = 0; i < pending.length; i++) {
+            const tile = pending[i]
+            if (created.length >= slots) {
+                left.push(tile)
+                continue
+            }
+            const code = this.createConstructionSite(tile[0], tile[1], STRUCTURE_ROAD)
+            if (code === OK) {
+                const site = this.getPositionAt(tile[0], tile[1])?.lookFor(LOOK_CONSTRUCTION_SITES)[0]
+                if (site) {
+                    created.push(site)
+                }
+                continue
+            }
+            if (code === ERR_FULL) {
+                // 槽位其实已经满了：剩下的留到回调事件再挂
+                left.push(...pending.slice(i))
+                this.scheduleRoadRetry(plan)
+                break
+            }
+            // 其他错误（格子被占/已有路/已有工地）：丢掉这一格，避免反复卡住
+        }
+        plan.pending = left
+        if (created.length) {
+            this.registTask(createBuildTask(created))
+        }
+    }
+
+    /**
+     * 把分段里当前等级已放行的格子挪进 pending。
+     * 已建成的路/已有工地直接算完成，不重复挂。
+     */
+    private releaseRoadTiles(plan: RoadPlan): [number, number][] {
+        const pending: [number, number][] = []
+        const level = this.controller?.level ?? 0
+        const segments = plan.segments ?? {}
+        for (const key in segments) {
+            if (Number(key) > level) {
+                continue
+            }
+            for (const tile of segments[key]) {
+                if (!this.roadTileBlocked(tile[0], tile[1])) {
+                    pending.push(tile)
+                }
+            }
+            // 这一段已放行完，删掉；后续等级的新段会继续补进来
+            delete segments[key]
+        }
+        plan.pending = pending
+        return pending
+    }
+
+    /**
+     * 工地上限打满时挂一个 siteRetryTicks 后的回调事件（只挂一次）。
+     */
+    private scheduleRoadRetry(plan: RoadPlan): void {
+        if (plan.retryAt !== undefined && plan.retryAt > Game.time) {
+            return
+        }
+        plan.retryAt = Game.time + roadSetting.siteRetryTicks
+        this.registEvent({
+            triggerTime: plan.retryAt,
+            triggerFunc: 'flushRoadSites',
+            param: [],
+        })
+    }
+
+    /**
+     * 道路目标：每段的目标位置 + 允许开建等级。
+     * 目标一开始就全部算出来（不管当前等级），整张路网一次定死。
+     */
+    private roadPlanTargets(): { level: number; pos: [number, number] }[] {
+        const targets: { level: number; pos: [number, number] }[] = []
+        // 本地段：矿点 container（还没建就用矿点位置）+ controller
+        for (const sourceId of this.sources()) {
+            const containerPos = this.memory.containerPosById?.[sourceId]
+            const source = containerPos ? undefined : Game.getObjectById<Source>(sourceId)
+            const pos = containerPos ?? (source ? [source.pos.x, source.pos.y] as [number, number] : undefined)
+            if (pos) {
+                targets.push({level: roadSetting.localMinLevel, pos})
+            }
+        }
+        if (this.controller) {
+            targets.push({
+                level: roadSetting.localMinLevel,
+                pos: [this.controller.pos.x, this.controller.pos.y],
+            })
+        }
+        // 外矿段：主房里靠近出口的 drop/link 位（有 container 的外矿才会算出来）
+        const remotePlan = Memory.remotePlan?.[this.name]
+        for (const roomName in remotePlan?.rooms ?? {}) {
+            const state = remotePlan.rooms[roomName]
+            if (!state || state.enabled === false || !state.remoteLinkPos) {
+                continue
+            }
+            targets.push({level: roadSetting.remoteMinLevel, pos: state.remoteLinkPos})
+        }
+        // 矿物段
+        const mineral = this.find(FIND_MINERALS)[0]
+        if (mineral) {
+            targets.push({
+                level: roadSetting.mineralMinLevel,
+                pos: [mineral.pos.x, mineral.pos.y],
+            })
+        }
+        return targets
+    }
+
+    private roadPlanSignature(targets: { level: number; pos: [number, number] }[]): string {
+        const planType = this.memory.roomPlanType === 2 ? 2 : 1
+        const anchor = planType === 2 ? this.memory.plan2Pos : this.memory.plan1Pos
+        const parts = targets.map(t => `${t.level}:${t.pos[0]},${t.pos[1]}`).sort()
+        return `${planType}|${JSON.stringify(anchor)}|${parts.join(';')}`
+    }
+
+    /**
+     * 每个目标算一条"最近的布局道路格 -> 目标"的路径，并集去重后按开建等级分段。
+     * 同一格被多段用到时归到最早的等级，避免重复施工。
+     */
+    private computeRoadSegments(targets: { level: number; pos: [number, number] }[]): { [level: string]: [number, number][] } {
+        const segments: { [level: string]: [number, number][] } = {}
+        const roadCells = this.layoutRoadCells()
+        const fallbackHub = this.layoutLinkPos()
+        const hubPositions = roadCells.length
+            ? roadCells
+            : (fallbackHub ? [this.getPositionAt(fallbackHub[0], fallbackHub[1])] : [])
+        const hubs = hubPositions.filter((pos): pos is RoomPosition => !!pos)
+        if (!hubs.length) {
+            return segments
+        }
+        const layoutKeys = this.layoutCellKeySet()
+        const seen = new Set<string>()
+        for (const target of targets) {
+            const start = this.roadPathStart(hubs, target.pos)
+            const goal = this.getPositionAt(target.pos[0], target.pos[1])
+            if (!start || !goal) {
+                continue
+            }
+            const path = this.findPath(start, goal, {ignoreCreeps: true, range: 1})
+            const key = String(target.level)
+            const tiles = segments[key] ?? (segments[key] = [])
+            for (const step of path) {
+                const cellKey = `${step.x},${step.y}`
+                if (layoutKeys.has(cellKey) || seen.has(cellKey)) {
+                    continue
+                }
+                seen.add(cellKey)
+                if (this.roadTileBlocked(step.x, step.y)) {
+                    continue
+                }
+                tiles.push([step.x, step.y])
+            }
+        }
+        return segments
+    }
+
+    private roadPathStart(starts: RoomPosition[], target: [number, number]): RoomPosition | undefined {
+        if (starts.length === 1) {
+            return starts[0]
+        }
+        const targetPos = this.getPositionAt(target[0], target[1])
+        if (!targetPos) {
+            return undefined
+        }
+        const closest = targetPos.findClosestByPath(starts, {ignoreCreeps: true})
+        if (closest) {
+            return closest
+        }
+        return targetPos.findClosestByRange(starts) ?? undefined
+    }
+
+    /**
+     * 布局锚点下所有格的坐标。roadOnly=true 只取 r 格（完整道路网），
+     * 否则取全部格（用于把基地内部从外部道路里过滤掉）。
+     * 坐标公式和 constructPlan1 / buildLayout 保持一致。
+     */
+    private layoutCells(roadOnly: boolean): [number, number][] {
+        const cells: [number, number][] = []
+        const collect = (map: string[], xx: number, yy: number, offset: number) => {
+            for (let y = 0; y < map.length; y++) {
+                const row = map[y].split(' ')
+                for (let x = 0; x < row.length; x++) {
+                    if (roadOnly && row[x][0] !== 'r') {
+                        continue
+                    }
+                    cells.push([xx + x - offset, yy + y - offset])
+                }
+            }
+        }
+        if (this.memory.roomPlanType === 2) {
+            const pos = this.memory.plan2Pos
+            if (!pos) {
+                return cells
+            }
+            collect(plan2_Core, pos.core[0], pos.core[1], plan2_Core.length - 1)
+            collect(plan2_extensionCluster1, pos.ext1[0], pos.ext1[1], plan2_extensionCluster1.length - 1)
+            collect(plan2_extensionCluster2, pos.ext2[0], pos.ext2[1], plan2_extensionCluster2.length - 1)
+            collect(plan2_Lab, pos.lab[0], pos.lab[1], plan2_Lab.length - 1)
+        } else {
+            const pos = this.memory.plan1Pos
+            if (!pos) {
+                return cells
+            }
+            collect(plan1, pos[0], pos[1], plan1.length)
+        }
+        return cells
+    }
+
+    private layoutRoadCells(): RoomPosition[] {
+        return this.layoutCells(true)
+            .map(([x, y]) => this.getPositionAt(x, y))
+            .filter((pos): pos is RoomPosition => !!pos)
+    }
+
+    private layoutCellKeySet(): Set<string> {
+        const keys = new Set<string>()
+        for (const [x, y] of this.layoutCells(false)) {
+            keys.add(`${x},${y}`)
+        }
+        return keys
+    }
+
+    /**
+     * 这一格能不能放道路工地：墙、已有建筑、已有工地都不行。
+     * 已有道路也算建筑，会被过滤掉，避免重复挂工地。
+     */
+    private roadTileBlocked(x: number, y: number): boolean {
+        if (this.getTerrain().get(x, y) === TERRAIN_MASK_WALL) {
+            return true
+        }
+        const pos = this.getPositionAt(x, y)
+        if (!pos) {
+            return true
+        }
+        return pos.lookFor(LOOK_STRUCTURES).length > 0
+            || pos.lookFor(LOOK_CONSTRUCTION_SITES).length > 0
     }
 }

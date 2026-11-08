@@ -128,6 +128,8 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
         if (state.enabled !== false) {
             // 停用是明确决定：立刻清掉回运任务，不等 10 tick 扫描
             Game.rooms[homeRoomName]?.removeRemoteCarryTasksOfRoom(room.name)
+            // 外矿停用：重算道路分段，pending 里不再保留这个房的路
+            Game.rooms[homeRoomName]?.syncRoadPlan()
         }
         state.enabled = false
         return
@@ -157,6 +159,8 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
                 entry.containerPos = [container.pos.x, container.pos.y]
                 homeRoom.registerRemoteCarryTask(room.name, source.id, container.id)
             }
+            // 外矿重新启用：remoteLinkPos 可能还在，道路目标集合变了，重算一次
+            homeRoom.syncRoadPlan()
         }
     }
 }
