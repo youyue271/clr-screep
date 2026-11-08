@@ -703,10 +703,12 @@ export default class RoomExtension extends Room {
                 return
             }
         }
-        // 外矿保留：房间还在计划里且安全，就一直保持一只驻守 claimer
-        if (!plan.force && !this.remoteGate()) {
-            return
-        }
+        // 外矿保留：计划内、启用且安全的房就一直保持一只驻守 claimer。
+        // 这里不再用 remoteGate 当门槛——worker 动态配额会让 priority 2 的任务
+        // 长期占着队列，满能量 + 本地 container 高水位的条件几乎打不开，
+        // claimer 老死后保留会直接归零。claimer 本身是 priority 3，排在
+        // harvester/carrier/worker 之后，不会抢经济的能量；等能量太久还有
+        // getBodyForEnergy 缩体型兜底，不会永久堵住同优先级的外矿补员。
         for (const roomName in plan.rooms) {
             const state = plan.rooms[roomName]
             if (!state || state.enabled === false) {
