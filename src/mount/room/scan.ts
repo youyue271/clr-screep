@@ -37,8 +37,7 @@ export default class RoomScanExtension extends Room {
             || now - cache.lastEnergyTaskScan >= 10) {
             cache.lastEnergyTaskScan = now
             this.refreshEnergyTasks()
-            // spawn/extension 的补能需求同样按间隔兜底同步
-            this.refreshEnergyCarryTasks()
+            // spawn/extension 的补能不再周期性遍历：由孵化/建成/桶补满等事件触发
             // 工地状态变化后升级并发要跟着调整
             this.refreshUpgradeTask()
             // 角色数量按产能/保底动态补员（只补不裁，死亡时再按目标决定是否续）

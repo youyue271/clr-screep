@@ -256,6 +256,7 @@ const RoomNodes: myNode[] = [
             const TaskType = ['workTask'
                 , 'harvestTask'
                 , 'carryTask'
+                , 'bucketCarryTask'
                 , 'upgradeTask'
                 , "constructTask"
                 , 'energyTask'

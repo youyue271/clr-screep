@@ -135,3 +135,57 @@ export const mapping = {
     N: "Null"
 }
 
+
+/**
+ * 能量桶：一个桶 = 一个道路节点 + 若干距离恰好为 1 的 extension。
+ * 坐标都是对应 plan 地图里的局部坐标，运行时按锚点换算成绝对坐标：
+ * plan1: abs = plan1Pos + local - plan1.length
+ * plan2: abs = regionAnchor + local - (map.length - 1)
+ *
+ * carrier 只需要走到桶节点，桶内成员全部在 1 格范围内，
+ * 不用为每个 extension 单独寻路；spawn 扣能量时按桶为前缀取，
+ * 一个桶被抽掉多少，就只登记这一个桶的补能任务。
+ */
+export interface EnergyBucketPlan {
+    node: [number, number]
+    members: [number, number][]
+}
+
+/**
+ * plan1 严格距离 1 的 16 桶划分：60 个 extension 全覆盖、无重复，
+ * 每桶 3~5 个。节点本身必须是道路格。
+ */
+export const plan1Buckets: EnergyBucketPlan[] = [
+    {node: [1, 1], members: [[0, 0], [1, 0], [2, 0], [0, 1], [0, 2]]},
+    {node: [4, 1], members: [[3, 0], [4, 0], [3, 1], [5, 1]]},
+    {node: [6, 1], members: [[6, 0], [7, 0], [7, 1]]},
+    {node: [9, 1], members: [[8, 0], [9, 0], [10, 0], [10, 2]]},
+    {node: [9, 2], members: [[8, 1], [10, 1], [8, 2]]},
+    {node: [2, 3], members: [[1, 2], [2, 2], [1, 3], [2, 4]]},
+    {node: [4, 3], members: [[5, 3], [3, 3], [3, 4]]},
+    {node: [1, 4], members: [[0, 3], [0, 4], [1, 5], [2, 5]]},
+    {node: [9, 4], members: [[10, 4], [9, 3], [10, 3]]},
+    {node: [6, 5], members: [[6, 4], [7, 5], [6, 6]]},
+    {node: [1, 6], members: [[0, 6], [2, 6], [0, 7], [1, 7]]},
+    {node: [3, 8], members: [[3, 7], [4, 7], [2, 8], [2, 9]]},
+    {node: [1, 9], members: [[0, 8], [0, 9], [0, 10], [1, 10], [2, 10]]},
+    {node: [4, 9], members: [[3, 10], [4, 10], [3, 9]]},
+    {node: [6, 9], members: [[7, 9], [6, 10], [7, 10]]},
+    {node: [9, 9], members: [[10, 8], [10, 9], [8, 10], [9, 10], [10, 10]]},
+]
+
+/** plan2 Core 四环：3/3/4/4，全部距离 1。 */
+export const plan2CoreBuckets: EnergyBucketPlan[] = [
+    {node: [1, 1], members: [[1, 0], [0, 1], [2, 1]]},
+    {node: [5, 1], members: [[5, 0], [4, 1], [5, 2]]},
+    {node: [1, 5], members: [[1, 4], [0, 5], [2, 5], [1, 6]]},
+    {node: [5, 5], members: [[5, 4], [4, 5], [6, 5], [5, 6]]},
+]
+
+/** plan2 每个 extension cluster 的四环模板：6/6/6/5，全部距离 1。 */
+export const plan2ClusterBuckets: EnergyBucketPlan[] = [
+    {node: [1, 1], members: [[0, 0], [1, 0], [0, 1], [2, 1], [1, 2], [2, 2]]},
+    {node: [4, 1], members: [[4, 0], [5, 0], [3, 1], [5, 1], [3, 2], [4, 2]]},
+    {node: [1, 4], members: [[1, 3], [2, 3], [0, 4], [2, 4], [0, 5], [1, 5]]},
+    {node: [4, 4], members: [[3, 3], [3, 4], [5, 4], [4, 5], [5, 5]]},
+]

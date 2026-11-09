@@ -298,6 +298,22 @@ export function getCarryList(targetList:Structure[], resourceType:ResourceConsta
 }
 
 /**
+ * 能量桶补能任务：一个桶一条，targetId 用桶节点坐标当 key。
+ * carrier 只认领桶，桶里哪个 extension 空、要不要换目标由 carryBucket 自己决定。
+ */
+export function getBucketCarryTask(bucketKey: string): MyTask {
+    return {
+        taskType: 'bucketCarryTask',
+        taskFunc: 'carryBucket',
+        taskParam: [bucketKey, RESOURCE_ENERGY],
+        priority: 1,
+        capacity: 1,
+        persistent: true,
+        targetId: bucketKey
+    }
+}
+
+/**
  * 外矿采集任务：一个矿点一条，容量 1（常驻 harvester 一人一矿）。
  * taskParam: [sourceId, 外矿房名, 主房名]
  * sourceId 为 null 的探路任务由房间扩展自己构造。

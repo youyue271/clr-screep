@@ -11,8 +11,9 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     // 只有少数 worker 会短暂转去维修，修完后自动回来升级
     'worker': ['repairTask', 'wallRepairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
-    // 本地补能永远先认领；本地没活时才转换角色去外矿拉货
-    'carrier': ['carryTask'],
+    // 本地补能永远先认领；桶任务优先（一次覆盖整桶），塔/spawn/布局外结构再走单目标
+    // 本地没活时才转换角色去外矿拉货
+    'carrier': ['bucketCarryTask', 'carryTask'],
     'remoteHarvester': ['remoteHarvestTask'],
     // 外矿专用运输只做外矿往返，保证外矿 container 不会因为本地任务不断出现而被饿死
     'remoteCarrier': ['remoteCarryTask'],
@@ -634,86 +635,144 @@ export default class CreepExtension extends Creep {
         this.suicide()
     }
 
+    /**
+     * 把身上的能量投给目标。
+     * true = 目标在本 tick 结算后已经满了/不可用，调用方可以换目标或交还任务；
+     * false = 还在移动或还没投满，本 tick 继续。
+     * moveTarget 给能量桶用：站到桶节点比追着每个 extension 跑更省移动。
+     */
+    private transferEnergyTo(target: any, resourceType: ResourceConstant, moveTarget?: RoomPosition): boolean {
+        if (!target.store.getFreeCapacity(resourceType)) {
+            return true
+        }
+        this.say("⚡运输中")
+        const res = this.transfer(target, resourceType)
+        if (res == ERR_NOT_IN_RANGE) {
+            this.moveTo(moveTarget ?? target, {visualizePathStyle: {stroke: '#ffffff'}})
+            return false
+        }
+        if (res == OK) {
+            // transfer 是回合末结算的，本 tick 读到的 store 还是投递前的旧值。
+            // 记下本 tick 已发出的投递量，据此推算结算后目标会不会被填满：
+            // 满了就当场交还任务，work() 同一 tick 接着领下一条，
+            // 不用多等一 tick 去发现「目标已满」白站一回合。
+            if (this.memory.transferTick !== Game.time) {
+                this.memory.transferTick = Game.time
+                this.memory.transferIssued = 0
+            }
+            const remainEnergy = (this.store.getUsedCapacity(resourceType) || 0)
+                - (this.memory.transferIssued || 0)
+            const amount = Math.max(0, Math.min(remainEnergy, target.store.getFreeCapacity(resourceType)))
+            this.memory.transferIssued = (this.memory.transferIssued || 0) + amount
+            return target.store.getFreeCapacity(resourceType) - amount <= 0
+        }
+        if (res == ERR_FULL) {
+            this.say("⚡目标已满")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 身上没能量时去中央 link / container 取能。
+     * true = 正在去取或已经取到，继续保留补能任务；
+     * false = 本房取不到，已经转成 emptyWorker。
+     */
+    private refillCarryFromSource(resourceType: ResourceConstant): boolean {
+        // 高优先级补能任务自带取能：carrier 按由近到远去 container 取，
+        // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
+        // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
+        const source = this.room.bestEnergyContainer(this.store.getFreeCapacity(resourceType))
+        if (source) {
+            this.say("⚡补能取能")
+            const res = this.withdraw(source, resourceType)
+            if (res == ERR_NOT_IN_RANGE) {
+                this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
+                return true
+            }
+            if (res == OK) {
+                // 取到了，下一 tick 继续这个补能任务去投递
+                return true
+            }
+        }
+        // 本房取不到能量：外矿回运由专用 remoteCarrier 负责，本地 carrier 退回通用取能
+        // （emptyWorker 会去 energyTask 队列排队，等掉落物/其他 container 补上）。
+        this.changeRole('emptyWorker')
+        return false
+    }
+
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean {
-        if (this.store['energy']) {
+        if (this.store.getUsedCapacity(resourceType) > 0) {
             const target = Game.getObjectById(targetId)
             if (!target) {
                 this.say("⚡找不到目标")
                 this.removeCurrentWorkFromQueue()
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
                 return true
             }
-            if (!target.store.getFreeCapacity(resourceType)) {
-                this.say("⚡目标已满")
-                this.removeCurrentWorkFromQueue()
-                // this.releaseCurrentWork()
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
-                return true
-            }
-            // 目标没满
-            this.say("⚡运输中")
-            const res = this.transfer(target, resourceType)
-            if (res == ERR_NOT_IN_RANGE) {
-                this.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}});
-                return false
-            } else if (res == OK) {
-                // transfer 是回合末结算的，本 tick 读到的 store 还是投递前的旧值。
-                // 记下本 tick 已发出的投递量，据此推算结算后目标会不会被填满：
-                // 满了就当场交还任务，work() 同一 tick 接着领下一条，
-                // 不用多等一 tick 去发现「目标已满」白站一回合。
-                if (this.memory.transferTick !== Game.time) {
-                    this.memory.transferTick = Game.time
-                    this.memory.transferIssued = 0
-                }
-                const remainEnergy = (this.store.getUsedCapacity(resourceType) || 0)
-                    - (this.memory.transferIssued || 0)
-                const amount = Math.max(0, Math.min(remainEnergy, target.store.getFreeCapacity(resourceType)))
-                this.memory.transferIssued = (this.memory.transferIssued || 0) + amount
-                if (target.store.getFreeCapacity(resourceType) - amount <= 0) {
-                    this.removeCurrentWorkFromQueue()
-                    return true
-                }
-                return false
-            } else if (res == ERR_FULL) {
-                this.say("⚡目标已满")
+            if (this.transferEnergyTo(target, resourceType)) {
                 this.removeCurrentWorkFromQueue()
                 return true
             }
-        } else {
-            // 高优先级补能任务自带取能：carrier 按由近到远去 container 取，
-            // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
-            // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
-            const source = this.room.bestEnergyContainer(this.store.getFreeCapacity(resourceType))
-            if (source) {
-                this.say("⚡补能取能")
-                const res = this.withdraw(source, resourceType)
-                if (res == ERR_NOT_IN_RANGE) {
-                    this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
-                    return false
-                }
-                if (res == OK) {
-                    // 取到了，下一 tick 继续这个 carryTask 去投递
-                    return false
-                }
+            return false
+        }
+        return !this.refillCarryFromSource(resourceType)
+    }
+
+    /**
+     * 能量桶补能：走到桶节点，找桶内第一个没满的 extension 投递，
+     * 桶内全部补满后自己把任务从队列里删掉。
+     * 一个桶只占一个 carrier（capacity 1），桶内成员距离节点都是 1，
+     * 所以补能过程中基本不用为每个 extension 单独寻路。
+     */
+    carryBucket(bucketKey: string, resourceType: ResourceConstant): boolean {
+        const bucket = this.room.energyBucket(bucketKey)
+        if (!bucket) {
+            // 桶只在主房布局里有；跑到别的房间时先回去，别把任务删了
+            if (this.memory.spawnRoom && this.room.name !== this.memory.spawnRoom) {
+                this.moveToRoom(this.memory.spawnRoom)
+                return false
             }
-            // 本房取不到能量：外矿回运由专用 remoteCarrier 负责，本地 carrier 退回通用取能
-            // （emptyWorker 会去 energyTask 队列排队，等掉落物/其他 container 补上）。
-            this.changeRole('emptyWorker')
+            this.removeCurrentWorkFromQueue()
             return true
         }
-        return false
+        if (!bucket.memberIds.length) {
+            this.removeCurrentWorkFromQueue()
+            return true
+        }
+        if (this.store.getUsedCapacity(resourceType) === 0) {
+            return !this.refillCarryFromSource(resourceType)
+        }
+        // 桶内找第一个没满的成员；通常 1~2 次 getObjectById 就命中
+        let target: any
+        for (const id of bucket.memberIds) {
+            const structure = Game.getObjectById<StructureExtension>(id)
+            if (structure && structure.store.getFreeCapacity(resourceType) > 0) {
+                target = structure
+                break
+            }
+        }
+        if (!target) {
+            this.say("⚡桶已满")
+            this.removeCurrentWorkFromQueue()
+            return true
+        }
+        const nodePos = this.room.getPositionAt(bucket.node.x, bucket.node.y) ?? undefined
+        if (!this.transferEnergyTo(target, resourceType, nodePos)) {
+            return false
+        }
+        // 刚投递的成员本 tick 读到的 store 还是旧值，跳过它看桶里其它空位。
+        // 还有空位就保留任务（下一 tick 继续补），全满了才把任务删掉。
+        for (const id of bucket.memberIds) {
+            if (id === target.id) {
+                continue
+            }
+            const structure = Game.getObjectById<StructureExtension>(id)
+            if (structure && structure.store.getFreeCapacity(resourceType) > 0) {
+                return false
+            }
+        }
+        this.removeCurrentWorkFromQueue()
+        return true
     }
 
     /**

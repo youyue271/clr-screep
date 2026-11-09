@@ -5,6 +5,22 @@ interface myNode {
     exec: () => string;
 }
 
+/** 一个能量桶：一个道路节点 + 距离恰好 1 的 extension。 */
+interface EnergyBucket {
+    key: string
+    node: { x: number; y: number }
+    memberIds: Id<StructureExtension>[]
+}
+
+/** 房间能量桶缓存：只存 id / 坐标，代码更新时随 global 一起丢弃。 */
+interface EnergyBucketCache {
+    // 桶的取用顺序（离核心 link 近的在前）
+    order: string[]
+    buckets: { [key: string]: EnergyBucket }
+    // extensionId -> 桶 key
+    byId: { [structureId: string]: string }
+}
+
 /**
  * 房间的堆内存缓存。只存 id / 数字，不存游戏对象引用，
  * 因为每个 tick 的对象都会重建；global 在代码更新时会整体清空，可安全丢弃。
@@ -19,6 +35,8 @@ interface RoomGlobalCache {
     energyExtensionList?: Id<StructureExtension | StructureSpawn>[]
     // 按布局集群顺序排好的 spawn/extension id，spawn 孵化时按这个顺序扣能量
     energyStructureOrder?: Id<StructureSpawn | StructureExtension>[]
+    // extension 能量桶划分；建/拆 extension 时失效重建
+    energyBuckets?: EnergyBucketCache
     lastEnergyStructureScan?: number
     // container 被拆后的刷新去重：同一 tick 只登记一次 refreshContainers 事件
     containerRefreshQueuedTick?: number

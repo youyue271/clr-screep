@@ -3732,6 +3732,21 @@ function getCarryList(targetList, resourceType) {
     });
 }
 /**
+ * 能量桶补能任务：一个桶一条，targetId 用桶节点坐标当 key。
+ * carrier 只认领桶，桶里哪个 extension 空、要不要换目标由 carryBucket 自己决定。
+ */
+function getBucketCarryTask(bucketKey) {
+    return {
+        taskType: 'bucketCarryTask',
+        taskFunc: 'carryBucket',
+        taskParam: [bucketKey, RESOURCE_ENERGY],
+        priority: 1,
+        capacity: 1,
+        persistent: true,
+        targetId: bucketKey
+    };
+}
+/**
  * 外矿采集任务：一个矿点一条，容量 1（常驻 harvester 一人一矿）。
  * taskParam: [sourceId, 外矿房名, 主房名]
  * sourceId 为 null 的探路任务由房间扩展自己构造。
@@ -4192,8 +4207,9 @@ const roleToTask = {
     // 只有少数 worker 会短暂转去维修，修完后自动回来升级
     'worker': ['repairTask', 'wallRepairTask', 'upgradeTask', 'constructTask'],
     'emptyWorker': ['energyTask'],
-    // 本地补能永远先认领；本地没活时才转换角色去外矿拉货
-    'carrier': ['carryTask'],
+    // 本地补能永远先认领；桶任务优先（一次覆盖整桶），塔/spawn/布局外结构再走单目标
+    // 本地没活时才转换角色去外矿拉货
+    'carrier': ['bucketCarryTask', 'carryTask'],
     'remoteHarvester': ['remoteHarvestTask'],
     // 外矿专用运输只做外矿往返，保证外矿 container 不会因为本地任务不断出现而被饿死
     'remoteCarrier': ['remoteCarryTask'],
@@ -4817,89 +4833,142 @@ class CreepExtension extends Creep {
         this.say('💀报废');
         this.suicide();
     }
+    /**
+     * 把身上的能量投给目标。
+     * true = 目标在本 tick 结算后已经满了/不可用，调用方可以换目标或交还任务；
+     * false = 还在移动或还没投满，本 tick 继续。
+     * moveTarget 给能量桶用：站到桶节点比追着每个 extension 跑更省移动。
+     */
+    transferEnergyTo(target, resourceType, moveTarget) {
+        if (!target.store.getFreeCapacity(resourceType)) {
+            return true;
+        }
+        this.say("⚡运输中");
+        const res = this.transfer(target, resourceType);
+        if (res == ERR_NOT_IN_RANGE) {
+            this.moveTo(moveTarget !== null && moveTarget !== void 0 ? moveTarget : target, { visualizePathStyle: { stroke: '#ffffff' } });
+            return false;
+        }
+        if (res == OK) {
+            // transfer 是回合末结算的，本 tick 读到的 store 还是投递前的旧值。
+            // 记下本 tick 已发出的投递量，据此推算结算后目标会不会被填满：
+            // 满了就当场交还任务，work() 同一 tick 接着领下一条，
+            // 不用多等一 tick 去发现「目标已满」白站一回合。
+            if (this.memory.transferTick !== Game.time) {
+                this.memory.transferTick = Game.time;
+                this.memory.transferIssued = 0;
+            }
+            const remainEnergy = (this.store.getUsedCapacity(resourceType) || 0)
+                - (this.memory.transferIssued || 0);
+            const amount = Math.max(0, Math.min(remainEnergy, target.store.getFreeCapacity(resourceType)));
+            this.memory.transferIssued = (this.memory.transferIssued || 0) + amount;
+            return target.store.getFreeCapacity(resourceType) - amount <= 0;
+        }
+        if (res == ERR_FULL) {
+            this.say("⚡目标已满");
+            return true;
+        }
+        return false;
+    }
+    /**
+     * 身上没能量时去中央 link / container 取能。
+     * true = 正在去取或已经取到，继续保留补能任务；
+     * false = 本房取不到，已经转成 emptyWorker。
+     */
+    refillCarryFromSource(resourceType) {
+        // 高优先级补能任务自带取能：carrier 按由近到远去 container 取，
+        // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
+        // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
+        const source = this.room.bestEnergyContainer(this.store.getFreeCapacity(resourceType));
+        if (source) {
+            this.say("⚡补能取能");
+            const res = this.withdraw(source, resourceType);
+            if (res == ERR_NOT_IN_RANGE) {
+                this.moveTo(source, { visualizePathStyle: { stroke: '#ffff00' } });
+                return true;
+            }
+            if (res == OK) {
+                // 取到了，下一 tick 继续这个补能任务去投递
+                return true;
+            }
+        }
+        // 本房取不到能量：外矿回运由专用 remoteCarrier 负责，本地 carrier 退回通用取能
+        // （emptyWorker 会去 energyTask 队列排队，等掉落物/其他 container 补上）。
+        this.changeRole('emptyWorker');
+        return false;
+    }
     carryEnergy(targetId, resourceType) {
-        if (this.store['energy']) {
+        if (this.store.getUsedCapacity(resourceType) > 0) {
             const target = Game.getObjectById(targetId);
             if (!target) {
                 this.say("⚡找不到目标");
                 this.removeCurrentWorkFromQueue();
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
                 return true;
             }
-            if (!target.store.getFreeCapacity(resourceType)) {
-                this.say("⚡目标已满");
-                this.removeCurrentWorkFromQueue();
-                // this.releaseCurrentWork()
-                // const targetRole = this.memory.oldRole ?? this.memory.role
-                // if (targetRole) {
-                //     this.changeRole(targetRole)
-                // } else {
-                //     this.remember()
-                // }
-                // delete this.memory.oldRole
-                return true;
-            }
-            // 目标没满
-            this.say("⚡运输中");
-            const res = this.transfer(target, resourceType);
-            if (res == ERR_NOT_IN_RANGE) {
-                this.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' } });
-                return false;
-            }
-            else if (res == OK) {
-                // transfer 是回合末结算的，本 tick 读到的 store 还是投递前的旧值。
-                // 记下本 tick 已发出的投递量，据此推算结算后目标会不会被填满：
-                // 满了就当场交还任务，work() 同一 tick 接着领下一条，
-                // 不用多等一 tick 去发现「目标已满」白站一回合。
-                if (this.memory.transferTick !== Game.time) {
-                    this.memory.transferTick = Game.time;
-                    this.memory.transferIssued = 0;
-                }
-                const remainEnergy = (this.store.getUsedCapacity(resourceType) || 0)
-                    - (this.memory.transferIssued || 0);
-                const amount = Math.max(0, Math.min(remainEnergy, target.store.getFreeCapacity(resourceType)));
-                this.memory.transferIssued = (this.memory.transferIssued || 0) + amount;
-                if (target.store.getFreeCapacity(resourceType) - amount <= 0) {
-                    this.removeCurrentWorkFromQueue();
-                    return true;
-                }
-                return false;
-            }
-            else if (res == ERR_FULL) {
-                this.say("⚡目标已满");
+            if (this.transferEnergyTo(target, resourceType)) {
                 this.removeCurrentWorkFromQueue();
                 return true;
             }
+            return false;
         }
-        else {
-            // 高优先级补能任务自带取能：carrier 按由近到远去 container 取，
-            // 不再降级成 emptyWorker 去和普通 worker 抢 energyTask——
-            // 那样会丢掉 carryTask 的 priority 1，spawn/extension 的补能会被拖慢。
-            const source = this.room.bestEnergyContainer(this.store.getFreeCapacity(resourceType));
-            if (source) {
-                this.say("⚡补能取能");
-                const res = this.withdraw(source, resourceType);
-                if (res == ERR_NOT_IN_RANGE) {
-                    this.moveTo(source, { visualizePathStyle: { stroke: '#ffff00' } });
-                    return false;
-                }
-                if (res == OK) {
-                    // 取到了，下一 tick 继续这个 carryTask 去投递
-                    return false;
-                }
+        return !this.refillCarryFromSource(resourceType);
+    }
+    /**
+     * 能量桶补能：走到桶节点，找桶内第一个没满的 extension 投递，
+     * 桶内全部补满后自己把任务从队列里删掉。
+     * 一个桶只占一个 carrier（capacity 1），桶内成员距离节点都是 1，
+     * 所以补能过程中基本不用为每个 extension 单独寻路。
+     */
+    carryBucket(bucketKey, resourceType) {
+        var _a;
+        const bucket = this.room.energyBucket(bucketKey);
+        if (!bucket) {
+            // 桶只在主房布局里有；跑到别的房间时先回去，别把任务删了
+            if (this.memory.spawnRoom && this.room.name !== this.memory.spawnRoom) {
+                this.moveToRoom(this.memory.spawnRoom);
+                return false;
             }
-            // 本房取不到能量：外矿回运由专用 remoteCarrier 负责，本地 carrier 退回通用取能
-            // （emptyWorker 会去 energyTask 队列排队，等掉落物/其他 container 补上）。
-            this.changeRole('emptyWorker');
+            this.removeCurrentWorkFromQueue();
             return true;
         }
-        return false;
+        if (!bucket.memberIds.length) {
+            this.removeCurrentWorkFromQueue();
+            return true;
+        }
+        if (this.store.getUsedCapacity(resourceType) === 0) {
+            return !this.refillCarryFromSource(resourceType);
+        }
+        // 桶内找第一个没满的成员；通常 1~2 次 getObjectById 就命中
+        let target;
+        for (const id of bucket.memberIds) {
+            const structure = Game.getObjectById(id);
+            if (structure && structure.store.getFreeCapacity(resourceType) > 0) {
+                target = structure;
+                break;
+            }
+        }
+        if (!target) {
+            this.say("⚡桶已满");
+            this.removeCurrentWorkFromQueue();
+            return true;
+        }
+        const nodePos = (_a = this.room.getPositionAt(bucket.node.x, bucket.node.y)) !== null && _a !== void 0 ? _a : undefined;
+        if (!this.transferEnergyTo(target, resourceType, nodePos)) {
+            return false;
+        }
+        // 刚投递的成员本 tick 读到的 store 还是旧值，跳过它看桶里其它空位。
+        // 还有空位就保留任务（下一 tick 继续补），全满了才把任务删掉。
+        for (const id of bucket.memberIds) {
+            if (id === target.id) {
+                continue;
+            }
+            const structure = Game.getObjectById(id);
+            if (structure && structure.store.getFreeCapacity(resourceType) > 0) {
+                return false;
+            }
+        }
+        this.removeCurrentWorkFromQueue();
+        return true;
     }
     /**
      * 本地没活时，把房间里的富余能量搬进 storage。
@@ -7138,6 +7207,42 @@ const mapping = {
     o: STRUCTURE_OBSERVER,
     N: "Null"
 };
+/**
+ * plan1 严格距离 1 的 16 桶划分：60 个 extension 全覆盖、无重复，
+ * 每桶 3~5 个。节点本身必须是道路格。
+ */
+const plan1Buckets = [
+    { node: [1, 1], members: [[0, 0], [1, 0], [2, 0], [0, 1], [0, 2]] },
+    { node: [4, 1], members: [[3, 0], [4, 0], [3, 1], [5, 1]] },
+    { node: [6, 1], members: [[6, 0], [7, 0], [7, 1]] },
+    { node: [9, 1], members: [[8, 0], [9, 0], [10, 0], [10, 2]] },
+    { node: [9, 2], members: [[8, 1], [10, 1], [8, 2]] },
+    { node: [2, 3], members: [[1, 2], [2, 2], [1, 3], [2, 4]] },
+    { node: [4, 3], members: [[5, 3], [3, 3], [3, 4]] },
+    { node: [1, 4], members: [[0, 3], [0, 4], [1, 5], [2, 5]] },
+    { node: [9, 4], members: [[10, 4], [9, 3], [10, 3]] },
+    { node: [6, 5], members: [[6, 4], [7, 5], [6, 6]] },
+    { node: [1, 6], members: [[0, 6], [2, 6], [0, 7], [1, 7]] },
+    { node: [3, 8], members: [[3, 7], [4, 7], [2, 8], [2, 9]] },
+    { node: [1, 9], members: [[0, 8], [0, 9], [0, 10], [1, 10], [2, 10]] },
+    { node: [4, 9], members: [[3, 10], [4, 10], [3, 9]] },
+    { node: [6, 9], members: [[7, 9], [6, 10], [7, 10]] },
+    { node: [9, 9], members: [[10, 8], [10, 9], [8, 10], [9, 10], [10, 10]] },
+];
+/** plan2 Core 四环：3/3/4/4，全部距离 1。 */
+const plan2CoreBuckets = [
+    { node: [1, 1], members: [[1, 0], [0, 1], [2, 1]] },
+    { node: [5, 1], members: [[5, 0], [4, 1], [5, 2]] },
+    { node: [1, 5], members: [[1, 4], [0, 5], [2, 5], [1, 6]] },
+    { node: [5, 5], members: [[5, 4], [4, 5], [6, 5], [5, 6]] },
+];
+/** plan2 每个 extension cluster 的四环模板：6/6/6/5，全部距离 1。 */
+const plan2ClusterBuckets = [
+    { node: [1, 1], members: [[0, 0], [1, 0], [0, 1], [2, 1], [1, 2], [2, 2]] },
+    { node: [4, 1], members: [[4, 0], [5, 0], [3, 1], [5, 1], [3, 2], [4, 2]] },
+    { node: [1, 4], members: [[1, 3], [2, 3], [0, 4], [2, 4], [0, 5], [1, 5]] },
+    { node: [4, 4], members: [[3, 3], [3, 4], [5, 4], [4, 5], [5, 5]] },
+];
 
 /**
  * 试了好几遍还是不知道怎么在tick内传函数,干脆传函数名,统一挂载在room下得了
@@ -7211,6 +7316,7 @@ class RoomExtension extends Room {
             'harvestTask': {},
             'workTask': {},
             'carryTask': {},
+            'bucketCarryTask': {},
             'upgradeTask': {},
             'constructTask': {},
             'repairTask': {},
@@ -7306,68 +7412,156 @@ class RoomExtension extends Room {
         }
         return buckets;
     }
+    /**
+     * 房间初始化（globalReset 后任务表是空的）时做一次全量登记。
+     * 之后不再周期性遍历补能需求：空了就由事件触发
+     * （spawn 孵化 -> refillAfterSpawn、建成 -> registerEnergyStructure、
+     * 桶补满 -> carryBucket 自删、预约失效 -> getWork 惰性清理）。
+     * tower 不在这里，它走 ensureEnergyCarryTask 的 60% 阈值补能。
+     */
     initCarryList() {
         if (!this.memory.creepTask) {
             return;
         }
-        // 只从 spawn/extension 登记表里取，不再每 tick find。
-        // tower 不放进这张表，它走 ensureEnergyCarryTask 的 60% 阈值补能。
-        const structureList = this.energyStructureOrder()
-            .map(id => Game.getObjectById(id))
-            .filter((structure) => !!structure && structure.store.getFreeCapacity(RESOURCE_ENERGY) > 0);
-        this.registTask(getCarryList(structureList, RESOURCE_ENERGY));
+        // 每个桶一条任务，桶内哪个成员空由 carryBucket 自己找
+        for (const key of this.energyBucketCache().order) {
+            this.ensureBucketCarryTask(key);
+        }
+        // spawn 和布局外的 extension 仍然按单目标 carryTask 补
+        for (const spawn of this.find(FIND_MY_SPAWNS)) {
+            this.ensureEnergyCarryTask(spawn.id);
+        }
+        const extensions = this.find(FIND_MY_STRUCTURES, {
+            filter: (object) => object.structureType === STRUCTURE_EXTENSION
+        });
+        for (const extension of extensions) {
+            if (!this.energyBucketKeyOf(extension.id)) {
+                this.ensureEnergyCarryTask(extension.id);
+            }
+        }
     }
-    refreshEnergyCarryTasks() {
+    /**
+     * 能量桶缓存：只 find 一次，之后按 id 查表。
+     * 桶 = 一个道路节点 + 距离恰好 1 的 extension，坐标划分固定写在 autoplan 里。
+     */
+    energyBucketCache() {
+        if (!global.room[this.name]) {
+            global.room[this.name] = {};
+        }
+        const cached = global.room[this.name].energyBuckets;
+        if (cached) {
+            return cached;
+        }
+        const cache = this.buildEnergyBucketCache();
+        global.room[this.name].energyBuckets = cache;
+        return cache;
+    }
+    buildEnergyBucketCache() {
+        var _a, _b, _c, _d, _e;
+        const extensions = this.find(FIND_MY_STRUCTURES, {
+            filter: (object) => object.structureType === STRUCTURE_EXTENSION
+        });
+        const byPos = {};
+        for (const extension of extensions) {
+            byPos[`${extension.pos.x},${extension.pos.y}`] = extension.id;
+        }
+        const bucketList = [];
+        const addPlan = (plan, anchor, offset) => {
+            if (!anchor || !plan) {
+                return;
+            }
+            for (const item of plan) {
+                const nodeX = anchor[0] + item.node[0] - offset;
+                const nodeY = anchor[1] + item.node[1] - offset;
+                const memberIds = [];
+                for (const member of item.members) {
+                    const id = byPos[`${anchor[0] + member[0] - offset},${anchor[1] + member[1] - offset}`];
+                    if (id) {
+                        memberIds.push(id);
+                    }
+                }
+                bucketList.push({ key: `${nodeX},${nodeY}`, node: { x: nodeX, y: nodeY }, memberIds });
+            }
+        };
+        if (this.memory.roomPlanType === 2 && this.memory.plan2Pos) {
+            const planPos = this.memory.plan2Pos;
+            addPlan(plan2CoreBuckets, planPos.core, plan2_Core.length - 1);
+            addPlan(plan2ClusterBuckets, planPos.ext1, plan2_extensionCluster1.length - 1);
+            addPlan(plan2ClusterBuckets, planPos.ext2, plan2_extensionCluster2.length - 1);
+        }
+        else if (this.memory.plan1Pos) {
+            addPlan(plan1Buckets, this.memory.plan1Pos, plan1.length);
+        }
+        // 离核心 link（没有则 storage、spawn）近的桶排在前面：
+        // spawn 按这个顺序抽能量，先抽到的桶就是先需要补的桶。
+        const anchorPos = (_d = (_b = (_a = this.getCoreLink()) === null || _a === void 0 ? void 0 : _a.pos) !== null && _b !== void 0 ? _b : (_c = this.storage) === null || _c === void 0 ? void 0 : _c.pos) !== null && _d !== void 0 ? _d : (_e = this.find(FIND_MY_SPAWNS)[0]) === null || _e === void 0 ? void 0 : _e.pos;
+        const distance = (bucket) => anchorPos
+            ? Math.max(Math.abs(bucket.node.x - anchorPos.x), Math.abs(bucket.node.y - anchorPos.y))
+            : 0;
+        bucketList.sort((a, b) => distance(a) - distance(b)
+            || a.node.y - b.node.y
+            || a.node.x - b.node.x);
+        const order = [];
+        const buckets = {};
+        const byId = {};
+        for (const bucket of bucketList) {
+            order.push(bucket.key);
+            buckets[bucket.key] = bucket;
+            for (const id of bucket.memberIds) {
+                byId[id] = bucket.key;
+            }
+        }
+        return { order, buckets, byId };
+    }
+    energyBucket(bucketKey) {
+        return this.energyBucketCache().buckets[bucketKey];
+    }
+    /**
+     * extension 所属桶的 key；布局外的 extension 返回 undefined。
+     */
+    energyBucketKeyOf(structureId) {
+        return this.energyBucketCache().byId[structureId];
+    }
+    /**
+     * 确保这个桶有一条 bucketCarryTask。
+     * 桶里已经全满、或者队列里已经有同桶任务时什么都不做。
+     */
+    ensureBucketCarryTask(bucketKey) {
         var _a, _b;
         if (!this.memory.creepTask) {
             return;
         }
-        // 直接遍历 spawn/extension 登记表，状态实时读 store，不再 find
-        const structureList = this.energyStructureOrder()
-            .map(id => Game.getObjectById(id))
-            .filter((structure) => !!structure && structure.store.getFreeCapacity(RESOURCE_ENERGY) > 0);
-        const carryBuckets = this.normalizeTaskBuckets('carryTask');
-        // 只清理 spawn/extension 自己的补能任务；塔等其它目标的任务不能动，
-        // 它们由各自的触发逻辑（ensureEnergyCarryTask）管理。
-        const orderIds = new Set(this.energyStructureOrder());
-        const neededIds = new Set(structureList.map(item => item.id));
-        const existingIds = new Set();
-        for (const key in carryBuckets) {
-            const bucket = carryBuckets[key];
-            if (!bucket || !bucket.length) {
-                delete carryBuckets[key];
+        const bucket = this.energyBucket(bucketKey);
+        if (!bucket || !bucket.memberIds.length) {
+            return;
+        }
+        let hasFree = false;
+        for (const id of bucket.memberIds) {
+            const structure = Game.getObjectById(id);
+            if (structure && structure.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                hasFree = true;
+                break;
+            }
+        }
+        if (!hasFree) {
+            return;
+        }
+        const buckets = this.normalizeTaskBuckets('bucketCarryTask');
+        for (const key in buckets) {
+            const bucketTasks = buckets[key];
+            if (!bucketTasks || !bucketTasks.length) {
                 continue;
             }
-            const nextBucket = [];
-            for (const task of bucket) {
+            for (const task of bucketTasks) {
                 if (!task) {
                     continue;
                 }
-                const taskTargetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
-                if (!taskTargetId) {
-                    continue;
+                if (((_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === bucketKey) {
+                    return;
                 }
-                if (orderIds.has(taskTargetId) && !neededIds.has(taskTargetId)) {
-                    // 这个 spawn/extension 已经满了，任务作废
-                    continue;
-                }
-                if (neededIds.has(taskTargetId)) {
-                    existingIds.add(taskTargetId);
-                }
-                nextBucket.push(task);
-            }
-            if (nextBucket.length) {
-                carryBuckets[key] = nextBucket;
-            }
-            else {
-                delete carryBuckets[key];
             }
         }
-        this.memory.creepTask['carryTask'] = carryBuckets;
-        const toAdd = structureList.filter(item => !existingIds.has(item.id));
-        if (toAdd.length) {
-            this.registTask(getCarryList(toAdd, RESOURCE_ENERGY));
-        }
+        this.registTask([getBucketCarryTask(bucketKey)]);
     }
     /**
      * 按布局集群顺序返回 spawn/extension 的固定 id 列表。
@@ -7383,43 +7577,25 @@ class RoomExtension extends Room {
         return global.room[this.name].energyStructureOrder;
     }
     /**
-     * 重建能量结构顺序：
-     * - plan2: Core -> extensionCluster1 -> extensionCluster2（和建造顺序一致）
-     * - plan1: 整个 plan1 行优先
-     * - 不在布局里的结构追加到最后，按到 spawn 的距离排
+     * 重建能量结构顺序（桶优先）：
+     * - 桶内的 extension 按桶的取用顺序排在前面，同一个桶的成员连续排放；
+     *   这样 spawn 按前缀扣能量时天然以"整桶"为单位，抽空哪几个桶一目了然。
+     * - spawn 排在桶后面当缓冲：spawn 自己空了单独补，不会连带抽桶。
+     * - 布局外的 extension 追加到最后，按到 spawn 的距离排。
      */
     buildEnergyStructureOrder() {
-        const rankMap = {};
+        var _a, _b, _c, _d;
+        const cache = this.energyBucketCache();
+        const bucketRank = {};
         let rank = 0;
-        const addPlan = (map, anchor, plusOne = true) => {
-            if (!anchor || !map) {
-                return;
+        for (const key of cache.order) {
+            const bucket = cache.buckets[key];
+            if (!bucket) {
+                continue;
             }
-            // 与 buildLayout / constructPlan1 的坐标计算保持一致
-            const offset = plusOne ? map.length - 1 : map.length;
-            for (let y = 0; y < map.length; y++) {
-                const row = map[y].split(" ");
-                for (let x = 0; x < row.length; x++) {
-                    const cell = row[x];
-                    if (!cell) {
-                        continue;
-                    }
-                    const type = mapping[cell[0]];
-                    if (type !== STRUCTURE_EXTENSION && type !== STRUCTURE_SPAWN) {
-                        continue;
-                    }
-                    rankMap[`${anchor[0] + x - offset},${anchor[1] + y - offset}`] = rank++;
-                }
+            for (const id of bucket.memberIds) {
+                bucketRank[id] = rank++;
             }
-        };
-        if (this.memory.roomPlanType === 2 && this.memory.plan2Pos) {
-            const planPos = this.memory.plan2Pos;
-            addPlan(plan2_Core, planPos.core);
-            addPlan(plan2_extensionCluster1, planPos.ext1);
-            addPlan(plan2_extensionCluster2, planPos.ext2);
-        }
-        else if (this.memory.plan1Pos) {
-            addPlan(plan1, this.memory.plan1Pos, false);
         }
         const structures = this.find(FIND_MY_STRUCTURES, {
             filter: (object) => object.structureType === STRUCTURE_SPAWN
@@ -7427,19 +7603,26 @@ class RoomExtension extends Room {
         });
         const spawn = this.find(FIND_MY_SPAWNS)[0];
         const spawnPos = spawn ? spawn.pos : undefined;
+        const anchorPos = (_d = (_b = (_a = this.getCoreLink()) === null || _a === void 0 ? void 0 : _a.pos) !== null && _b !== void 0 ? _b : (_c = this.storage) === null || _c === void 0 ? void 0 : _c.pos) !== null && _d !== void 0 ? _d : spawnPos;
+        // 0 = 桶内 extension，1 = spawn（缓冲），2 = 布局外 extension
+        const category = (structure) => {
+            if (bucketRank[structure.id] !== undefined) {
+                return 0;
+            }
+            return structure.structureType === STRUCTURE_SPAWN ? 1 : 2;
+        };
         structures.sort((a, b) => {
-            const rankA = rankMap[`${a.pos.x},${a.pos.y}`];
-            const rankB = rankMap[`${b.pos.x},${b.pos.y}`];
-            const aPlanned = rankA !== undefined;
-            const bPlanned = rankB !== undefined;
-            if (aPlanned && bPlanned && rankA !== rankB) {
-                return rankA - rankB;
+            const catA = category(a);
+            const catB = category(b);
+            if (catA !== catB) {
+                return catA - catB;
             }
-            if (aPlanned !== bPlanned) {
-                return aPlanned ? -1 : 1;
+            if (catA === 0) {
+                return bucketRank[a.id] - bucketRank[b.id];
             }
-            const distanceA = spawnPos ? a.pos.getRangeTo(spawnPos) : 0;
-            const distanceB = spawnPos ? b.pos.getRangeTo(spawnPos) : 0;
+            const ref = catA === 1 ? anchorPos : spawnPos;
+            const distanceA = ref ? a.pos.getRangeTo(ref) : 0;
+            const distanceB = ref ? b.pos.getRangeTo(ref) : 0;
             if (distanceA !== distanceB) {
                 return distanceA - distanceB;
             }
@@ -7453,17 +7636,31 @@ class RoomExtension extends Room {
         return order;
     }
     /**
-     * 新建的 spawn/extension 加入顺序表；已经在表里则不动。
+     * 新建的 spawn/extension 加入顺序表，并保证它有补能任务。
+     * 结构集合变了，桶缓存一并失效（下一次查询时重建）。
      */
     registerEnergyStructure(id) {
         if (!global.room[this.name]) {
             global.room[this.name] = {};
         }
+        delete global.room[this.name].energyBuckets;
         const order = global.room[this.name].energyStructureOrder;
-        if (order && order.includes(id)) {
+        if (!order || !order.includes(id)) {
+            this.buildEnergyStructureOrder();
+        }
+        const structure = Game.getObjectById(id);
+        if (!structure || !structure.store.getFreeCapacity(RESOURCE_ENERGY)) {
             return;
         }
-        this.buildEnergyStructureOrder();
+        if (structure.structureType === STRUCTURE_EXTENSION) {
+            const bucketKey = this.energyBucketKeyOf(structure.id);
+            if (bucketKey) {
+                this.ensureBucketCarryTask(bucketKey);
+                return;
+            }
+        }
+        // spawn 本身和布局外的 extension 走单目标任务
+        this.ensureEnergyCarryTask(structure.id);
     }
     /**
      * 定期兜底重建顺序表，处理漏掉的建成/拆除。
@@ -7508,6 +7705,15 @@ class RoomExtension extends Room {
             }
             const stored = structure.store.getUsedCapacity(RESOURCE_ENERGY);
             if (!stored) {
+                // 取能顺序正好扫到了空结构：补能事件可能丢了（事件异常/刚建成），
+                // 顺手补登记。复用这次已有的遍历，不额外扫房间，也不做周期轮询。
+                const bucketKey = this.energyBucketKeyOf(structure.id);
+                if (bucketKey) {
+                    this.ensureBucketCarryTask(bucketKey);
+                }
+                else {
+                    this.ensureEnergyCarryTask(structure.id);
+                }
                 continue;
             }
             structures.push(structure);
@@ -7523,11 +7729,44 @@ class RoomExtension extends Room {
      * spawn 成功后 +1 tick 调用：spawnCreep 是 intent，回合末才扣能量，
      * 下一 tick 这些结构才会真正出现空位。只给实际贡献了能量的结构登记 carry 任务。
      */
-    refillAfterSpawn(structureIds) {
+    refillAfterSpawn(structureIds, retry = 0) {
         if (!structureIds || !structureIds.length) {
             return;
         }
-        this.addExtensionCarryTasks(structureIds);
+        try {
+            const bucketKeys = {};
+            for (const id of structureIds) {
+                const structure = Game.getObjectById(id);
+                if (!structure) {
+                    continue;
+                }
+                if (structure.structureType === STRUCTURE_EXTENSION) {
+                    const bucketKey = this.energyBucketKeyOf(structure.id);
+                    if (bucketKey) {
+                        // 同一个桶被抽掉多个成员时只登记一条桶任务
+                        bucketKeys[bucketKey] = true;
+                        continue;
+                    }
+                }
+                // spawn 本身和布局外的 extension 单目标补
+                this.ensureEnergyCarryTask(structure.id);
+            }
+            for (const key in bucketKeys) {
+                this.ensureBucketCarryTask(key);
+            }
+        }
+        catch (error) {
+            // runEvent 是 pop 之后才执行，抛异常这个事件就丢了。
+            // 重试 2 次，避免 spawn 抽空的桶长期没人补。
+            loggerInstance.error(`refillAfterSpawn 失败: ${error}`);
+            if (retry < 2) {
+                this.registEvent({
+                    triggerTime: Game.time + 1,
+                    triggerFunc: 'refillAfterSpawn',
+                    param: [structureIds, retry + 1]
+                });
+            }
+        }
     }
     /**
      * 定期刷新取能任务：先剔除失效任务，再补缺失的目标。
@@ -9343,46 +9582,6 @@ class RoomExtension extends Room {
             return (_b = target.amount) !== null && _b !== void 0 ? _b : 0;
         }
         return 0;
-    }
-    addExtensionCarryTasks(structureIds) {
-        var _a, _b;
-        if (!this.memory.creepTask) {
-            return;
-        }
-        const carryBuckets = this.normalizeTaskBuckets('carryTask');
-        const existingIds = new Set();
-        for (const key in carryBuckets) {
-            const bucket = carryBuckets[key];
-            if (!bucket || !bucket.length) {
-                continue;
-            }
-            for (const task of bucket) {
-                if (!task) {
-                    continue;
-                }
-                const taskTargetId = (_a = task.targetId) !== null && _a !== void 0 ? _a : (_b = task.taskParam) === null || _b === void 0 ? void 0 : _b[0];
-                if (taskTargetId) {
-                    existingIds.add(taskTargetId);
-                }
-            }
-        }
-        const toAdd = [];
-        for (const id of structureIds) {
-            const structure = Game.getObjectById(id);
-            if (!structure) {
-                continue;
-            }
-            if (!structure.store.getFreeCapacity(RESOURCE_ENERGY)) {
-                continue;
-            }
-            if (existingIds.has(structure.id)) {
-                continue;
-            }
-            toAdd.push(structure);
-        }
-        if (toAdd.length) {
-            this.registTask(getCarryList(toAdd, RESOURCE_ENERGY));
-        }
     }
     /**
      * 为单个结构登记补能任务（塔等主动请求补能用）。
@@ -11381,8 +11580,7 @@ class RoomScanExtension extends Room {
             || now - cache.lastEnergyTaskScan >= 10) {
             cache.lastEnergyTaskScan = now;
             this.refreshEnergyTasks();
-            // spawn/extension 的补能需求同样按间隔兜底同步
-            this.refreshEnergyCarryTasks();
+            // spawn/extension 的补能不再周期性遍历：由孵化/建成/桶补满等事件触发
             // 工地状态变化后升级并发要跟着调整
             this.refreshUpgradeTask();
             // 角色数量按产能/保底动态补员（只补不裁，死亡时再按目标决定是否续）
@@ -11686,7 +11884,8 @@ class SpawnExtension extends Spawn {
 
 class ExtensionExtension extends StructureExtension {
     onBuild() {
-        this.room.addExtensionCarryTasks([this.id]);
+        // 新 extension 的补能任务由 buildOver -> registerEnergyStructure 统一登记：
+        // 布局内的走所属能量桶的 bucketCarryTask，布局外的才单目标补。
     }
 }
 
@@ -12104,6 +12303,7 @@ const RoomNodes = [
             const TaskType = ['workTask',
                 'harvestTask',
                 'carryTask',
+                'bucketCarryTask',
                 'upgradeTask',
                 "constructTask",
                 'energyTask',

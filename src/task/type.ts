@@ -37,6 +37,7 @@ type TaskBucket = {
 type TaskType = 'workTask'
     | 'harvestTask'
     | 'carryTask'
+    | 'bucketCarryTask'
     | 'upgradeTask'
     | "constructTask"
     | 'repairTask'

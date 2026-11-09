@@ -194,7 +194,23 @@ interface Room {
      */
     refillAfterSpawn(structureIds: Id<StructureSpawn | StructureExtension>[]): void
 
-    addExtensionCarryTasks(structureIds: Id<StructureExtension | StructureSpawn>[]): void
+    /**
+     * 能量桶缓存：按 plan1/plan2 的固定划分建表，只 find 一次并缓存在 global。
+     */
+    energyBucketCache(): EnergyBucketCache
+
+    energyBucket(bucketKey: string): EnergyBucket | undefined
+
+    /**
+     * extension 所属桶的 key；plan 外的 extension 返回 undefined。
+     */
+    energyBucketKeyOf(structureId: Id<StructureSpawn | StructureExtension>): string | undefined
+
+    /**
+     * 确保这个桶有一条 bucketCarryTask：桶里还有空位且队列里没有同桶任务时才登记。
+     * spawn 扣能、建成、自愈都走这里。
+     */
+    ensureBucketCarryTask(bucketKey: string): void
 
     /**
      * 按 getContainer() 顺序（离阵型中心由近到远）选容器：优先能装满
@@ -204,8 +220,6 @@ interface Room {
     bestEnergyContainer(freeCapacity?: number): StructureLink | StructureContainer | undefined
 
     ensureEnergyCarryTask(structureId: Id<AnyStoreStructure>): void
-
-    refreshEnergyCarryTasks(): void
 
     /**
      * 定期把新出现的能量来源（container / 掉落物 / storage / tombstone）补进 energyTask

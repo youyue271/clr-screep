@@ -80,6 +80,11 @@ interface Creep {
      */
     suicideAndRespawn(): void
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean
+    /**
+     * 把能量补进一个桶：站桶节点，找桶内第一个没满的成员投递。
+     * 桶内全部补满后自己把任务从队列里删掉。
+     */
+    carryBucket(bucketKey: string, resourceType: ResourceConstant): boolean
     buildConstructionSite(constructionId: Id<any>):boolean
     /**
      * 按房间名走到目标房间。没有视野时用房间出口导航，只支持相邻房间
