@@ -1,4 +1,5 @@
-import {remoteSetting} from "@/setting"
+import {remoteSetting, warSetting} from "@/setting"
+import {classifyThreat, isArmedThreat, isWeakThreat} from "@/util/threat"
 
 /**
  * highway 通道房：房间名坐标能被 10 整除（如 W34S50、W40S49）。
@@ -97,12 +98,39 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
     const me = Game.rooms[homeRoomName]?.controller?.owner?.username
     const controller = room.controller
     const sources = room.find(FIND_SOURCES)
+    // 按实际剩余战力分级：纯矿工/运输车不算威胁，小股武装先撤离，
+    // 有 HEAL/高 DPS/拆墙能力才停用外矿。
+    const threat = classifyThreat(room.find(FIND_HOSTILE_CREEPS))
+    const armed = isArmedThreat(threat)
+    const weak = isWeakThreat(threat)
     intel.scoutedAt = Game.time
     intel.sources = sources.map(source => source.id)
     intel.owner = controller?.owner?.username
     intel.reservation = controller?.reservation?.username
-    intel.hostile = room.find(FIND_HOSTILE_CREEPS).length > 0
-    intel.unsafe = !!intel.hostile
+    intel.hostile = threat.count > 0
+    intel.threatLevel = threat.level
+    intel.hostileCount = threat.count
+    intel.hostileDps = threat.dps
+    if (armed) {
+        if (intel.hostileSince === undefined) {
+            intel.hostileSince = Game.time
+        }
+        intel.hostileLastSeen = Game.time
+        // 武装敌对还在：安排下一次复查。弱敌复查得勤一点，
+        // 强敌停用后隔久一点再回来看，避免侦察兵反复送死。
+        intel.retryAt = Game.time + (weak ? warSetting.hostileRecheckTicks : warSetting.rescoutTicks)
+    } else if (intel.hostileLastSeen !== undefined
+        && Game.time - intel.hostileLastSeen >= warSetting.hostileCalmTicks) {
+        // 连续这么久没看到武装敌对：这一轮骚扰结束，外矿恢复、复探标记清掉
+        delete intel.hostileSince
+        delete intel.hostileLastSeen
+        delete intel.hostileCount
+        delete intel.hostileDps
+        delete intel.retryAt
+    }
+    // 弱敌不停用外矿：产线留着，先让 crew 撤离避战，下一批再交给反击队。
+    // 强敌 / 有主 / 被外人 reserve 才 unsafe。
+    intel.unsafe = (!weak && armed)
         || !!(controller?.owner && !controller.my)
         || !!(controller?.reservation && controller.reservation.username !== me)
     // 有视野时用真实保留剩余校正：不是我们的保留就清掉，

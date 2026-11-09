@@ -31,6 +31,29 @@ interface BodySet {
 }
 
 
+/**
+ * 敌对威胁分级：
+ * none 没看到敌对；harmless 只会采集/搬运/移动（无攻击能力）；
+ * raid 无 HEAL 的小股武装；assault 正规进攻；siege 拆家/重火力。
+ */
+type ThreatLevel = 'none' | 'harmless' | 'raid' | 'assault' | 'siege'
+
+interface ThreatSummary {
+    level: ThreatLevel
+    // 敌对 creep 数量（只算还活着的）
+    count: number
+    attackParts: number
+    rangedParts: number
+    workParts: number
+    healParts: number
+    claimParts: number
+    // 理论输出：ATTACK/RANGED_ATTACK 的每 tick 伤害
+    dps: number
+    // 理论治疗量：HEAL 每 tick 回复量
+    healPerTick: number
+    ids: Id<Creep>[]
+}
+
 type CreepRoleConstant = BaseRoleConstant | AdvancedRoleConstant
 
 type BaseRoleConstant =

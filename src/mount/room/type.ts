@@ -53,6 +53,17 @@ interface MapIntel {
     // 我们对该房控制器的保留到期 tick（由 claimer 成功 reserve 后写入）
     reservedUntil?: number
     sources?: Id<Source>[]
+    // 最近一次视野的威胁分级
+    threatLevel?: ThreatLevel
+    // 本轮武装敌对第一次/最后一次看到的 tick。连续 hostileCalmTicks
+    // 没有武装敌对才清空；在清空之前外矿暂停补员/出货
+    hostileSince?: number
+    hostileLastSeen?: number
+    hostileCount?: number
+    hostileDps?: number
+    // 侦察兵允许再次进入这个房的 tick：
+    // 武装敌对中按 hostileRecheckTicks 复查，强敌停用房按 rescoutTicks 复探
+    retryAt?: number
 }
 
 /**

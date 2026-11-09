@@ -191,6 +191,29 @@ export const remoteSetting = {
     maxRooms: 4,
 }
 
+// 战争模块（Phase 2：威胁分级 + 外矿撤离/复探）。
+// 数值只用于"要不要躲、要不要停外矿"的判断，不追求精确战斗模拟。
+export const warSetting = {
+    // 每个部件的理论输出：ATTACK 30/tick、RANGED_ATTACK 10/tick（贴身）、HEAL 12/tick
+    attackDps: 30,
+    rangedDps: 10,
+    healPerPart: 12,
+    // 弱敌判定：没有 HEAL、数量不超过 N、总 DPS 不超过 D。
+    // 这类敌人留给下一批的反击队；现在先保证外矿不送人头。
+    weakMaxCount: 2,
+    weakMaxDps: 300,
+    // 视野里连续这么久没有武装敌对，才算这一轮骚扰结束、外矿恢复
+    hostileCalmTicks: 100,
+    // 武装敌对还在时，侦察兵隔这么久回去复查一次（没视野时靠它推进清场判定）
+    hostileRecheckTicks: 150,
+    // 强敌导致外矿停用后，这么久再派侦察兵复探
+    rescoutTicks: 500,
+    // siege 判定：总 DPS 达到、或 WORK 拆墙部件 + 数量同时达到
+    siegeDps: 600,
+    siegeWorkParts: 5,
+    siegeMinCount: 3,
+}
+
 export const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
     threatScanInterval: 5,

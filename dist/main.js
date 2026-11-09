@@ -3421,6 +3421,28 @@ const remoteSetting = {
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
     maxRooms: 4,
 };
+// 战争模块（Phase 2：威胁分级 + 外矿撤离/复探）。
+// 数值只用于"要不要躲、要不要停外矿"的判断，不追求精确战斗模拟。
+const warSetting = {
+    // 每个部件的理论输出：ATTACK 30/tick、RANGED_ATTACK 10/tick（贴身）、HEAL 12/tick
+    attackDps: 30,
+    rangedDps: 10,
+    healPerPart: 12,
+    // 弱敌判定：没有 HEAL、数量不超过 N、总 DPS 不超过 D。
+    // 这类敌人留给下一批的反击队；现在先保证外矿不送人头。
+    weakMaxCount: 2,
+    weakMaxDps: 300,
+    // 视野里连续这么久没有武装敌对，才算这一轮骚扰结束、外矿恢复
+    hostileCalmTicks: 100,
+    // 武装敌对还在时，侦察兵隔这么久回去复查一次（没视野时靠它推进清场判定）
+    hostileRecheckTicks: 150,
+    // 强敌导致外矿停用后，这么久再派侦察兵复探
+    rescoutTicks: 500,
+    // siege 判定：总 DPS 达到、或 WORK 拆墙部件 + 数量同时达到
+    siegeDps: 600,
+    siegeWorkParts: 5,
+    siegeMinCount: 3,
+};
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
     threatScanInterval: 5,
@@ -3866,6 +3888,111 @@ const colors = {
 const loggerInstance = new logger();
 
 /**
+ * 数某个 creep 还活着的部件（hits > 0）。
+ * 被打掉的部件不产生伤害/治疗，分级必须按实际剩余战力算。
+ */
+function activeParts(creep, type) {
+    let count = 0;
+    for (const part of creep.body) {
+        if (part.type === type && part.hits > 0) {
+            count++;
+        }
+    }
+    return count;
+}
+/**
+ * 把一批敌对 creep 归成威胁档位：
+ * - 没有任何攻击/CLAIM 能力 = harmless（纯 WORK 矿工、运输车、路过侦察兵）
+ * - 无 HEAL 的小股武装 = raid（留给外矿反击队处理）
+ * - 有 HEAL / 多只 / 高 DPS = assault
+ * - 拆墙能力或极高 DPS = siege
+ * 都按理论满输出估算，用于决定"躲不躲、停不停外矿"，不用于精确战斗结算。
+ */
+function classifyThreat(creeps) {
+    const summary = {
+        level: 'none',
+        count: 0,
+        attackParts: 0,
+        rangedParts: 0,
+        workParts: 0,
+        healParts: 0,
+        claimParts: 0,
+        dps: 0,
+        healPerTick: 0,
+        ids: [],
+    };
+    for (const creep of creeps) {
+        if (!creep) {
+            continue;
+        }
+        const attack = activeParts(creep, ATTACK);
+        const ranged = activeParts(creep, RANGED_ATTACK);
+        const work = activeParts(creep, WORK);
+        const heal = activeParts(creep, HEAL);
+        const claim = activeParts(creep, CLAIM);
+        summary.count++;
+        summary.attackParts += attack;
+        summary.rangedParts += ranged;
+        summary.workParts += work;
+        summary.healParts += heal;
+        summary.claimParts += claim;
+        summary.ids.push(creep.id);
+    }
+    summary.dps = summary.attackParts * warSetting.attackDps
+        + summary.rangedParts * warSetting.rangedDps;
+    summary.healPerTick = summary.healParts * warSetting.healPerPart;
+    if (summary.count === 0) {
+        return summary;
+    }
+    const armed = summary.attackParts + summary.rangedParts + summary.claimParts > 0;
+    if (!armed) {
+        summary.level = 'harmless';
+        return summary;
+    }
+    if (summary.dps >= warSetting.siegeDps
+        || (summary.workParts >= warSetting.siegeWorkParts && summary.count >= warSetting.siegeMinCount)) {
+        summary.level = 'siege';
+        return summary;
+    }
+    if (summary.healParts === 0
+        && summary.count <= warSetting.weakMaxCount
+        && summary.dps <= warSetting.weakMaxDps) {
+        summary.level = 'raid';
+        return summary;
+    }
+    summary.level = 'assault';
+    return summary;
+}
+/**
+ * 有攻击能力（含 CLAIM 抢控制器）的敌人才算威胁。
+ * 纯 WORK 矿工、运输车、没有攻击部件的侦察兵不算。
+ */
+function isArmedThreat(summary) {
+    return summary.level !== 'none' && summary.level !== 'harmless';
+}
+/**
+ * 弱敌：无 HEAL、数量/总 DPS 在阈值内。
+ * 现在先不反击，但外矿同样要撤离；下一批交给反击队。
+ */
+function isWeakThreat(summary) {
+    return summary.level === 'raid';
+}
+/**
+ * 按当前视野直接判断房间里有没有需要避战的武装敌对。
+ * 外矿 creep 在自己房里每 tick 都能用，不依赖 10 tick 的情报刷新。
+ */
+function hasArmedHostile(room) {
+    return isArmedThreat(classifyThreat(room.find(FIND_HOSTILE_CREEPS)));
+}
+/**
+ * 情报里这一轮武装敌对还没结束（外矿暂停补员/出货）。
+ * hostileSince 由 recordRoomIntel 在清场后连续 hostileCalmTicks 才删除。
+ */
+function isRemotePaused(intel) {
+    return !!intel && intel.hostileSince !== undefined;
+}
+
+/**
  * highway 通道房：房间名坐标能被 10 整除（如 W34S50、W40S49）。
  * 这类房没有 controller、没有 source，不能占领/保留；
  * 早期规划对"没探过"的相邻房一律当候选，必须靠房名先挡掉。
@@ -3962,12 +4089,40 @@ function recordRoomIntel(homeRoomName, room) {
     const me = (_d = (_c = (_b = Game.rooms[homeRoomName]) === null || _b === void 0 ? void 0 : _b.controller) === null || _c === void 0 ? void 0 : _c.owner) === null || _d === void 0 ? void 0 : _d.username;
     const controller = room.controller;
     const sources = room.find(FIND_SOURCES);
+    // 按实际剩余战力分级：纯矿工/运输车不算威胁，小股武装先撤离，
+    // 有 HEAL/高 DPS/拆墙能力才停用外矿。
+    const threat = classifyThreat(room.find(FIND_HOSTILE_CREEPS));
+    const armed = isArmedThreat(threat);
+    const weak = isWeakThreat(threat);
     intel.scoutedAt = Game.time;
     intel.sources = sources.map(source => source.id);
     intel.owner = (_e = controller === null || controller === void 0 ? void 0 : controller.owner) === null || _e === void 0 ? void 0 : _e.username;
     intel.reservation = (_f = controller === null || controller === void 0 ? void 0 : controller.reservation) === null || _f === void 0 ? void 0 : _f.username;
-    intel.hostile = room.find(FIND_HOSTILE_CREEPS).length > 0;
-    intel.unsafe = !!intel.hostile
+    intel.hostile = threat.count > 0;
+    intel.threatLevel = threat.level;
+    intel.hostileCount = threat.count;
+    intel.hostileDps = threat.dps;
+    if (armed) {
+        if (intel.hostileSince === undefined) {
+            intel.hostileSince = Game.time;
+        }
+        intel.hostileLastSeen = Game.time;
+        // 武装敌对还在：安排下一次复查。弱敌复查得勤一点，
+        // 强敌停用后隔久一点再回来看，避免侦察兵反复送死。
+        intel.retryAt = Game.time + (weak ? warSetting.hostileRecheckTicks : warSetting.rescoutTicks);
+    }
+    else if (intel.hostileLastSeen !== undefined
+        && Game.time - intel.hostileLastSeen >= warSetting.hostileCalmTicks) {
+        // 连续这么久没看到武装敌对：这一轮骚扰结束，外矿恢复、复探标记清掉
+        delete intel.hostileSince;
+        delete intel.hostileLastSeen;
+        delete intel.hostileCount;
+        delete intel.hostileDps;
+        delete intel.retryAt;
+    }
+    // 弱敌不停用外矿：产线留着，先让 crew 撤离避战，下一批再交给反击队。
+    // 强敌 / 有主 / 被外人 reserve 才 unsafe。
+    intel.unsafe = (!weak && armed)
         || !!((controller === null || controller === void 0 ? void 0 : controller.owner) && !controller.my)
         || !!((controller === null || controller === void 0 ? void 0 : controller.reservation) && controller.reservation.username !== me);
     // 有视野时用真实保留剩余校正：不是我们的保留就清掉，
@@ -4865,7 +5020,7 @@ class CreepExtension extends Creep {
      * taskParam: [sourceId | null, 外矿房名, 主房名]
      */
     remoteHarvest(sourceId, targetRoom, homeRoom) {
-        var _a, _b, _c, _d, _e;
+        var _a, _b, _c, _d, _e, _f;
         // 外矿房被停用/移出计划：主房会把任务清掉，但 creep 手里还留着 currentWork 副本，
         // 不在这里校验就会一直挖到被敌人打死。交还任务并打召回标记，回主房待命到死。
         const planState = (_c = (_b = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom]) === null || _b === void 0 ? void 0 : _b.rooms) === null || _c === void 0 ? void 0 : _c[targetRoom];
@@ -4882,6 +5037,18 @@ class CreepExtension extends Creep {
         // 换班补员和预约恢复（seedRemoteHarvestReservations）都靠这个字段认人
         if (sourceId) {
             this.memory.harvestSourceId = sourceId;
+        }
+        // 外矿有武装敌对（强弱都一样）：先回主房避战，任务和预约都保留。
+        // 人在外矿房时直接看视野并立刻写情报，不然离开视野后主房要到
+        // 下一次 10 tick 扫描才知道有敌人，creep 会在走廊上被反复派回来。
+        if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
+            recordRoomIntel(homeRoom, this.room);
+        }
+        if (isRemotePaused((_d = Memory.mapIntel) === null || _d === void 0 ? void 0 : _d[targetRoom])) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom);
+            }
+            return false;
         }
         if (this.room.name !== targetRoom) {
             this.moveToRoom(targetRoom);
@@ -4913,7 +5080,7 @@ class CreepExtension extends Creep {
             if (state && state.containerId !== container.id) {
                 state.containerId = container.id;
                 // container 首次出现 / 换了 id：主房登记一条循环回运任务（事件驱动，不周期扫描）
-                (_d = Game.rooms[homeRoom]) === null || _d === void 0 ? void 0 : _d.registerRemoteCarryTask(targetRoom, source.id, container.id);
+                (_e = Game.rooms[homeRoom]) === null || _e === void 0 ? void 0 : _e.registerRemoteCarryTask(targetRoom, source.id, container.id);
             }
             if (state && (!state.containerPos || state.containerPos[0] !== container.pos.x || state.containerPos[1] !== container.pos.y)) {
                 state.containerPos = [container.pos.x, container.pos.y];
@@ -4939,7 +5106,7 @@ class CreepExtension extends Creep {
         }
         // 外矿 container 没了：清掉对应回运任务和缓存，重建后再按新 id 登记
         if (state === null || state === void 0 ? void 0 : state.containerId) {
-            (_e = Game.rooms[homeRoom]) === null || _e === void 0 ? void 0 : _e.removeRemoteCarryTask(state.containerId);
+            (_f = Game.rooms[homeRoom]) === null || _f === void 0 ? void 0 : _f.removeRemoteCarryTask(state.containerId);
             delete state.containerId;
         }
         // 还没有 container：自己放工地并建造（5000 进度，边采边建）
@@ -4991,8 +5158,28 @@ class CreepExtension extends Creep {
      * （任务参数结构不变），不再用于兜底投递。
      */
     remoteCarry(containerId, targetRoom, homeRoom, sinkId, linkId) {
-        var _a;
+        var _a, _b;
         const energy = this.store.getUsedCapacity(RESOURCE_ENERGY);
+        // 外矿有武装敌对：不进屋取货。任务和预约保留，情报清场后自动恢复。
+        if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
+            recordRoomIntel(homeRoom, this.room);
+        }
+        if (isRemotePaused((_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[targetRoom])) {
+            if (this.room.name !== homeRoom) {
+                // 在外面（含刚发现敌人的外矿房）：带能量的先回家投递
+                this.memory.remoteReturn = energy > 0;
+                this.moveToRoom(homeRoom);
+                return false;
+            }
+            if (energy > 0) {
+                // 已经在主房：走下面正常投递分支，把这一趟货卸掉
+                this.memory.remoteReturn = true;
+            }
+            else {
+                // 空车在主房：原地待命，别出去送死
+                return this.remoteCarrierIdle();
+            }
+        }
         if (this.room.name === targetRoom) {
             if (this.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                 const container = Game.getObjectById(containerId);
@@ -5007,7 +5194,7 @@ class CreepExtension extends Creep {
                 // 有视野确认 container 已经没了：让主房删任务，别让循环任务跟着死目标跑。
                 // 同时标记 abort：循环运输只该在外矿还有货时持续，目标没了就回主房收尾转回 carrier。
                 if (!container) {
-                    (_a = Game.rooms[homeRoom]) === null || _a === void 0 ? void 0 : _a.removeRemoteCarryTask(containerId);
+                    (_b = Game.rooms[homeRoom]) === null || _b === void 0 ? void 0 : _b.removeRemoteCarryTask(containerId);
                     this.memory.remoteAbort = true;
                 }
             }
@@ -5184,8 +5371,11 @@ class CreepExtension extends Creep {
         // 只从真实相邻房（describeExits）里挑：findExitTo 对非相邻房的行为不可靠，
         // 盲选会让侦察兵在错误的出口之间来回撞。地形静态，走不通的房直接永久跳过。
         const exits = (_b = Game.map.describeExits(homeRoom)) !== null && _b !== void 0 ? _b : {};
+        const now = Game.time;
         let best;
         let bestAt = Infinity;
+        let due;
+        let dueAt = Infinity;
         for (const dir in exits) {
             const roomName = exits[dir];
             if (!roomName || !plan.rooms[roomName]) {
@@ -5195,13 +5385,25 @@ class CreepExtension extends Creep {
             if (intel === null || intel === void 0 ? void 0 : intel.unreachable) {
                 continue;
             }
+            // 还没到复探时间：先不去（强敌停用房、武装敌对没结束的房）
+            if ((intel === null || intel === void 0 ? void 0 : intel.retryAt) !== undefined && intel.retryAt > now) {
+                continue;
+            }
+            // 到点的复探优先：尽快确认外矿能不能恢复生产
+            if ((intel === null || intel === void 0 ? void 0 : intel.retryAt) !== undefined) {
+                if (intel.retryAt < dueAt) {
+                    dueAt = intel.retryAt;
+                    due = roomName;
+                }
+                continue;
+            }
             const at = (_d = intel === null || intel === void 0 ? void 0 : intel.scoutedAt) !== null && _d !== void 0 ? _d : 0;
             if (at < bestAt) {
                 bestAt = at;
                 best = roomName;
             }
         }
-        return best;
+        return due !== null && due !== void 0 ? due : best;
     }
     /**
      * 侦察兵从主房都走不到的房间：记成 unsafe，之后不再自动选它。
@@ -8414,7 +8616,7 @@ class RoomExtension extends Room {
      * 孵化时把矿点 id 写进 harvestSourceId，新 creep 才会只认这一个矿。
      */
     refreshRemoteHarvesterSpawn(plan) {
-        var _a, _b;
+        var _a, _b, _c;
         // 旧逻辑留下的、没绑定矿点的孵化任务没法计入任何一个矿点的覆盖，直接清掉
         this.cancelUnboundRemoteSpawnTasks('remoteHarvester');
         // 首次开矿（还没有 container）仍受富余能量门槛限制；
@@ -8430,12 +8632,17 @@ class RoomExtension extends Room {
             if (!state || state.enabled === false) {
                 continue;
             }
+            // 这一轮武装敌对还没结束：不补人。不把矿点加进 validSources，
+            // 队列里还没孵的 remoteHarvester 会被 cancelStaleRemoteSpawnTasks 清掉。
+            if (isRemotePaused((_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName])) {
+                continue;
+            }
             // 赶路距离按房间数估：相邻房最远 50 格，再留 25 格余量
             const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25;
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin;
-            for (const sourceId in (_a = state.sources) !== null && _a !== void 0 ? _a : {}) {
+            for (const sourceId in (_b = state.sources) !== null && _b !== void 0 ? _b : {}) {
                 validSources.add(sourceId);
-                const established = !!((_b = state.sources[sourceId]) === null || _b === void 0 ? void 0 : _b.containerId);
+                const established = !!((_c = state.sources[sourceId]) === null || _c === void 0 ? void 0 : _c.containerId);
                 if (!established && !gate) {
                     continue;
                 }
@@ -8458,7 +8665,7 @@ class RoomExtension extends Room {
      * 一只车只负责自己矿点脚下的 container；没有 container 的矿点没东西可运，不补。
      */
     refreshRemoteCarrierSpawn(plan) {
-        var _a, _b;
+        var _a, _b, _c;
         // 没绑定矿点的老式孵化任务（或老版本转换出来的车）不计入任何矿点的覆盖
         this.cancelUnboundRemoteSpawnTasks('remoteCarrier');
         if (!plan.force && !this.remoteCarryGate()) {
@@ -8476,11 +8683,16 @@ class RoomExtension extends Room {
             if (!state || state.enabled === false) {
                 continue;
             }
+            // 武装敌对没清场：不补车、不占 spawn；矿点不进 validSources，
+            // 队列里的 remoteCarrier 会被下面统一清掉。
+            if (isRemotePaused((_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName])) {
+                continue;
+            }
             const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25;
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin;
-            for (const sourceId in (_a = state.sources) !== null && _a !== void 0 ? _a : {}) {
+            for (const sourceId in (_b = state.sources) !== null && _b !== void 0 ? _b : {}) {
                 // 容器还没建好：先不孵化，等 containerId 写回计划再补
-                const containerId = (_b = state.sources[sourceId]) === null || _b === void 0 ? void 0 : _b.containerId;
+                const containerId = (_c = state.sources[sourceId]) === null || _c === void 0 ? void 0 : _c.containerId;
                 if (!containerId) {
                     continue;
                 }
@@ -10091,7 +10303,7 @@ class RoomExtension extends Room {
      * 本地 carrier 没超过保底数量时不外派，保证主房补能不断档。
      */
     findRemoteCarryOpening() {
-        var _a, _b, _c, _d, _e;
+        var _a, _b, _c, _d, _e, _f;
         if (!this.controller) {
             return undefined;
         }
@@ -10128,6 +10340,10 @@ class RoomExtension extends Room {
                 }
                 const found = this.remoteSourceOfContainer(containerId);
                 if (!found) {
+                    continue;
+                }
+                // 外矿有武装敌对：别把本地 carrier 转职过去送死
+                if (isRemotePaused((_f = Memory.mapIntel) === null || _f === void 0 ? void 0 : _f[found.roomName])) {
                     continue;
                 }
                 return {

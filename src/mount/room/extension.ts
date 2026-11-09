@@ -5,6 +5,7 @@ import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repai
 import {createBuildTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
+import {isRemotePaused} from "@/util/threat";
 
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
 // 会严重低估升级速度，实测 diff=1 把下一次检查排到了 3 万多 tick 之后，
@@ -1572,6 +1573,11 @@ export default class RoomExtension extends Room {
             if (!state || state.enabled === false) {
                 continue
             }
+            // 这一轮武装敌对还没结束：不补人。不把矿点加进 validSources，
+            // 队列里还没孵的 remoteHarvester 会被 cancelStaleRemoteSpawnTasks 清掉。
+            if (isRemotePaused(Memory.mapIntel?.[roomName])) {
+                continue
+            }
             // 赶路距离按房间数估：相邻房最远 50 格，再留 25 格余量
             const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin
@@ -1616,6 +1622,11 @@ export default class RoomExtension extends Room {
         for (const roomName in plan.rooms) {
             const state = plan.rooms[roomName]
             if (!state || state.enabled === false) {
+                continue
+            }
+            // 武装敌对没清场：不补车、不占 spawn；矿点不进 validSources，
+            // 队列里的 remoteCarrier 会被下面统一清掉。
+            if (isRemotePaused(Memory.mapIntel?.[roomName])) {
                 continue
             }
             const travel = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25
@@ -3308,6 +3319,10 @@ export default class RoomExtension extends Room {
                 }
                 const found = this.remoteSourceOfContainer(containerId)
                 if (!found) {
+                    continue
+                }
+                // 外矿有武装敌对：别把本地 carrier 转职过去送死
+                if (isRemotePaused(Memory.mapIntel?.[found.roomName])) {
                     continue
                 }
                 return {

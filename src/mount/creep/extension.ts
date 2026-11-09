@@ -2,6 +2,7 @@ import { getEnergyTask } from "@/task/roomTask";
 import { remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { recordRoomIntel } from "@/global/autoplan/remotePlan";
+import { hasArmedHostile, isRemotePaused } from "@/util/threat";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
@@ -849,6 +850,18 @@ export default class CreepExtension extends Creep {
         if (sourceId) {
             this.memory.harvestSourceId = sourceId
         }
+        // 外矿有武装敌对（强弱都一样）：先回主房避战，任务和预约都保留。
+        // 人在外矿房时直接看视野并立刻写情报，不然离开视野后主房要到
+        // 下一次 10 tick 扫描才知道有敌人，creep 会在走廊上被反复派回来。
+        if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
+            recordRoomIntel(homeRoom, this.room)
+        }
+        if (isRemotePaused(Memory.mapIntel?.[targetRoom])) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+            }
+            return false
+        }
         if (this.room.name !== targetRoom) {
             this.moveToRoom(targetRoom)
             return false
@@ -958,6 +971,25 @@ export default class CreepExtension extends Creep {
      */
     remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>, linkId?: Id<StructureLink>): boolean {
         const energy = this.store.getUsedCapacity(RESOURCE_ENERGY)
+        // 外矿有武装敌对：不进屋取货。任务和预约保留，情报清场后自动恢复。
+        if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
+            recordRoomIntel(homeRoom, this.room)
+        }
+        if (isRemotePaused(Memory.mapIntel?.[targetRoom])) {
+            if (this.room.name !== homeRoom) {
+                // 在外面（含刚发现敌人的外矿房）：带能量的先回家投递
+                this.memory.remoteReturn = energy > 0
+                this.moveToRoom(homeRoom)
+                return false
+            }
+            if (energy > 0) {
+                // 已经在主房：走下面正常投递分支，把这一趟货卸掉
+                this.memory.remoteReturn = true
+            } else {
+                // 空车在主房：原地待命，别出去送死
+                return this.remoteCarrierIdle()
+            }
+        }
         if (this.room.name === targetRoom) {
             if (this.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                 const container = Game.getObjectById<StructureContainer>(containerId)
@@ -1152,8 +1184,11 @@ export default class CreepExtension extends Creep {
         // 只从真实相邻房（describeExits）里挑：findExitTo 对非相邻房的行为不可靠，
         // 盲选会让侦察兵在错误的出口之间来回撞。地形静态，走不通的房直接永久跳过。
         const exits = Game.map.describeExits(homeRoom) ?? {}
+        const now = Game.time
         let best: string | undefined
         let bestAt = Infinity
+        let due: string | undefined
+        let dueAt = Infinity
         for (const dir in exits) {
             const roomName = exits[dir]
             if (!roomName || !plan.rooms[roomName]) {
@@ -1163,13 +1198,25 @@ export default class CreepExtension extends Creep {
             if (intel?.unreachable) {
                 continue
             }
+            // 还没到复探时间：先不去（强敌停用房、武装敌对没结束的房）
+            if (intel?.retryAt !== undefined && intel.retryAt > now) {
+                continue
+            }
+            // 到点的复探优先：尽快确认外矿能不能恢复生产
+            if (intel?.retryAt !== undefined) {
+                if (intel.retryAt < dueAt) {
+                    dueAt = intel.retryAt
+                    due = roomName
+                }
+                continue
+            }
             const at = intel?.scoutedAt ?? 0
             if (at < bestAt) {
                 bestAt = at
                 best = roomName
             }
         }
-        return best
+        return due ?? best
     }
 
     /**
