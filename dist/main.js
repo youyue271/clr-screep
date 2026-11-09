@@ -4250,6 +4250,11 @@ class CreepExtension extends Creep {
             }
             if (!this.memory.working) {
                 if (!this.getWork()) {
+                    // 本地没活：房间有 storage 就把富余能量搬进去（见 storeSurplusEnergy）。
+                    // 必须放在随机走前面：随机走会覆盖这里发出的 moveTo 意图。
+                    if (this.storeSurplusEnergy()) {
+                        return;
+                    }
                     // 外矿 carrier / claimer 的空闲处理自己会发移动意图（回家/原地待命），
                     // 这里再随机走会覆盖 moveToRoom，导致永远回不了主房
                     if (this.memory.role !== 'remoteCarrier' && this.memory.role !== 'claimer') {
@@ -4405,25 +4410,15 @@ class CreepExtension extends Creep {
         if (this.memory.role === 'remoteCarrier') {
             return this.remoteCarrierIdle();
         }
-        // 本地 carrier 有空闲外矿运输位、且本地 carrier 超过保底数量时，转职去跑外矿：
+        // 本地运输体型有空闲外矿运输位、且本地运输体型超过保底数量时，转职去跑外矿：
         // 运输车和本地 carrier 体型完全一样，不用重新孵化。转职后死亡不进 initSpawn
         // 配额（reSpawn=false），由主房扫描按矿点动态补员；本地保底由 refreshCarrierQuota 兜底。
-        if (this.memory.role === 'carrier'
-            && this.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            const opening = room.findRemoteCarryOpening();
-            if (opening) {
-                this.changeRole('remoteCarrier');
-                this.memory.remoteCarrySourceId = opening.sourceId;
-                this.memory.remoteCarryRoom = opening.remoteRoom;
-                delete this.memory.oldRole;
-                this.memory.reSpawn = false;
-                if (this.getWork()) {
-                    return true;
-                }
-                // 名额被别人抢了：退回本地 carrier，别挂着外矿身份发呆
-                this.finishRemoteTrip();
-                return false;
-            }
+        // emptyWorker 也要参与：本地没活时 carrier 会被转成 emptyWorker 去取能，
+        // 不在这里重新指派的话，本地 carrier 数量一低于保底，外矿满了也永远没人去搬。
+        if ((this.memory.role === 'carrier'
+            || (this.memory.role === 'emptyWorker' && this.memory.oldRole === 'carrier'))
+            && this.tryJoinRemoteCarry()) {
+            return true;
         }
         // 外矿运输由主房扫描（refreshRemoteCarrierSpawn）按矿点动态补员；
         // 没任务可做且身上没能量：转成 emptyWorker 去取能，避免原地空转。
@@ -4906,6 +4901,65 @@ class CreepExtension extends Creep {
         }
         return false;
     }
+    /**
+     * 本地没活时，把房间里的富余能量搬进 storage。
+     * 只有 getWork 找不到任何任务（spawn/extension/塔都不缺能量）才会走到这里：
+     * 这时 core link（中转缓冲）和高于高水位的 container 才算是真正的富余。
+     * 不登记任务、不占预约，纯粹是空闲时的搬运行为；返回 true 表示已经发出意图。
+     */
+    storeSurplusEnergy() {
+        // 只处理本地运输体型：carrier 本身，以及空闲下来的 carrier 体型 emptyWorker
+        if (this.memory.role !== 'carrier'
+            && !(this.memory.role === 'emptyWorker' && this.memory.oldRole === 'carrier')) {
+            return false;
+        }
+        const storage = this.room.storage;
+        if (!storage || storage.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
+            return false;
+        }
+        // 身上有货先送去 storage
+        if (this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            this.say('📥存储备');
+            const res = this.transfer(storage, RESOURCE_ENERGY);
+            if (res == ERR_NOT_IN_RANGE) {
+                this.moveTo(storage, { visualizePathStyle: { stroke: '#ffff00' } });
+                return true;
+            }
+            return res == OK;
+        }
+        // 没货：找富余来源。core link 是中转缓冲，有能量就搬走；
+        // container 只搬高水位以上的部分，别把本地补能要用的底仓搬空。
+        const source = this.surplusEnergySource();
+        if (!source) {
+            return false;
+        }
+        this.say('📤搬富余');
+        const res = this.withdraw(source, RESOURCE_ENERGY);
+        if (res == ERR_NOT_IN_RANGE) {
+            this.moveTo(source, { visualizePathStyle: { stroke: '#ffff00' } });
+            return true;
+        }
+        return res == OK;
+    }
+    /**
+     * 房间里的富余能量来源：core link 优先，其次高水位以上的 container。
+     */
+    surplusEnergySource() {
+        var _a;
+        const core = this.room.getCoreLink();
+        if (core && core.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            return core;
+        }
+        const level = this.room.controller ? this.room.controller.level : 0;
+        const high = ((_a = containerWatermark[level]) !== null && _a !== void 0 ? _a : containerWatermark[0]).high;
+        for (const id of this.room.getContainer()) {
+            const container = this.room.containerById(id);
+            if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) >= high) {
+                return container;
+            }
+        }
+        return undefined;
+    }
     repairStructure(targetId, targetHits) {
         var _a;
         const target = Game.getObjectById(targetId);
@@ -5278,6 +5332,31 @@ class CreepExtension extends Creep {
             return undefined;
         }
         return new RoomPosition(pos[0], pos[1], homeRoom);
+    }
+    /**
+     * 空闲运输体型转职去跑外矿：找到空闲回运名额并领到任务返回 true。
+     * 没有名额（含本地运输体型不超过保底）返回 false，调用方继续走本地兜底。
+     * 名额被别人抢了会收回外矿身份，避免挂着 remoteCarrier 发呆。
+     */
+    tryJoinRemoteCarry() {
+        if (this.store.getUsedCapacity(RESOURCE_ENERGY) !== 0) {
+            return false;
+        }
+        const opening = this.room.findRemoteCarryOpening();
+        if (!opening) {
+            return false;
+        }
+        this.changeRole('remoteCarrier');
+        this.memory.remoteCarrySourceId = opening.sourceId;
+        this.memory.remoteCarryRoom = opening.remoteRoom;
+        delete this.memory.oldRole;
+        this.memory.reSpawn = false;
+        if (this.getWork()) {
+            return true;
+        }
+        // 名额被别人抢了：退回本地 carrier，别挂着外矿身份发呆
+        this.finishRemoteTrip();
+        return false;
     }
     /**
      * 外矿往返结束：循环任务保留，只把角色切回 carrier。
@@ -8752,7 +8831,13 @@ class RoomExtension extends Room {
         let idleEmpty = 0;
         for (const name in Game.creeps) {
             const creep = Game.creeps[name];
-            if (creep.memory.spawnRoom !== this.name || creep.memory.role !== 'carrier') {
+            if (creep.memory.spawnRoom !== this.name) {
+                continue;
+            }
+            // 本地没活时 carrier 会被转成 emptyWorker 去取能，oldRole 是 carrier
+            // 的 emptyWorker 也是同一套运输体型，必须一起算，否则转职名额永远凑不够
+            if (creep.memory.role !== 'carrier'
+                && !(creep.memory.role === 'emptyWorker' && creep.memory.oldRole === 'carrier')) {
                 continue;
             }
             locals++;
@@ -10311,7 +10396,13 @@ class RoomExtension extends Room {
         let locals = 0;
         for (const name in Game.creeps) {
             const creep = Game.creeps[name];
-            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'carrier') {
+            if (creep.memory.spawnRoom !== this.name) {
+                continue;
+            }
+            // 本地没活时 carrier 会转成 oldRole=carrier 的 emptyWorker，
+            // 它们同样是本地运输体型，算进保底才能继续被指派去外矿
+            if (creep.memory.role === 'carrier'
+                || (creep.memory.role === 'emptyWorker' && creep.memory.oldRole === 'carrier')) {
                 locals++;
             }
         }

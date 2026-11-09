@@ -1695,7 +1695,13 @@ export default class RoomExtension extends Room {
         let idleEmpty = 0
         for (const name in Game.creeps) {
             const creep = Game.creeps[name]
-            if (creep.memory.spawnRoom !== this.name || creep.memory.role !== 'carrier') {
+            if (creep.memory.spawnRoom !== this.name) {
+                continue
+            }
+            // 本地没活时 carrier 会被转成 emptyWorker 去取能，oldRole 是 carrier
+            // 的 emptyWorker 也是同一套运输体型，必须一起算，否则转职名额永远凑不够
+            if (creep.memory.role !== 'carrier'
+                && !(creep.memory.role === 'emptyWorker' && creep.memory.oldRole === 'carrier')) {
                 continue
             }
             locals++
@@ -3289,7 +3295,13 @@ export default class RoomExtension extends Room {
         let locals = 0
         for (const name in Game.creeps) {
             const creep = Game.creeps[name]
-            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'carrier') {
+            if (creep.memory.spawnRoom !== this.name) {
+                continue
+            }
+            // 本地没活时 carrier 会转成 oldRole=carrier 的 emptyWorker，
+            // 它们同样是本地运输体型，算进保底才能继续被指派去外矿
+            if (creep.memory.role === 'carrier'
+                || (creep.memory.role === 'emptyWorker' && creep.memory.oldRole === 'carrier')) {
                 locals++
             }
         }
