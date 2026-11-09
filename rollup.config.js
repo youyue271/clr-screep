@@ -5,6 +5,8 @@ import typescript from 'rollup-plugin-typescript2'
 import resolve from '@rollup/plugin-node-resolve'
 import commonjs from '@rollup/plugin-commonjs'
 import { createRequire } from 'node:module';
+import fs from 'node:fs'
+import path from 'node:path'
 const require = createRequire(import.meta.url);
 
 let config
@@ -35,6 +37,49 @@ const pluginDeploy = config && config.copyPath ?
     // 更新 .map 到 .map.js 并上传
     screeps({ config, dryRun: !config })
 
+// 额外账号：主目标上传后，把同一份 dist 再推到这些账号
+const extraConfigs = (config?.extra || []).map(name => {
+    const extra = require("./.secret.json")[name]
+    if (!extra) {
+        throw new Error(`无效的额外目标 ${name}，请检查 secret.json`)
+    }
+    return extra
+})
+
+function readDist(dir) {
+    const code = {}
+    for (const file of fs.readdirSync(dir)) {
+        if (file.endsWith('.js')) {
+            code[file.replace(/\.js$/i, '')] = fs.readFileSync(path.join(dir, file), 'utf8')
+        }
+    }
+    return code
+}
+
+// 复刻 rollup-plugin-screeps 的上传逻辑，但不再 rename sourcemap（原插件已经做过一次）
+function extraDeploy(configs) {
+    return {
+        name: 'screeps-extra-deploy',
+        async writeBundle(options) {
+            if (!configs.length) {
+                return
+            }
+            const code = readDist(path.dirname(options.file))
+            for (const cfg of configs) {
+                const api = new (require('screeps-api').ScreepsAPI)(cfg)
+                const data = await api.raw.user.branches()
+                const branches = (data.list || []).map(item => item.branch)
+                if (branches.includes(cfg.branch)) {
+                    await api.code.set(cfg.branch, code)
+                } else {
+                    await api.raw.user.cloneBranch('', cfg.branch, code)
+                }
+                console.log(`已上传到额外账号 ${cfg.hostname}/${cfg.branch}（${Object.keys(code).length} 个模块）`)
+            }
+        }
+    }
+}
+
 export default {
     input: 'src/main.ts',
     output: {
@@ -52,6 +97,8 @@ export default {
         // 编译 ts
         typescript({ tsconfig: "./tsconfig.json" }),
         // 执行上传或者复制
-        pluginDeploy
+        pluginDeploy,
+        // 额外账号同步上传
+        extraDeploy(extraConfigs)
     ]
 };
