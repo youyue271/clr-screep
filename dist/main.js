@@ -5532,13 +5532,14 @@ class CreepExtension extends Creep {
                 return this.afterRemoteDelivery();
             }
         }
-        // 没有可用 link：丢在外矿对应的 link 规划位上，等本地 carrier/emptyWorker 来收。
+        // 没有可用 link：丢在外矿对应的 link 规划位旁边，等本地 carrier/emptyWorker 来收。
+        // 规划位上可能已经有 link 工地/建成的 link（都是障碍），人站不上去，所以相邻即放。
         // 不转回 carrier —— 外矿还有货就继续往返，把"外面运不回来"这一段先打通。
         const dropPos = this.remoteLinkPosOf(homeRoom, targetRoom);
         if (dropPos) {
-            if (!this.pos.isEqualTo(dropPos)) {
+            if (!this.pos.isNearTo(dropPos)) {
                 this.say('📦去放货');
-                this.moveTo(dropPos, { visualizePathStyle: { stroke: '#66ccff' } });
+                this.moveTo(dropPos, { range: 1, visualizePathStyle: { stroke: '#66ccff' } });
                 return false;
             }
             this.say('📦放link位');
