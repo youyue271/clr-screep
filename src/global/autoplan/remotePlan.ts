@@ -113,7 +113,10 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
     intel.hostileDps = threat.dps
     if (armed) {
         if (intel.hostileSince === undefined) {
+            // 新一轮骚扰：反击队的次数/冷却重新算
             intel.hostileSince = Game.time
+            delete intel.counterAt
+            delete intel.counterAttempts
         }
         intel.hostileLastSeen = Game.time
         // 武装敌对还在：安排下一次复查。弱敌复查得勤一点，
@@ -127,6 +130,8 @@ export function recordRoomIntel(homeRoomName: string, room: Room): void {
         delete intel.hostileCount
         delete intel.hostileDps
         delete intel.retryAt
+        delete intel.counterAt
+        delete intel.counterAttempts
     }
     // 弱敌不停用外矿：产线留着，先让 crew 撤离避战，下一批再交给反击队。
     // 强敌 / 有主 / 被外人 reserve 才 unsafe。

@@ -2,7 +2,8 @@ import { getEnergyTask } from "@/task/roomTask";
 import { containerWatermark, remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { recordRoomIntel } from "@/global/autoplan/remotePlan";
-import { hasArmedHostile, isRemotePaused } from "@/util/threat";
+import { classifyThreat, hasArmedHostile, isRemotePaused } from "@/util/threat";
+import { ACTION_BLOCKED } from "./actionGuard";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
@@ -21,6 +22,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'viewer': ['scoutTask'],
     // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
     'claimer': ['claimTask'],
+    // 反击队不领任务：work() 里直接走 counterAttack，只认孵化时绑定的外矿房
+    'attacker': [],
     // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
     'sleep': [],
 }
@@ -37,6 +40,11 @@ export default class CreepExtension extends Creep {
         // console.log(this.name)
         if (this.spawning) {
             // console.log(this.ticksToLive)
+            return
+        }
+        // 反击队：不领任务，自己按 attackerTarget 去外矿清弱敌
+        if (this.memory.role === 'attacker') {
+            this.counterAttack()
             return
         }
         // 外矿房被停用（敌对/被别人占用/已移出计划）后任务会被主房清掉，
@@ -690,6 +698,11 @@ export default class CreepExtension extends Creep {
                 this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
                 return true
             }
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经发过取能/投递动作：补能任务保留，下一 tick 继续，
+                // 绝不能因为一次被守卫跳过就降级成 emptyWorker。
+                return true
+            }
             if (res == OK) {
                 // 取到了，下一 tick 继续这个补能任务去投递
                 return true
@@ -799,6 +812,10 @@ export default class CreepExtension extends Creep {
                 this.moveTo(storage, {visualizePathStyle: {stroke: '#ffff00'}})
                 return true
             }
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经发过动作：保持原地，别让下面的随机走覆盖掉
+                return true
+            }
             return res == OK
         }
         // 没货：找富余来源。core link 是中转缓冲，有能量就搬走；
@@ -811,6 +828,10 @@ export default class CreepExtension extends Creep {
         const res = this.withdraw(source, RESOURCE_ENERGY)
         if (res == ERR_NOT_IN_RANGE) {
             this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
+            return true
+        }
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已经发过动作：保持原地，别让下面的随机走覆盖掉
             return true
         }
         return res == OK
@@ -856,6 +877,10 @@ export default class CreepExtension extends Creep {
             this.moveTo(target, {range: 3, visualizePathStyle: {stroke: '#ffffff'}})
             return false
         }
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已发过冲突动作：保留维修任务，下一 tick 再修
+            return false
+        }
         if (res == OK) {
             // 继续修，下一 tick 检查是否已经满了
             return false
@@ -882,6 +907,9 @@ export default class CreepExtension extends Creep {
                 // 以前目标是 range 0，所有 builder 都往工地那一格挤，站进 range 3 的人
                 // 还会被后面的人推开（对穿反复互换位置），工地只有一个工位在产出。
                 this.moveTo(target, {range: 3, visualizePathStyle: {stroke: '#ffffff'}});
+                return false
+            } else if (res === ACTION_BLOCKED) {
+                // 本 tick 已发过冲突动作：保留建造任务，下一 tick 再建
                 return false
             } else if (res == OK) {
                 // 只有这一下会把工地打满时才在下一 tick 触发 onBuild；
@@ -1149,6 +1177,11 @@ export default class CreepExtension extends Creep {
         if (link && link.energy < link.energyCapacity) {
             this.say('🔗外矿入link')
             const res = this.transfer(link, RESOURCE_ENERGY)
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经投递过能量：保留任务，下一 tick 再入 link。
+                // 绝不能落到下面的 drop 分支同 tick 再丢一次。
+                return false
+            }
             if (res === ERR_NOT_IN_RANGE) {
                 this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } })
                 return false
@@ -1169,7 +1202,12 @@ export default class CreepExtension extends Creep {
                 return false
             }
             this.say('📦放link位')
-            if (this.drop(RESOURCE_ENERGY) === OK) {
+            const dropRes = this.drop(RESOURCE_ENERGY)
+            if (dropRes === ACTION_BLOCKED) {
+                // 本 tick 已经有动作了，货还没丢下，别结束这趟外运
+                return false
+            }
+            if (dropRes === OK) {
                 return this.afterRemoteDelivery()
             }
         }
@@ -1393,6 +1431,13 @@ export default class CreepExtension extends Creep {
             }
             return false
         }
+        // 目标房这一轮武装敌对还没结束：先撤回主房，保留绑定，清场后自动回去
+        if (isRemotePaused(Memory.mapIntel?.[target])) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+            }
+            return false
+        }
         const claimEntry = Memory.claimPlan?.[target]
         if (claimEntry) {
             if (claimEntry.retryAt !== undefined && claimEntry.retryAt > Game.time) {
@@ -1472,6 +1517,10 @@ export default class CreepExtension extends Creep {
             return false
         }
         const res = this.claimController(controller)
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已发过动作：保留占领计划，下一 tick 再试，别删计划
+            return false
+        }
         if (res === OK) {
             this.say('🚩 占领')
             delete Memory.claimPlan?.[roomName]
@@ -1528,6 +1577,10 @@ export default class CreepExtension extends Creep {
             return false
         }
         const res = this.reserveController(controller)
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已发过动作：下一 tick 继续保留，别写错情报
+            return false
+        }
         if (res === OK) {
             this.say('🛡️ 保留')
             const me = this.owner?.username
@@ -1638,6 +1691,70 @@ export default class CreepExtension extends Creep {
             }
         }
         return best
+    }
+
+    /**
+     * 反击队行为：只清 attackerTarget 这一轮骚扰里的弱敌（无 HEAL 的小股武装）。
+     * - 主房遭强敌：先回家防守，不出去送
+     * - 目标房清空 / episode 结束 / 情报升级成 assault/siege：撤回主房
+     * - 只打有 ATTACK/RANGED_ATTACK/CLAIM 部件的敌人，先打最近的
+     */
+    private counterAttack(): void {
+        const homeRoom = this.memory.spawnRoom
+        const target = this.memory.attackerTarget
+        const home = Game.rooms[homeRoom]
+        if (home) {
+            const homeLevel = classifyThreat(home.find(FIND_HOSTILE_CREEPS)).level
+            if (homeLevel === 'assault' || homeLevel === 'siege') {
+                if (this.room.name !== homeRoom) {
+                    this.moveToRoom(homeRoom)
+                }
+                return
+            }
+        }
+        // 目标丢了、外矿总开关关了或这一轮骚扰已经结束：回家等 TTL/回收
+        if (!target || Memory.remotePlan?.[homeRoom]?.enabled === false
+            || !isRemotePaused(Memory.mapIntel?.[target])) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+            }
+            return
+        }
+        if (this.room.name !== target) {
+            // moveToRoom 只支持相邻房：先回主房，再从主房出门
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
+            } else {
+                this.moveToRoom(target)
+            }
+            return
+        }
+        // 到站刷新情报：维持 hostileLastSeen，敌人增援升级时立刻能看出来
+        recordRoomIntel(homeRoom, this.room)
+        const hostiles = this.room.find(FIND_HOSTILE_CREEPS)
+        const threat = classifyThreat(hostiles)
+        if (threat.level === 'assault' || threat.level === 'siege') {
+            // 情报过期，敌人已经不是弱敌：撤退，把房留给下一阶段
+            this.moveToRoom(homeRoom)
+            return
+        }
+        const armed = hostiles.filter(creep =>
+            creep.getActiveBodyparts(ATTACK) > 0
+            || creep.getActiveBodyparts(RANGED_ATTACK) > 0
+            || creep.getActiveBodyparts(CLAIM) > 0)
+        if (!armed.length) {
+            // 清场完毕：回家等 episode 自然结束
+            this.moveToRoom(homeRoom)
+            return
+        }
+        // 有 HEAL 的敌人已经被 classifyThreat 判成 assault 撤了，这里只剩无奶弱敌：打最近的
+        armed.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b))
+        const goal = armed[0]
+        if (this.pos.isNearTo(goal)) {
+            this.attack(goal)
+        } else {
+            this.moveTo(goal, {reusePath: 5})
+        }
     }
 
     /**

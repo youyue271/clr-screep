@@ -2,6 +2,7 @@ import CreepExtension from "./extension"
 import {assignPrototype} from "@/util/utils"
 import {detectStructureBlock, getField} from "./field"
 import {DIR_DX, DIR_DY, escapeDir, idx} from "./fieldCore"
+import {installActionGuard} from "./actionGuard"
 
 // 引擎 moveTo 默认允许跨最多 16 个房间寻路。当前房间是大片沼泽、隔壁房是平原时，
 // 最便宜的路径会绕出房间再绕回来；而 Room.findPath 收尾时会在第一个房外格子处截断
@@ -206,4 +207,7 @@ export default () => {
     // assignPrototype 之后再覆盖，避免被 CreepExtension 上的同名方法盖掉
     Creep.prototype.moveTo = moveToInRoom as any
     Creep.prototype.move = moveWithBodyCheck as any
+    // 动作守卫：同 tick 同名/优先级冲突的第二个动作直接跳过，保护已经发出的 intent。
+    // 必须放在 assignPrototype 之后，且只装一次。
+    installActionGuard()
 }

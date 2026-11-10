@@ -109,3 +109,13 @@ export function hasArmedHostile(room: Room): boolean {
 export function isRemotePaused(intel: MapIntel | undefined): boolean {
     return !!intel && intel.hostileSince !== undefined
 }
+
+/**
+ * NPC 阵营的用户名。反击队只清 NPC/野生敌对，
+ * 别的玩家 owner/reserve 的房一律不打。
+ */
+const npcUsers = ['Invader', 'Source Keeper']
+
+export function isNpcUser(username: string | undefined): boolean {
+    return !!username && npcUsers.indexOf(username) >= 0
+}

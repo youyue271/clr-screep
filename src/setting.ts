@@ -40,6 +40,8 @@ export const spawnTable: { [role in Role]: number[] } = {
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
     'claimer':      [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // 反击队不参与自动配额：refreshCounterSpawn 按弱敌情报按需补员，reSpawn=false
+    'attacker':     [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // sleep 是矿采空后的临时状态，从不孵化
     'sleep':        [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
@@ -212,6 +214,14 @@ export const warSetting = {
     siegeDps: 600,
     siegeWorkParts: 5,
     siegeMinCount: 3,
+    // 弱敌反击队：每只 5 ATTACK + 5 MOVE = 150 DPS（RCL4 容量 1300 时的体型）
+    counterDpsEach: 150,
+    // 一个外矿房最多同时派几只、全部外矿加起来最多几只
+    counterMaxPerRoom: 2,
+    counterMaxTotal: 3,
+    // 同一轮骚扰最多派几队；打光后等 reinforceTicks 再整队补派
+    counterMaxAttempts: 3,
+    counterReinforceTicks: 300,
 }
 
 export const towerSetting = {

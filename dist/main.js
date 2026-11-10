@@ -3286,6 +3286,8 @@ const spawnTable = {
     'remoteCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // claimer 不参与自动配额：refreshClaimSpawn 按 reserve 到期/显式 claim 需求补员
     'claimer': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // 反击队不参与自动配额：refreshCounterSpawn 按弱敌情报按需补员，reSpawn=false
+    'attacker': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // sleep 是矿采空后的临时状态，从不孵化
     'sleep': [0, 0, 0, 0, 0, 0, 0, 0, 0],
 };
@@ -3442,6 +3444,14 @@ const warSetting = {
     siegeDps: 600,
     siegeWorkParts: 5,
     siegeMinCount: 3,
+    // 弱敌反击队：每只 5 ATTACK + 5 MOVE = 150 DPS（RCL4 容量 1300 时的体型）
+    counterDpsEach: 150,
+    // 一个外矿房最多同时派几只、全部外矿加起来最多几只
+    counterMaxPerRoom: 2,
+    counterMaxTotal: 3,
+    // 同一轮骚扰最多派几队；打光后等 reinforceTicks 再整队补派
+    counterMaxAttempts: 3,
+    counterReinforceTicks: 300,
 };
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
@@ -4006,6 +4016,14 @@ function hasArmedHostile(room) {
 function isRemotePaused(intel) {
     return !!intel && intel.hostileSince !== undefined;
 }
+/**
+ * NPC 阵营的用户名。反击队只清 NPC/野生敌对，
+ * 别的玩家 owner/reserve 的房一律不打。
+ */
+const npcUsers = ['Invader', 'Source Keeper'];
+function isNpcUser(username) {
+    return !!username && npcUsers.indexOf(username) >= 0;
+}
 
 /**
  * highway 通道房：房间名坐标能被 10 整除（如 W34S50、W40S49）。
@@ -4119,7 +4137,10 @@ function recordRoomIntel(homeRoomName, room) {
     intel.hostileDps = threat.dps;
     if (armed) {
         if (intel.hostileSince === undefined) {
+            // 新一轮骚扰：反击队的次数/冷却重新算
             intel.hostileSince = Game.time;
+            delete intel.counterAt;
+            delete intel.counterAttempts;
         }
         intel.hostileLastSeen = Game.time;
         // 武装敌对还在：安排下一次复查。弱敌复查得勤一点，
@@ -4134,6 +4155,8 @@ function recordRoomIntel(homeRoomName, room) {
         delete intel.hostileCount;
         delete intel.hostileDps;
         delete intel.retryAt;
+        delete intel.counterAt;
+        delete intel.counterAttempts;
     }
     // 弱敌不停用外矿：产线留着，先让 crew 撤离避战，下一批再交给反击队。
     // 强敌 / 有主 / 被外人 reserve 才 unsafe。
@@ -4200,6 +4223,124 @@ function recordRoomIntel(homeRoomName, room) {
     }
 }
 
+/**
+ * 同 tick 动作守卫。
+ *
+ * 引擎的 intent 模型（见 src/processor/intents/creeps/intents.js）：
+ * 1. 每个 creep 每个动作名只存一个 intent，同名方法后调用覆盖前调用，但两次都返回 OK；
+ * 2. 一张 priorities 有向图，低优先级动作会被已存在的高优先级动作挡掉（checkPriorities）；
+ * 3. 没有优先级关系的不同动作可以同 tick 一起执行（例如 transfer + withdraw、transfer + drop）。
+ *
+ * 本守卫的语义是「本 tick 第一个发出的动作粘住」：
+ * - 同名动作第二次调用 -> 跳过；
+ * - 与已发出动作存在优先级关系（无论谁挡谁）-> 跳过，避免后一个把前一个顶掉，
+ *   也避免发出一个引擎根本不会执行的“幻影 OK”；
+ * - 无关系的动作照常放行。
+ *
+ * 标记是自动的：在 Creep.prototype 上包一层，原生方法返回 OK 才记一位，
+ * 这样所有现有/未来的动作调用点都不需要手写标记。
+ * 判定是 O(1)：每个 creep 一个 32 位掩码，冲突集预计算成位掩码。
+ */
+const ACTION_BLOCKED = ERR_BUSY;
+// 会产生 creep intent 的动作。move/pull 属于移动管线（traffic 依赖 last-wins），
+// say 每 tick 多次且纯展示，suicide 是终止动作，都不参与冲突。
+const ACTION_NAMES = [
+    'drop', 'transfer', 'withdraw', 'pickup',
+    'heal', 'rangedHeal', 'dismantle', 'attack', 'harvest',
+    'repair', 'build', 'rangedMassAttack', 'rangedAttack',
+    'claimController', 'upgradeController', 'reserveController',
+    'attackController', 'generateSafeMode', 'signController',
+];
+// 与引擎 src/processor/intents/creeps/intents.js 的 priorities 逐字一致。
+// 注意这是有向图不是全序：harvest 和 rangedAttack、rangedAttack 和 heal
+// 互不在对方 blockers 里，可以同 tick 执行；压成单个 rank 会误杀。
+const BLOCKERS = {
+    rangedHeal: ['heal'],
+    attackController: ['rangedHeal', 'heal'],
+    dismantle: ['attackController', 'rangedHeal', 'heal'],
+    repair: ['dismantle', 'attackController', 'rangedHeal', 'heal'],
+    build: ['repair', 'dismantle', 'attackController', 'rangedHeal', 'heal'],
+    attack: ['build', 'repair', 'dismantle', 'attackController', 'rangedHeal', 'heal'],
+    harvest: ['attack', 'build', 'repair', 'dismantle', 'attackController', 'rangedHeal', 'heal'],
+    rangedMassAttack: ['build', 'repair', 'rangedHeal'],
+    rangedAttack: ['rangedMassAttack', 'build', 'repair', 'rangedHeal'],
+};
+const ACTION_BIT = {};
+// 对称展开后的冲突集：a 在 b 的 blockers 里，则 a、b 互相冲突。
+const ACTION_CONFLICT = {};
+// 运行时只查这一个：同名位 | 优先级冲突位。
+const ACTION_SELF_CONFLICT = {};
+ACTION_NAMES.forEach((name, i) => {
+    ACTION_BIT[name] = 1 << i;
+    ACTION_CONFLICT[name] = 0;
+});
+for (const name in BLOCKERS) {
+    for (const blocker of BLOCKERS[name]) {
+        ACTION_CONFLICT[name] |= ACTION_BIT[blocker];
+        ACTION_CONFLICT[blocker] |= ACTION_BIT[name];
+    }
+}
+ACTION_NAMES.forEach(name => {
+    ACTION_SELF_CONFLICT[name] = ACTION_BIT[name] | ACTION_CONFLICT[name];
+});
+function currentMask(creep) {
+    const c = creep;
+    // creep 对象每 tick 重建；tick 比较兜底，避免复用对象时读到旧掩码
+    return c.__actTick === Game.time ? (c.__actMask | 0) : 0;
+}
+function canAct(creep, name) {
+    return (currentMask(creep) & (ACTION_SELF_CONFLICT[name] || 0)) === 0;
+}
+function markActed(creep, name) {
+    const c = creep;
+    if (c.__actTick !== Game.time) {
+        c.__actTick = Game.time;
+        c.__actMask = ACTION_BIT[name];
+    }
+    else {
+        c.__actMask |= ACTION_BIT[name];
+    }
+}
+/**
+ * transfer(controller, ENERGY) 在引擎里会转调 upgradeController
+ * （game/creeps.js 455-456 行），实际 intent 名是 upgradeController。
+ * 判定和标记都必须用有效动作名，否则会错误地占掉 transfer 位。
+ */
+function effectiveName(name, args) {
+    if (name === 'transfer'
+        && args[1] === RESOURCE_ENERGY
+        && args[0] && args[0].structureType === STRUCTURE_CONTROLLER) {
+        return 'upgradeController';
+    }
+    return name;
+}
+let installed = false;
+function installActionGuard() {
+    if (installed) {
+        return;
+    }
+    installed = true;
+    for (const name of ACTION_NAMES) {
+        const native = Creep.prototype[name];
+        if (typeof native !== 'function') {
+            continue;
+        }
+        Creep.prototype[name] = function (...args) {
+            const effective = effectiveName(name, args);
+            if (!canAct(this, effective)) {
+                return ACTION_BLOCKED;
+            }
+            const res = native.apply(this, args);
+            // 只有 OK 才代表 intent 真的进了引擎；ERR_NOT_IN_RANGE /
+            // ERR_NOT_ENOUGH_RESOURCES 等没有 intent，提前标记会误杀后续合法动作。
+            if (res === OK) {
+                markActed(this, effective);
+            }
+            return res;
+        };
+    }
+}
+
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 const roleToTask = {
     'harvester': ['harvestTask'],
@@ -4217,6 +4358,8 @@ const roleToTask = {
     'viewer': ['scoutTask'],
     // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
     'claimer': ['claimTask'],
+    // 反击队不领任务：work() 里直接走 counterAttack，只认孵化时绑定的外矿房
+    'attacker': [],
     // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
     'sleep': [],
 };
@@ -4231,6 +4374,11 @@ class CreepExtension extends Creep {
         // console.log(this.name)
         if (this.spawning) {
             // console.log(this.ticksToLive)
+            return;
+        }
+        // 反击队：不领任务，自己按 attackerTarget 去外矿清弱敌
+        if (this.memory.role === 'attacker') {
+            this.counterAttack();
             return;
         }
         // 外矿房被停用（敌对/被别人占用/已移出计划）后任务会被主房清掉，
@@ -4887,6 +5035,11 @@ class CreepExtension extends Creep {
                 this.moveTo(source, { visualizePathStyle: { stroke: '#ffff00' } });
                 return true;
             }
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经发过取能/投递动作：补能任务保留，下一 tick 继续，
+                // 绝不能因为一次被守卫跳过就降级成 emptyWorker。
+                return true;
+            }
             if (res == OK) {
                 // 取到了，下一 tick 继续这个补能任务去投递
                 return true;
@@ -4994,6 +5147,10 @@ class CreepExtension extends Creep {
                 this.moveTo(storage, { visualizePathStyle: { stroke: '#ffff00' } });
                 return true;
             }
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经发过动作：保持原地，别让下面的随机走覆盖掉
+                return true;
+            }
             return res == OK;
         }
         // 没货：找富余来源。core link 是中转缓冲，有能量就搬走；
@@ -5006,6 +5163,10 @@ class CreepExtension extends Creep {
         const res = this.withdraw(source, RESOURCE_ENERGY);
         if (res == ERR_NOT_IN_RANGE) {
             this.moveTo(source, { visualizePathStyle: { stroke: '#ffff00' } });
+            return true;
+        }
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已经发过动作：保持原地，别让下面的随机走覆盖掉
             return true;
         }
         return res == OK;
@@ -5051,6 +5212,10 @@ class CreepExtension extends Creep {
             this.moveTo(target, { range: 3, visualizePathStyle: { stroke: '#ffffff' } });
             return false;
         }
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已发过冲突动作：保留维修任务，下一 tick 再修
+            return false;
+        }
         if (res == OK) {
             // 继续修，下一 tick 检查是否已经满了
             return false;
@@ -5076,6 +5241,10 @@ class CreepExtension extends Creep {
                 // 以前目标是 range 0，所有 builder 都往工地那一格挤，站进 range 3 的人
                 // 还会被后面的人推开（对穿反复互换位置），工地只有一个工位在产出。
                 this.moveTo(target, { range: 3, visualizePathStyle: { stroke: '#ffffff' } });
+                return false;
+            }
+            else if (res === ACTION_BLOCKED) {
+                // 本 tick 已发过冲突动作：保留建造任务，下一 tick 再建
                 return false;
             }
             else if (res == OK) {
@@ -5348,6 +5517,11 @@ class CreepExtension extends Creep {
         if (link && link.energy < link.energyCapacity) {
             this.say('🔗外矿入link');
             const res = this.transfer(link, RESOURCE_ENERGY);
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经投递过能量：保留任务，下一 tick 再入 link。
+                // 绝不能落到下面的 drop 分支同 tick 再丢一次。
+                return false;
+            }
             if (res === ERR_NOT_IN_RANGE) {
                 this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } });
                 return false;
@@ -5368,7 +5542,12 @@ class CreepExtension extends Creep {
                 return false;
             }
             this.say('📦放link位');
-            if (this.drop(RESOURCE_ENERGY) === OK) {
+            const dropRes = this.drop(RESOURCE_ENERGY);
+            if (dropRes === ACTION_BLOCKED) {
+                // 本 tick 已经有动作了，货还没丢下，别结束这趟外运
+                return false;
+            }
+            if (dropRes === OK) {
                 return this.afterRemoteDelivery();
             }
         }
@@ -5579,7 +5758,7 @@ class CreepExtension extends Creep {
      * 单 CLAIM 只能维持现有剩余，所以必须常驻，不能收一次就换房。
      */
     claim(homeRoom) {
-        var _a;
+        var _a, _b;
         const target = this.memory.claimerTarget;
         if (!target) {
             // 没有绑定目标（旧代码孵化/外部删掉了目标）：回主房等补员逻辑重新分配
@@ -5588,7 +5767,14 @@ class CreepExtension extends Creep {
             }
             return false;
         }
-        const claimEntry = (_a = Memory.claimPlan) === null || _a === void 0 ? void 0 : _a[target];
+        // 目标房这一轮武装敌对还没结束：先撤回主房，保留绑定，清场后自动回去
+        if (isRemotePaused((_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[target])) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom);
+            }
+            return false;
+        }
+        const claimEntry = (_b = Memory.claimPlan) === null || _b === void 0 ? void 0 : _b[target];
         if (claimEntry) {
             if (claimEntry.retryAt !== undefined && claimEntry.retryAt > Game.time) {
                 // GCL 不足等暂时失败：保留绑定，回主房待命，到点再试
@@ -5667,6 +5853,10 @@ class CreepExtension extends Creep {
             return false;
         }
         const res = this.claimController(controller);
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已发过动作：保留占领计划，下一 tick 再试，别删计划
+            return false;
+        }
         if (res === OK) {
             this.say('🚩 占领');
             (_c = Memory.claimPlan) === null || _c === void 0 ? true : delete _c[roomName];
@@ -5723,6 +5913,10 @@ class CreepExtension extends Creep {
             return false;
         }
         const res = this.reserveController(controller);
+        if (res === ACTION_BLOCKED) {
+            // 本 tick 已发过动作：下一 tick 继续保留，别写错情报
+            return false;
+        }
         if (res === OK) {
             this.say('🛡️ 保留');
             const me = (_a = this.owner) === null || _a === void 0 ? void 0 : _a.username;
@@ -5832,6 +6026,71 @@ class CreepExtension extends Creep {
             }
         }
         return best;
+    }
+    /**
+     * 反击队行为：只清 attackerTarget 这一轮骚扰里的弱敌（无 HEAL 的小股武装）。
+     * - 主房遭强敌：先回家防守，不出去送
+     * - 目标房清空 / episode 结束 / 情报升级成 assault/siege：撤回主房
+     * - 只打有 ATTACK/RANGED_ATTACK/CLAIM 部件的敌人，先打最近的
+     */
+    counterAttack() {
+        var _a, _b, _c;
+        const homeRoom = this.memory.spawnRoom;
+        const target = this.memory.attackerTarget;
+        const home = Game.rooms[homeRoom];
+        if (home) {
+            const homeLevel = classifyThreat(home.find(FIND_HOSTILE_CREEPS)).level;
+            if (homeLevel === 'assault' || homeLevel === 'siege') {
+                if (this.room.name !== homeRoom) {
+                    this.moveToRoom(homeRoom);
+                }
+                return;
+            }
+        }
+        // 目标丢了、外矿总开关关了或这一轮骚扰已经结束：回家等 TTL/回收
+        if (!target || ((_b = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom]) === null || _b === void 0 ? void 0 : _b.enabled) === false
+            || !isRemotePaused((_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[target])) {
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom);
+            }
+            return;
+        }
+        if (this.room.name !== target) {
+            // moveToRoom 只支持相邻房：先回主房，再从主房出门
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom);
+            }
+            else {
+                this.moveToRoom(target);
+            }
+            return;
+        }
+        // 到站刷新情报：维持 hostileLastSeen，敌人增援升级时立刻能看出来
+        recordRoomIntel(homeRoom, this.room);
+        const hostiles = this.room.find(FIND_HOSTILE_CREEPS);
+        const threat = classifyThreat(hostiles);
+        if (threat.level === 'assault' || threat.level === 'siege') {
+            // 情报过期，敌人已经不是弱敌：撤退，把房留给下一阶段
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        const armed = hostiles.filter(creep => creep.getActiveBodyparts(ATTACK) > 0
+            || creep.getActiveBodyparts(RANGED_ATTACK) > 0
+            || creep.getActiveBodyparts(CLAIM) > 0);
+        if (!armed.length) {
+            // 清场完毕：回家等 episode 自然结束
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        // 有 HEAL 的敌人已经被 classifyThreat 判成 assault 撤了，这里只剩无奶弱敌：打最近的
+        armed.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b));
+        const goal = armed[0];
+        if (this.pos.isNearTo(goal)) {
+            this.attack(goal);
+        }
+        else {
+            this.moveTo(goal, { reusePath: 5 });
+        }
     }
     /**
      * 外矿 carrier 没任务时的兜底：不在主房就先回去，在主房就把能量交给接收点。
@@ -6103,14 +6362,14 @@ const getClaimerBody = function (room) {
     return calcBodyPart({ [CLAIM]: num, [MOVE]: num });
 };
 const getAttackerBody = function (room) {
-    let body;
-    let num = Math.floor((room.energyCapacityAvailable * spawnPercent) / 200);
-    if (num > 10)
-        num = 10;
+    // 反击队：ATTACK + MOVE 1:1，无疲劳、跑得快。
+    // 每对 130 能量、30 DPS，上限 5 对（650 能量，150 DPS），够清 1-2 只弱敌。
+    let num = Math.floor(room.energyCapacityAvailable / 130);
+    if (num > 5)
+        num = 5;
     if (num <= 0)
         num = 1;
-    body = calcBodyPart({ [TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num });
-    return body;
+    return calcBodyPart({ [MOVE]: num, [ATTACK]: num });
 };
 /**
  * 兜底体型：按当前可用能量算一个刚好买得起的身体。
@@ -6162,8 +6421,10 @@ function getBodyForEnergy(role, room, energy) {
             return CalBodyCost(body) <= budget ? body : undefined;
         }
         case 'attacker': {
-            const num = Math.floor(budget / 200);
-            return num > 0 ? calcBodyPart({ [TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num }) : undefined;
+            let num = Math.floor(budget / 130);
+            if (num > 5)
+                num = 5;
+            return num > 0 ? calcBodyPart({ [MOVE]: num, [ATTACK]: num }) : undefined;
         }
         default:
             return undefined;
@@ -7126,6 +7387,9 @@ var mountCreep = () => {
     // assignPrototype 之后再覆盖，避免被 CreepExtension 上的同名方法盖掉
     Creep.prototype.moveTo = moveToInRoom;
     Creep.prototype.move = moveWithBodyCheck;
+    // 动作守卫：同 tick 同名/优先级冲突的第二个动作直接跳过，保护已经发出的 intent。
+    // 必须放在 assignPrototype 之后，且只装一次。
+    installActionGuard();
 };
 
 const plan1 = [
@@ -8059,7 +8323,7 @@ class RoomExtension extends Room {
      * 每只 claimer 孵化时绑定目标房（taskParam[4]），避免一只在多房之间来回跑。
      */
     refreshClaimSpawn(plan) {
-        var _a;
+        var _a, _b;
         if (plan.enabled === false) {
             return;
         }
@@ -8075,6 +8339,10 @@ class RoomExtension extends Room {
             for (const roomName in Memory.claimPlan) {
                 const entry = Memory.claimPlan[roomName];
                 if (!entry || (entry.retryAt !== undefined && entry.retryAt > Game.time)) {
+                    continue;
+                }
+                // 目标房还在敌对/骚扰期：先不派人去送，等 episode 结束
+                if (isRemotePaused((_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName])) {
                     continue;
                 }
                 if (!this.hasClaimerFor(roomName)) {
@@ -8094,8 +8362,12 @@ class RoomExtension extends Room {
             if (!state || state.enabled === false) {
                 continue;
             }
-            const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName];
+            const intel = (_b = Memory.mapIntel) === null || _b === void 0 ? void 0 : _b[roomName];
             if ((intel === null || intel === void 0 ? void 0 : intel.unsafe) || (intel === null || intel === void 0 ? void 0 : intel.unreachable)) {
+                continue;
+            }
+            // 这一轮武装敌对还没结束：claimer 先不补，避免刚孵出来就被打
+            if (isRemotePaused(intel)) {
                 continue;
             }
             // highway / 探明无 source：没有 controller 可保留，别孵 claimer 去边界打转
@@ -8150,6 +8422,8 @@ class RoomExtension extends Room {
         }
         const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[this.name];
         if (!plan || plan.enabled === false) {
+            // 外矿总开关关掉：排队的反击队也取消，别在停用后还孵化出去
+            this.cancelStaleCounterSpawnTasks(new Set());
             return;
         }
         // 回运任务并发跟着 container 现存能量走，先更新再按最新容量补车
@@ -8157,6 +8431,8 @@ class RoomExtension extends Room {
         // 外矿角色都不进 initSpawn 配额：按"每个矿点一只"在这里补员。
         this.refreshRemoteHarvesterSpawn(plan);
         this.refreshRemoteCarrierSpawn(plan);
+        // 弱敌反击队：按情报派 ATTACK+MOVE，只打没有 HEAL 的小股武装
+        this.refreshCounterSpawn(plan);
     }
     /**
      * 外矿回运任务的动态并发：capacity = ceil(container 能量 / 房间最大 carry 容量)，
@@ -9042,6 +9318,138 @@ class RoomExtension extends Room {
         this.cancelStaleRemoteSpawnTasks('remoteCarrier', validSources);
     }
     /**
+     * 弱敌反击队：情报显示某相邻房这一轮武装敌对是 raid 级（无 HEAL、数量/总 DPS 在阈值内），
+     * 就按 DPS 派 1-2 只 ATTACK+MOVE 去清场。
+     * - 只有弱敌才派；情报过期后敌人升级成 assault/siege 时，attacker 到场会自己撤回来
+     * - 别的玩家 owner/reserve 的房不打，只清 NPC（Invader/Source Keeper）和野生敌对
+     * - 每轮骚扰最多派 counterMaxAttempts 队；一队全灭后等 counterReinforceTicks 再整队补派
+     */
+    refreshCounterSpawn(plan) {
+        var _a, _b, _c, _d;
+        const now = Game.time;
+        const desiredRooms = new Map();
+        for (const roomName in plan.rooms) {
+            const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName];
+            if (!intel || !isRemotePaused(intel) || intel.threatLevel !== 'raid') {
+                continue;
+            }
+            // 有主 / 被真实玩家 reserve：不主动开战
+            if (intel.owner || (intel.reservation && !isNpcUser(intel.reservation))) {
+                continue;
+            }
+            const dps = (_b = intel.hostileDps) !== null && _b !== void 0 ? _b : 0;
+            const need = Math.min(warSetting.counterMaxPerRoom, Math.max(1, Math.ceil(dps / warSetting.counterDpsEach)));
+            desiredRooms.set(roomName, need);
+        }
+        // 这一轮已经清了/房间不在计划里的，排队中的反击队取消
+        this.cancelStaleCounterSpawnTasks(new Set(desiredRooms.keys()));
+        if (!desiredRooms.size) {
+            return;
+        }
+        // 全房间总上限：活着的 + 排队的一起算，避免多房同时开战把经济掏空
+        let budget = warSetting.counterMaxTotal - this.countCounterTotal();
+        for (const [roomName, need] of desiredRooms) {
+            if (budget <= 0) {
+                break;
+            }
+            const intel = (_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[roomName];
+            if (!intel) {
+                continue;
+            }
+            const attempts = (_d = intel.counterAttempts) !== null && _d !== void 0 ? _d : 0;
+            if (attempts >= warSetting.counterMaxAttempts) {
+                continue;
+            }
+            const have = this.countCounterFor(roomName);
+            if (have >= need) {
+                continue;
+            }
+            // 整队打光后的补派冷却：上一队还有活人（have>0）就直接补人
+            if (have === 0 && intel.counterAt !== undefined
+                && now - intel.counterAt < warSetting.counterReinforceTicks) {
+                continue;
+            }
+            for (let i = have; i < need && budget > 0; i++) {
+                this.addToSpawnList('attacker', undefined, roomName);
+                budget -= 1;
+            }
+            intel.counterAt = now;
+            intel.counterAttempts = attempts + 1;
+        }
+    }
+    /**
+     * 某个房已经派出的反击队人数（活着 + 排队/孵化中）。
+     */
+    countCounterFor(roomName) {
+        var _a, _b, _c;
+        let count = 0;
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name];
+            if (creep.memory.spawnRoom === this.name
+                && creep.memory.role === 'attacker'
+                && creep.memory.attackerTarget === roomName) {
+                count++;
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
+        for (const key in spawnBuckets) {
+            for (const task of (_a = spawnBuckets[key]) !== null && _a !== void 0 ? _a : []) {
+                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === 'attacker' && ((_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[4]) === roomName) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+    /**
+     * 本房全部反击队人数（活着 + 排队/孵化中），用于全房间总数上限。
+     */
+    countCounterTotal() {
+        var _a, _b;
+        let count = 0;
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name];
+            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'attacker') {
+                count++;
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
+        for (const key in spawnBuckets) {
+            for (const task of (_a = spawnBuckets[key]) !== null && _a !== void 0 ? _a : []) {
+                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === 'attacker') {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+    /**
+     * 清掉目标房已经不需要反击的排队任务（清场/强敌/停用/换目标）。
+     */
+    cancelStaleCounterSpawnTasks(validTargets) {
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key];
+            if (!queue || !queue.length) {
+                continue;
+            }
+            const next = queue.filter(task => {
+                var _a, _b;
+                if (((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) !== 'attacker') {
+                    return true;
+                }
+                const target = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[4];
+                return !!target && validTargets.has(target);
+            });
+            if (next.length) {
+                spawnBuckets[key] = next;
+            }
+            else {
+                delete spawnBuckets[key];
+            }
+        }
+    }
+    /**
      * 该矿点绑定的健康 remoteCarrier 数量（不含排队/孵化中的）。
      */
     remoteSourceCarrierCount(sourceId, threshold) {
@@ -9736,6 +10144,8 @@ class RoomExtension extends Room {
             'viewer': 0,
             // claimer 同理：refreshClaimSpawn 按 reserve 到期/claimPlan 按需补
             'claimer': 0,
+            // 反击队同理：refreshCounterSpawn 按弱敌情报按需补，死亡后不自动重孵
+            'attacker': 0,
             // sleep 是矿采空后的临时状态，从不孵化
             'sleep': 0,
         };
@@ -9755,6 +10165,8 @@ class RoomExtension extends Room {
                 const savedWorkType = outsideHome ? creep.memory.currentWorkType : undefined;
                 // claimer 绑定的目标房也要保住，否则每次推代码都会解绑回主房重孵
                 const savedClaimerTarget = creep.memory.claimerTarget;
+                // 反击队的目标房同理：丢了会回家摆烂，这一轮弱敌就没人清了
+                const savedAttackerTarget = creep.memory.attackerTarget;
                 // 外矿召回标记也要保住：否则推代码后召回过的 harvester 会重新领任务
                 // 跑回停用房；保住后它继续在主房待命到死
                 const savedRecall = creep.memory.recall;
@@ -9771,6 +10183,9 @@ class RoomExtension extends Room {
                 }
                 if (savedClaimerTarget) {
                     creep.memory.claimerTarget = savedClaimerTarget;
+                }
+                if (savedAttackerTarget) {
+                    creep.memory.attackerTarget = savedAttackerTarget;
                 }
                 if (savedRecall) {
                     creep.memory.recall = true;
@@ -9842,7 +10257,7 @@ class RoomExtension extends Room {
             // 停用房也会继续补人
             taskParam: [role, getBody(role, this), sourceId,
                 role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
-                    && role !== 'claimer',
+                    && role !== 'claimer' && role !== 'attacker',
                 targetRoom],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
@@ -9857,7 +10272,9 @@ class RoomExtension extends Room {
                         : role == 'remoteHarvester' ? 3
                             : role == 'remoteCarrier' ? 3
                                 : role == 'claimer' ? 3
-                                    : 2,
+                                    // 反击队和经济补员同档：650 能量，不压 harvester/carrier
+                                    : role == 'attacker' ? 2
+                                        : 2,
             capacity: 1,
             persistent: false,
             reservedBy: []
@@ -11732,7 +12149,7 @@ class SpawnExtension extends Spawn {
      * 如果孵化出现问题,refresh carrierList,并将
      */
     work() {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
         // log.debug("spawn working")
         if (this.spawning) {
             // 孵化可视化：显示真实名字（名字规则就是 role + 孵化时刻的 Game.time）
@@ -11835,6 +12252,10 @@ class SpawnExtension extends Spawn {
                             // claimer 孵化时绑定目标房，之后只负责这一个房
                             claimerTarget: role === 'claimer'
                                 ? (_g = task === null || task === void 0 ? void 0 : task.taskParam) === null || _g === void 0 ? void 0 : _g[4]
+                                : undefined,
+                            // 反击队孵化时绑定外矿房，这一轮骚扰结束前只去这个房
+                            attackerTarget: role === 'attacker'
+                                ? (_h = task === null || task === void 0 ? void 0 : task.taskParam) === null || _h === void 0 ? void 0 : _h[4]
                                 : undefined
                         },
                         energyStructures: picked.structures
@@ -11844,10 +12265,10 @@ class SpawnExtension extends Spawn {
                         // claimer 出生有 1 tick 延迟：本 tick 任务已出队、creep 还没进
                         // Game.creeps，记下目标房，让补员扫描别在这个窗口重复排队
                         const claimerTarget = role === 'claimer'
-                            ? (_h = task === null || task === void 0 ? void 0 : task.taskParam) === null || _h === void 0 ? void 0 : _h[4]
+                            ? (_j = task === null || task === void 0 ? void 0 : task.taskParam) === null || _j === void 0 ? void 0 : _j[4]
                             : undefined;
                         if (claimerTarget) {
-                            const spawnTicks = (_j = this.room.memory.claimerSpawnTick) !== null && _j !== void 0 ? _j : (this.room.memory.claimerSpawnTick = {});
+                            const spawnTicks = (_k = this.room.memory.claimerSpawnTick) !== null && _k !== void 0 ? _k : (this.room.memory.claimerSpawnTick = {});
                             spawnTicks[claimerTarget] = Game.time;
                         }
                         spawnQueue.shift();

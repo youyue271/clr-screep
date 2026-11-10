@@ -1,11 +1,11 @@
 import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, initializeArray} from "@/util/utils";
 import {mapping, plan1Buckets, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1, plan2CoreBuckets, plan2ClusterBuckets, EnergyBucketPlan} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, workerSetting} from "@/setting";
+import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, warSetting, workerSetting} from "@/setting";
 import {createBuildTask, getBucketCarryTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
-import {isRemotePaused} from "@/util/threat";
+import {isNpcUser, isRemotePaused} from "@/util/threat";
 
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
 // 会严重低估升级速度，实测 diff=1 把下一次检查排到了 3 万多 tick 之后，
@@ -834,6 +834,10 @@ export default class RoomExtension extends Room {
                 if (!entry || (entry.retryAt !== undefined && entry.retryAt > Game.time)) {
                     continue
                 }
+                // 目标房还在敌对/骚扰期：先不派人去送，等 episode 结束
+                if (isRemotePaused(Memory.mapIntel?.[roomName])) {
+                    continue
+                }
                 if (!this.hasClaimerFor(roomName)) {
                     this.addToSpawnList('claimer', undefined, roomName)
                 }
@@ -853,6 +857,10 @@ export default class RoomExtension extends Room {
             }
             const intel = Memory.mapIntel?.[roomName]
             if (intel?.unsafe || intel?.unreachable) {
+                continue
+            }
+            // 这一轮武装敌对还没结束：claimer 先不补，避免刚孵出来就被打
+            if (isRemotePaused(intel)) {
                 continue
             }
             // highway / 探明无 source：没有 controller 可保留，别孵 claimer 去边界打转
@@ -907,6 +915,8 @@ export default class RoomExtension extends Room {
         }
         const plan = Memory.remotePlan?.[this.name]
         if (!plan || plan.enabled === false) {
+            // 外矿总开关关掉：排队的反击队也取消，别在停用后还孵化出去
+            this.cancelStaleCounterSpawnTasks(new Set())
             return
         }
         // 回运任务并发跟着 container 现存能量走，先更新再按最新容量补车
@@ -914,6 +924,8 @@ export default class RoomExtension extends Room {
         // 外矿角色都不进 initSpawn 配额：按"每个矿点一只"在这里补员。
         this.refreshRemoteHarvesterSpawn(plan)
         this.refreshRemoteCarrierSpawn(plan)
+        // 弱敌反击队：按情报派 ATTACK+MOVE，只打没有 HEAL 的小股武装
+        this.refreshCounterSpawn(plan)
     }
 
     /**
@@ -1802,6 +1814,140 @@ export default class RoomExtension extends Room {
     }
 
     /**
+     * 弱敌反击队：情报显示某相邻房这一轮武装敌对是 raid 级（无 HEAL、数量/总 DPS 在阈值内），
+     * 就按 DPS 派 1-2 只 ATTACK+MOVE 去清场。
+     * - 只有弱敌才派；情报过期后敌人升级成 assault/siege 时，attacker 到场会自己撤回来
+     * - 别的玩家 owner/reserve 的房不打，只清 NPC（Invader/Source Keeper）和野生敌对
+     * - 每轮骚扰最多派 counterMaxAttempts 队；一队全灭后等 counterReinforceTicks 再整队补派
+     */
+    private refreshCounterSpawn(plan: RemotePlan): void {
+        const now = Game.time
+        const desiredRooms = new Map<string, number>()
+        for (const roomName in plan.rooms) {
+            const intel = Memory.mapIntel?.[roomName]
+            if (!intel || !isRemotePaused(intel) || intel.threatLevel !== 'raid') {
+                continue
+            }
+            // 有主 / 被真实玩家 reserve：不主动开战
+            if (intel.owner || (intel.reservation && !isNpcUser(intel.reservation))) {
+                continue
+            }
+            const dps = intel.hostileDps ?? 0
+            const need = Math.min(
+                warSetting.counterMaxPerRoom,
+                Math.max(1, Math.ceil(dps / warSetting.counterDpsEach))
+            )
+            desiredRooms.set(roomName, need)
+        }
+        // 这一轮已经清了/房间不在计划里的，排队中的反击队取消
+        this.cancelStaleCounterSpawnTasks(new Set(desiredRooms.keys()))
+        if (!desiredRooms.size) {
+            return
+        }
+        // 全房间总上限：活着的 + 排队的一起算，避免多房同时开战把经济掏空
+        let budget = warSetting.counterMaxTotal - this.countCounterTotal()
+        for (const [roomName, need] of desiredRooms) {
+            if (budget <= 0) {
+                break
+            }
+            const intel = Memory.mapIntel?.[roomName]
+            if (!intel) {
+                continue
+            }
+            const attempts = intel.counterAttempts ?? 0
+            if (attempts >= warSetting.counterMaxAttempts) {
+                continue
+            }
+            const have = this.countCounterFor(roomName)
+            if (have >= need) {
+                continue
+            }
+            // 整队打光后的补派冷却：上一队还有活人（have>0）就直接补人
+            if (have === 0 && intel.counterAt !== undefined
+                && now - intel.counterAt < warSetting.counterReinforceTicks) {
+                continue
+            }
+            for (let i = have; i < need && budget > 0; i++) {
+                this.addToSpawnList('attacker', undefined, roomName)
+                budget -= 1
+            }
+            intel.counterAt = now
+            intel.counterAttempts = attempts + 1
+        }
+    }
+
+    /**
+     * 某个房已经派出的反击队人数（活着 + 排队/孵化中）。
+     */
+    private countCounterFor(roomName: string): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name
+                && creep.memory.role === 'attacker'
+                && creep.memory.attackerTarget === roomName) {
+                count++
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === 'attacker' && task?.taskParam?.[4] === roomName) {
+                    count++
+                }
+            }
+        }
+        return count
+    }
+
+    /**
+     * 本房全部反击队人数（活着 + 排队/孵化中），用于全房间总数上限。
+     */
+    private countCounterTotal(): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'attacker') {
+                count++
+            }
+        }
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === 'attacker') {
+                    count++
+                }
+            }
+        }
+        return count
+    }
+
+    /**
+     * 清掉目标房已经不需要反击的排队任务（清场/强敌/停用/换目标）。
+     */
+    private cancelStaleCounterSpawnTasks(validTargets: Set<string>): void {
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key]
+            if (!queue || !queue.length) {
+                continue
+            }
+            const next = queue.filter(task => {
+                if (task?.taskParam?.[0] !== 'attacker') {
+                    return true
+                }
+                const target = task?.taskParam?.[4] as string | undefined
+                return !!target && validTargets.has(target)
+            })
+            if (next.length) {
+                spawnBuckets[key] = next
+            } else {
+                delete spawnBuckets[key]
+            }
+        }
+    }
+
+    /**
      * 该矿点绑定的健康 remoteCarrier 数量（不含排队/孵化中的）。
      */
     private remoteSourceCarrierCount(sourceId: string, threshold: number): number {
@@ -2500,6 +2646,8 @@ export default class RoomExtension extends Room {
             'viewer': 0,
             // claimer 同理：refreshClaimSpawn 按 reserve 到期/claimPlan 按需补
             'claimer': 0,
+            // 反击队同理：refreshCounterSpawn 按弱敌情报按需补，死亡后不自动重孵
+            'attacker': 0,
             // sleep 是矿采空后的临时状态，从不孵化
             'sleep': 0,
         }
@@ -2520,6 +2668,8 @@ export default class RoomExtension extends Room {
                 const savedWorkType = outsideHome ? creep.memory.currentWorkType : undefined
                 // claimer 绑定的目标房也要保住，否则每次推代码都会解绑回主房重孵
                 const savedClaimerTarget = creep.memory.claimerTarget
+                // 反击队的目标房同理：丢了会回家摆烂，这一轮弱敌就没人清了
+                const savedAttackerTarget = creep.memory.attackerTarget
                 // 外矿召回标记也要保住：否则推代码后召回过的 harvester 会重新领任务
                 // 跑回停用房；保住后它继续在主房待命到死
                 const savedRecall = creep.memory.recall
@@ -2536,6 +2686,9 @@ export default class RoomExtension extends Room {
                 }
                 if (savedClaimerTarget) {
                     creep.memory.claimerTarget = savedClaimerTarget
+                }
+                if (savedAttackerTarget) {
+                    creep.memory.attackerTarget = savedAttackerTarget
                 }
                 if (savedRecall) {
                     creep.memory.recall = true
@@ -2608,7 +2761,7 @@ export default class RoomExtension extends Room {
             // 停用房也会继续补人
             taskParam: [role, getBody(role, this), sourceId,
                 role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
-                && role !== 'claimer',
+                && role !== 'claimer' && role !== 'attacker',
                 targetRoom],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
@@ -2623,6 +2776,8 @@ export default class RoomExtension extends Room {
                 : role == 'remoteHarvester' ? 3
                 : role == 'remoteCarrier' ? 3
                 : role == 'claimer' ? 3
+                // 反击队和经济补员同档：650 能量，不压 harvester/carrier
+                : role == 'attacker' ? 2
                 : 2,
             capacity: 1,
             persistent: false, 

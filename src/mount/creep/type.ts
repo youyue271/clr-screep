@@ -24,6 +24,8 @@ interface CreepMemory {
     // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
     // 每个目标房常驻一只，避免一只 claimer 在多房间之间来回跑
     claimerTarget?: string
+    // 反击队孵化时绑定的外矿房：这一轮骚扰结束前只去这个房清弱敌
+    attackerTarget?: string
     // 本 tick 已经发出的 transfer 量。transfer 要到回合末才结算，本 tick 读到的
     // store 还是旧值，只能自己记账推算目标结算后会不会满（Game.time 变了就重置）
     transferTick?: number
@@ -41,6 +43,8 @@ type Role = 'worker'
     | 'viewer'
     // 占领/保留控制器：CLAIM + MOVE，reserve 由它自动续，claim 只执行显式 claimPlan
     | 'claimer'
+    // 弱敌反击队：ATTACK + MOVE，只打外矿房里没有 HEAL 的小股武装
+    | 'attacker'
     // 矿采空后的睡眠态：每 tick 只说 zzz，矿重生时由 wakeCreep 事件唤醒回原职业
     | 'sleep'
 

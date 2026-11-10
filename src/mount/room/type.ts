@@ -64,6 +64,10 @@ interface MapIntel {
     // 侦察兵允许再次进入这个房的 tick：
     // 武装敌对中按 hostileRecheckTicks 复查，强敌停用房按 rescoutTicks 复探
     retryAt?: number
+    // 这一轮骚扰里最近一次派出反击队的 tick / 已经派过几队。
+    // 一队全灭后要等 counterReinforceTicks 才整队补派，最多 counterMaxAttempts 队
+    counterAt?: number
+    counterAttempts?: number
 }
 
 /**

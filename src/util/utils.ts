@@ -191,12 +191,12 @@ export const getClaimerBody = function (room: Room) {
 }
 
 const getAttackerBody = function (room: Room) {
-    let body: any[]
-    let num = Math.floor((room.energyCapacityAvailable * spawnPercent) / 200);
-    if (num > 10) num = 10
+    // 反击队：ATTACK + MOVE 1:1，无疲劳、跑得快。
+    // 每对 130 能量、30 DPS，上限 5 对（650 能量，150 DPS），够清 1-2 只弱敌。
+    let num = Math.floor(room.energyCapacityAvailable / 130)
+    if (num > 5) num = 5
     if (num <= 0) num = 1
-    body = calcBodyPart({[TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num})
-    return body
+    return calcBodyPart({[MOVE]: num, [ATTACK]: num})
 }
 
 /**
@@ -247,8 +247,9 @@ export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: nu
             return CalBodyCost(body) <= budget ? body : undefined
         }
         case 'attacker': {
-            const num = Math.floor(budget / 200)
-            return num > 0 ? calcBodyPart({[TOUGH]: num * 2, [MOVE]: num * 2, [ATTACK]: num}) : undefined
+            let num = Math.floor(budget / 130)
+            if (num > 5) num = 5
+            return num > 0 ? calcBodyPart({[MOVE]: num, [ATTACK]: num}) : undefined
         }
         default:
             return undefined

@@ -134,6 +134,10 @@ export default class SpawnExtension extends Spawn {
                             // claimer 孵化时绑定目标房，之后只负责这一个房
                             claimerTarget: role === 'claimer'
                                 ? task?.taskParam?.[4] as string | undefined
+                                : undefined,
+                            // 反击队孵化时绑定外矿房，这一轮骚扰结束前只去这个房
+                            attackerTarget: role === 'attacker'
+                                ? task?.taskParam?.[4] as string | undefined
                                 : undefined
                         },
                         energyStructures: picked.structures
