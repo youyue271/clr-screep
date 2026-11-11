@@ -9326,7 +9326,7 @@ class RoomExtension extends Room {
      * - 每轮骚扰最多派 counterMaxAttempts 队；一队全灭后等 counterReinforceTicks 再整队补派
      */
     refreshCounterSpawn(plan) {
-        var _a, _b, _c, _d;
+        var _a, _b, _c, _d, _e, _f;
         const now = Game.time;
         const desiredRooms = new Map();
         for (const roomName in plan.rooms) {
@@ -9334,11 +9334,14 @@ class RoomExtension extends Room {
             if (!intel || !isRemotePaused(intel) || intel.threatLevel !== 'raid') {
                 continue;
             }
-            // 有主 / 被真实玩家 reserve：不主动开战
-            if (intel.owner || (intel.reservation && !isNpcUser(intel.reservation))) {
+            // 有主 / 被别的真实玩家 reserve：不主动开战。
+            // 自己 claimer 保留的房要照打：否则所有自留外矿都进不了反击名单。
+            const me = (_c = (_b = this.controller) === null || _b === void 0 ? void 0 : _b.owner) === null || _c === void 0 ? void 0 : _c.username;
+            if (intel.owner
+                || (intel.reservation && !isNpcUser(intel.reservation) && intel.reservation !== me)) {
                 continue;
             }
-            const dps = (_b = intel.hostileDps) !== null && _b !== void 0 ? _b : 0;
+            const dps = (_d = intel.hostileDps) !== null && _d !== void 0 ? _d : 0;
             const need = Math.min(warSetting.counterMaxPerRoom, Math.max(1, Math.ceil(dps / warSetting.counterDpsEach)));
             desiredRooms.set(roomName, need);
         }
@@ -9353,11 +9356,11 @@ class RoomExtension extends Room {
             if (budget <= 0) {
                 break;
             }
-            const intel = (_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[roomName];
+            const intel = (_e = Memory.mapIntel) === null || _e === void 0 ? void 0 : _e[roomName];
             if (!intel) {
                 continue;
             }
-            const attempts = (_d = intel.counterAttempts) !== null && _d !== void 0 ? _d : 0;
+            const attempts = (_f = intel.counterAttempts) !== null && _f !== void 0 ? _f : 0;
             if (attempts >= warSetting.counterMaxAttempts) {
                 continue;
             }
@@ -10551,25 +10554,31 @@ class RoomExtension extends Room {
                         }
                     }
                 }
-                if (room && memory.spawnRoom && memory.reSpawn) {
+                if (room && memory.spawnRoom) {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole;
                     }
                     if (memory.role === 'harvester') {
-                        // harvester 正常由换班事件提前替补；意外死亡时在这里兜底补员
+                        // harvester 正常由换班事件提前替补；意外死亡时在这里兜底补员。
+                        // 不看 reSpawn：换班窗口内有 3~4 只矿工时推代码，替补会被全局配额
+                        // 标成 reSpawn=false，只按它自己的死亡事件走就永远不补人，
+                        // 那个矿点会一直空到下次推代码。ensureHarvesterForSource 会按
+                        // 实际覆盖决定补不补，已有人时自己取消多余任务，不会多孵。
                         const sourceId = ((_a = memory.harvestSourceId) !== null && _a !== void 0 ? _a : (_c = (_b = memory.currentWork) === null || _b === void 0 ? void 0 : _b.taskParam) === null || _c === void 0 ? void 0 : _c[0]);
                         if (sourceId) {
                             room.ensureHarvesterForSource(sourceId);
                         }
                     }
-                    else if (memory.role === 'worker') {
-                        // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命
-                        if (room.countRoleWithSpawnQueue('worker') < room.desiredWorkerCount()) {
-                            room.addToSpawnList('worker');
+                    else if (memory.reSpawn) {
+                        if (memory.role === 'worker') {
+                            // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命
+                            if (room.countRoleWithSpawnQueue('worker') < room.desiredWorkerCount()) {
+                                room.addToSpawnList('worker');
+                            }
                         }
-                    }
-                    else {
-                        room.addToSpawnList(memory.role);
+                        else {
+                            room.addToSpawnList(memory.role);
+                        }
                     }
                 }
                 delete Memory.creeps[creepName];

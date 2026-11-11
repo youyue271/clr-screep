@@ -1828,8 +1828,11 @@ export default class RoomExtension extends Room {
             if (!intel || !isRemotePaused(intel) || intel.threatLevel !== 'raid') {
                 continue
             }
-            // 有主 / 被真实玩家 reserve：不主动开战
-            if (intel.owner || (intel.reservation && !isNpcUser(intel.reservation))) {
+            // 有主 / 被别的真实玩家 reserve：不主动开战。
+            // 自己 claimer 保留的房要照打：否则所有自留外矿都进不了反击名单。
+            const me = this.controller?.owner?.username
+            if (intel.owner
+                || (intel.reservation && !isNpcUser(intel.reservation) && intel.reservation !== me)) {
                 continue
             }
             const dps = intel.hostileDps ?? 0
@@ -3061,24 +3064,30 @@ export default class RoomExtension extends Room {
                         }
                     }
                 }
-                if (room && memory.spawnRoom && memory.reSpawn) {
+                if (room && memory.spawnRoom) {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole
                     }
                     if (memory.role === 'harvester') {
-                        // harvester 正常由换班事件提前替补；意外死亡时在这里兜底补员
+                        // harvester 正常由换班事件提前替补；意外死亡时在这里兜底补员。
+                        // 不看 reSpawn：换班窗口内有 3~4 只矿工时推代码，替补会被全局配额
+                        // 标成 reSpawn=false，只按它自己的死亡事件走就永远不补人，
+                        // 那个矿点会一直空到下次推代码。ensureHarvesterForSource 会按
+                        // 实际覆盖决定补不补，已有人时自己取消多余任务，不会多孵。
                         const sourceId = (memory.harvestSourceId
                             ?? memory.currentWork?.taskParam?.[0]) as string | undefined
                         if (sourceId) {
                             room.ensureHarvesterForSource(sourceId as Id<Source>)
                         }
-                    } else if (memory.role === 'worker') {
-                        // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命
-                        if (room.countRoleWithSpawnQueue('worker') < room.desiredWorkerCount()) {
-                            room.addToSpawnList('worker')
+                    } else if (memory.reSpawn) {
+                        if (memory.role === 'worker') {
+                            // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命
+                            if (room.countRoleWithSpawnQueue('worker') < room.desiredWorkerCount()) {
+                                room.addToSpawnList('worker')
+                            }
+                        } else {
+                            room.addToSpawnList(memory.role)
                         }
-                    } else {
-                        room.addToSpawnList(memory.role)
                     }
                 }
                 delete Memory.creeps[creepName]
