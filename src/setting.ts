@@ -42,6 +42,9 @@ export const spawnTable: { [role in Role]: number[] } = {
     'claimer':      [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 反击队不参与自动配额：refreshCounterSpawn 按弱敌情报按需补员，reSpawn=false
     'attacker':     [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // 中央 carrier 不按这张表孵化：由 ensureCenterCarrier 在 link 解锁且
+    // 中央 link + 至少一条转发 link + storage 都到位后补一只常驻
+    'centerCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // sleep 是矿采空后的临时状态，从不孵化
     'sleep':        [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
@@ -191,6 +194,9 @@ export const remoteSetting = {
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
     maxRooms: 4,
+    // 回主房投递时外矿 link 已满：先在 link 旁边等中央 carrier 腾中央 link，
+    // 连续等这么多 tick 才退回 drop 暂存（正常链路下几 tick 就腾出来了）
+    linkFullWaitTicks: 30,
 }
 
 // 战争模块（Phase 2：威胁分级 + 外矿撤离/复探）。

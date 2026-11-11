@@ -91,8 +91,19 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
         case 'remoteCarrier':
             // 外矿运输和本地 carrier 一样是纯搬货，body 直接复用
             return getCarrierBody(room)
+        case 'centerCarrier':
+            // 定点短途：固定 8 CARRY + 2 MOVE，一次搬 400，不随房间容量放大
+            return getCenterCarrierBody()
 
     }
+}
+
+/**
+ * 中央 carrier 体型：站在 link/storage/terminal 中间不动，只在中转之间来回搬。
+ * 8 CARRY = 400 一次搬半条 link，2 MOVE 保证调位（terminal 不在贴身格时）不拖慢。
+ */
+const getCenterCarrierBody = function (): BodyPartConstant[] {
+    return calcBodyPart({[CARRY]: 8, [MOVE]: 2})
 }
 
 
@@ -225,6 +236,16 @@ export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: nu
                 return undefined
             }
             return calcBodyPart({[CARRY]: Math.min(num, 25), [MOVE]: Math.min(num, 25)})
+        }
+        case 'centerCarrier': {
+            // 兜底体型：正常 500 的固定体型买不起时缩到 4 CARRY，仍能搬货
+            if (budget >= 500) {
+                return getCenterCarrierBody()
+            }
+            if (budget >= 300) {
+                return calcBodyPart({[CARRY]: 4, [MOVE]: 2})
+            }
+            return undefined
         }
         case 'worker':
         case 'remoteBuilder': {

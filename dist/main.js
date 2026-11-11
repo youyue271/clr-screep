@@ -3288,6 +3288,9 @@ const spawnTable = {
     'claimer': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // 反击队不参与自动配额：refreshCounterSpawn 按弱敌情报按需补员，reSpawn=false
     'attacker': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // 中央 carrier 不按这张表孵化：由 ensureCenterCarrier 在 link 解锁且
+    // 中央 link + 至少一条转发 link + storage 都到位后补一只常驻
+    'centerCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // sleep 是矿采空后的临时状态，从不孵化
     'sleep': [0, 0, 0, 0, 0, 0, 0, 0, 0],
 };
@@ -3422,6 +3425,9 @@ const remoteSetting = {
     repairThreshold: 0.9,
     // 每个主房自动选定的外矿房上限（相邻房最多四个）
     maxRooms: 4,
+    // 回主房投递时外矿 link 已满：先在 link 旁边等中央 carrier 腾中央 link，
+    // 连续等这么多 tick 才退回 drop 暂存（正常链路下几 tick 就腾出来了）
+    linkFullWaitTicks: 30,
 };
 // 战争模块（Phase 2：威胁分级 + 外矿撤离/复探）。
 // 数值只用于"要不要躲、要不要停外矿"的判断，不追求精确战斗模拟。
@@ -3673,35 +3679,34 @@ function getStorageEnergy(room) {
         }];
 }
 /**
- * 中央 link 的取能任务：外矿 link 转发过来的能量要及时搬走，
- * 否则 link 满了外矿 carrier 就投不进去，只能多走路回主房。
+ * 中央 carrier 的常驻搬运任务：中央 link -> storage。
+ * 任务形式是通用的 [from, to, resourceType]，work 函数 transferResource 只按参数搬运；
+ * 以后新增中转（terminal/lab 等）只需再登记一条同样形状的 transferTask。
  */
-function getCoreLinkEnergy(room) {
+function getCoreLinkTransferTask(room) {
     const link = room.getCoreLink();
-    if (!link) {
+    const storage = room.storage;
+    if (!link || !storage) {
         return [];
     }
-    const energy = link.store.getUsedCapacity(RESOURCE_ENERGY);
-    if (energy <= 0) {
-        return [];
-    }
-    const maxCarry = room.carrierCapacity();
     return [{
-            taskType: 'energyTask',
-            taskFunc: 'getEnergyFromStructure',
-            priority: 2,
-            taskParam: [link.id, RESOURCE_ENERGY],
-            // link 容量 800，按满体型载重拆成 1~2 个并发就够了
-            capacity: Math.max(1, Math.min(2, Math.ceil(energy / maxCarry))),
+            taskType: 'transferTask',
+            taskFunc: 'transferResource',
+            taskParam: [link.id, storage.id, RESOURCE_ENERGY],
+            // 中转链路优先级最高：中央 link 满了转发就会停，外矿车就投不进来了
+            priority: 1,
+            // 定点单岗，只给一只 centerCarrier
+            capacity: 1,
+            persistent: true,
             targetId: link.id,
         }];
 }
 function getEnergyTask(room) {
     const containTasks = getContainerEnergy(room);
-    const linkTasks = getCoreLinkEnergy(room);
+    // 中央 link 由 centerCarrier 的 transferTask 专职搬，本地 carrier 不再插手
     const opportunityTasks = getOpportunityEnergy(room);
     const storageTasks = getStorageEnergy(room);
-    return [...containTasks, ...linkTasks, ...opportunityTasks, ...storageTasks];
+    return [...containTasks, ...opportunityTasks, ...storageTasks];
 }
 // export function getEnergyWithStorage(room: Room): MyTask[] {
 //     let tasks = getContainerEnergy(room)
@@ -4362,6 +4367,8 @@ const roleToTask = {
     'attacker': [],
     // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
     'sleep': [],
+    // 中央 carrier 只领建筑间搬运任务，不参与本地补能/外矿
+    'centerCarrier': ['transferTask'],
 };
 class CreepExtension extends Creep {
     /**
@@ -4371,6 +4378,7 @@ class CreepExtension extends Creep {
      * 因为creep的res的OK表示纳入计划, 最后在回合结束时统一结算, 所以会出现,工作做完了,但是这个回合不需要继续的情况
      */
     work() {
+        var _a, _b;
         // console.log(this.name)
         if (this.spawning) {
             // console.log(this.ticksToLive)
@@ -4414,6 +4422,13 @@ class CreepExtension extends Creep {
             }
             if (!this.memory.working) {
                 if (!this.getWork()) {
+                    // 中央 carrier 没有任务时回阵型固定格待命，不随机走；
+                    // 顺便让房间自愈：link/storage 变化后重新挂上常驻搬运任务。
+                    if (this.memory.role === 'centerCarrier') {
+                        (_b = (_a = this.room).ensureCenterCarrier) === null || _b === void 0 ? void 0 : _b.call(_a);
+                        this.moveToCenterPost();
+                        return;
+                    }
                     // 本地没活：房间有 storage 就把富余能量搬进去（见 storeSurplusEnergy）。
                     // 必须放在随机走前面：随机走会覆盖这里发出的 moveTo 意图。
                     if (this.storeSurplusEnergy()) {
@@ -5067,6 +5082,89 @@ class CreepExtension extends Creep {
         return !this.refillCarryFromSource(resourceType);
     }
     /**
+     * 通用建筑间搬运：fromId -> toId，resourceType 完全来自 transferTask 参数。
+     * 一次调用只发一个动作，下一 tick 按结算后的 store 继续：
+     * - 身上有货：目标有空位就投递；目标满了原地等（persistent 任务不释放）
+     * - 身上没货：来源有货就取；来源空了回固定站位等
+     * - from/to 消失（建筑被拆/规划变了）才算任务结束，把任务移出队列
+     */
+    transferResource(fromId, toId, resourceType) {
+        const from = Game.getObjectById(fromId);
+        const to = Game.getObjectById(toId);
+        if (!from || !to) {
+            this.say('❓搬运目标没了');
+            this.removeCurrentWorkFromQueue();
+            this.releaseCurrentWork();
+            return true;
+        }
+        // CARRY 部件被打光：不可能再搬货，自毁补员（和 emptyWorker 的处理一致）
+        if (!this.store.getCapacity(resourceType)) {
+            this.suicideAndRespawn();
+            return true;
+        }
+        if (this.store.getUsedCapacity(resourceType) > 0) {
+            if (to.store.getFreeCapacity(resourceType) <= 0) {
+                // 目标满了：原地等（中央 link -> storage 时说明 storage 也满了），
+                // 不丢货、不释放任务，腾出空位后同一任务继续
+                this.say('⏳等目标空位');
+                this.moveToCenterPost();
+                return false;
+            }
+            this.say('🚚中转搬运');
+            const res = this.transfer(to, resourceType);
+            if (res === ERR_NOT_IN_RANGE) {
+                this.moveTo(to, { visualizePathStyle: { stroke: '#66ccff' } });
+                return false;
+            }
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经发过动作：任务保留，下一 tick 再投
+                return false;
+            }
+            if (res === OK || res === ERR_FULL || res === ERR_NOT_ENOUGH_RESOURCES) {
+                // OK：下一 tick 结算后继续投；FULL/不足是当 tick 读到的旧 store，下一 tick 再看
+                return false;
+            }
+            this.removeCurrentWorkFromQueue();
+            this.releaseCurrentWork();
+            return true;
+        }
+        if (from.store.getUsedCapacity(resourceType) <= 0) {
+            this.say('😴等货');
+            this.moveToCenterPost();
+            return false;
+        }
+        this.say('🫳中转取货');
+        const res = this.withdraw(from, resourceType);
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(from, { visualizePathStyle: { stroke: '#ffff00' } });
+            return false;
+        }
+        if (res === ACTION_BLOCKED) {
+            return false;
+        }
+        if (res === OK || res === ERR_NOT_ENOUGH_RESOURCES || res === ERR_FULL) {
+            return false;
+        }
+        this.removeCurrentWorkFromQueue();
+        this.releaseCurrentWork();
+        return true;
+    }
+    /**
+     * 回中央 carrier 的固定站位（布局里 link/storage/terminal 中间的路格）。
+     * 没有站位（非主房/布局缺失）时原地不动。
+     */
+    moveToCenterPost() {
+        var _a, _b;
+        const post = (_b = (_a = this.room).centerCarrierPos) === null || _b === void 0 ? void 0 : _b.call(_a);
+        if (!post) {
+            return;
+        }
+        if (this.pos.x === post[0] && this.pos.y === post[1]) {
+            return;
+        }
+        this.moveTo(new RoomPosition(post[0], post[1], this.room.name), { visualizePathStyle: { stroke: '#00ffff' } });
+    }
+    /**
      * 能量桶补能：走到桶节点，找桶内第一个没满的 extension 投递，
      * 桶内全部补满后自己把任务从队列里删掉。
      * 一个桶只占一个 carrier（capacity 1），桶内成员距离节点都是 1，
@@ -5450,7 +5548,7 @@ class CreepExtension extends Creep {
      * （任务参数结构不变），不再用于兜底投递。
      */
     remoteCarry(containerId, targetRoom, homeRoom, sinkId, linkId) {
-        var _a, _b;
+        var _a, _b, _c;
         const energy = this.store.getUsedCapacity(RESOURCE_ENERGY);
         // 外矿有武装敌对：不进屋取货。任务和预约保留，情报清场后自动恢复。
         if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
@@ -5512,24 +5610,47 @@ class CreepExtension extends Creep {
             this.finishRemoteTrip();
             return true;
         }
-        // 主房有外矿 link 就投进去；link 满了也走暂存位，不原地等
+        // 主房有外矿 link 就投进去；link 满了先在旁边等中央 carrier 腾出中央 link
         const link = linkId ? Game.getObjectById(linkId) : undefined;
-        if (link && link.energy < link.energyCapacity) {
-            this.say('🔗外矿入link');
-            const res = this.transfer(link, RESOURCE_ENERGY);
-            if (res === ACTION_BLOCKED) {
-                // 本 tick 已经投递过能量：保留任务，下一 tick 再入 link。
-                // 绝不能落到下面的 drop 分支同 tick 再丢一次。
-                return false;
+        if (link) {
+            if (link.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                delete this.memory.linkWaitTicks;
+                this.say('🔗外矿入link');
+                const res = this.transfer(link, RESOURCE_ENERGY);
+                if (res === ACTION_BLOCKED) {
+                    // 本 tick 已经投递过能量：保留任务，下一 tick 再入 link。
+                    // 绝不能落到下面的 drop 分支同 tick 再丢一次。
+                    return false;
+                }
+                if (res === ERR_NOT_IN_RANGE) {
+                    this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } });
+                    return false;
+                }
+                if (res === OK) {
+                    // transfer 是 intent，回合末才结算，本 tick 读 link.energy 还是旧值。
+                    // 挂 +1 tick 的转发事件，投递成功后事件驱动地发往中央 link。
+                    this.room.registEvent({
+                        triggerTime: Game.time + 1,
+                        triggerFunc: 'forwardLink',
+                        param: [link.id]
+                    });
+                    return this.afterRemoteDelivery();
+                }
             }
-            if (res === ERR_NOT_IN_RANGE) {
-                this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } });
-                return false;
-            }
-            if (res === OK) {
-                // link 收下了：冷却好了就转发中央 link，不用额外扫描
-                this.trySendLink(link);
-                return this.afterRemoteDelivery();
+            else {
+                // link 满了：说明中央 link 还没被中央 carrier 搬空，转发进不去。
+                // 先在 link 旁边等，不把货丢地上（下一趟还要捡回来）。
+                // 等太久说明中转链真的堵了，才退回 drop 暂存，避免外矿车无限干等。
+                const waited = ((_c = this.memory.linkWaitTicks) !== null && _c !== void 0 ? _c : 0) + 1;
+                this.memory.linkWaitTicks = waited;
+                if (waited <= remoteSetting.linkFullWaitTicks) {
+                    this.say('⏳等link空位');
+                    if (!this.pos.inRangeTo(link, 1)) {
+                        this.moveTo(link, { range: 1, visualizePathStyle: { stroke: '#66ccff' } });
+                    }
+                    return false;
+                }
+                delete this.memory.linkWaitTicks;
             }
         }
         // 没有可用 link：丢在外矿对应的 link 规划位旁边，等本地 carrier/emptyWorker 来收。
@@ -5618,20 +5739,7 @@ class CreepExtension extends Creep {
         // 转回本地 carrier 后不再绑定任何外矿矿点
         delete this.memory.remoteCarrySourceId;
         delete this.memory.remoteCarryRoom;
-    }
-    /**
-     * 把 link 里的能量转发中央 link（link→link 瞬发，有冷却和损耗）。
-     */
-    trySendLink(link) {
-        var _a, _b;
-        if (link.cooldown > 0 || !link.energy) {
-            return;
-        }
-        const core = (_b = (_a = this.room).getCoreLink) === null || _b === void 0 ? void 0 : _b.call(_a);
-        if (!core || core.id === link.id || core.energy >= core.energyCapacity) {
-            return;
-        }
-        link.transferEnergy(core);
+        delete this.memory.linkWaitTicks;
     }
     /**
      * 侦察兵常驻任务：从外矿计划里挑需要情报的房间，走过去写情报；
@@ -6268,8 +6376,18 @@ function getBody(role, room) {
         case 'remoteCarrier':
             // 外矿运输和本地 carrier 一样是纯搬货，body 直接复用
             return getCarrierBody(room);
+        case 'centerCarrier':
+            // 定点短途：固定 8 CARRY + 2 MOVE，一次搬 400，不随房间容量放大
+            return getCenterCarrierBody();
     }
 }
+/**
+ * 中央 carrier 体型：站在 link/storage/terminal 中间不动，只在中转之间来回搬。
+ * 8 CARRY = 400 一次搬半条 link，2 MOVE 保证调位（terminal 不在贴身格时）不拖慢。
+ */
+const getCenterCarrierBody = function () {
+    return calcBodyPart({ [CARRY]: 8, [MOVE]: 2 });
+};
 // 1 CARRY + 2n WORK + n MOVE = 3n + 1 个部件，受 50 部件上限约束：n 最大 16（49 部件）。
 // WORK 越多单位时间采得越快；矿采空后 harvester 会进 sleep 角色等矿重生，
 // 所以大体型只在矿满时爆发采集，不会有"多出来的 WORK 白烧"的问题。
@@ -6399,6 +6517,16 @@ function getBodyForEnergy(role, room, energy) {
                 return undefined;
             }
             return calcBodyPart({ [CARRY]: Math.min(num, 25), [MOVE]: Math.min(num, 25) });
+        }
+        case 'centerCarrier': {
+            // 兜底体型：正常 500 的固定体型买不起时缩到 4 CARRY，仍能搬货
+            if (budget >= 500) {
+                return getCenterCarrierBody();
+            }
+            if (budget >= 300) {
+                return calcBodyPart({ [CARRY]: 4, [MOVE]: 2 });
+            }
+            return undefined;
         }
         case 'worker':
         case 'remoteBuilder': {
@@ -7590,6 +7718,8 @@ class RoomExtension extends Room {
             'spawnTask': {},
             'remoteHarvestTask': {},
             'remoteCarryTask': {},
+            // 通用建筑间搬运（中央 carrier 用）：[fromId, toId, resourceType]
+            'transferTask': {},
             'scoutTask': {},
             'claimTask': {}
         };
@@ -7605,6 +7735,14 @@ class RoomExtension extends Room {
         this.rearmRemoteCarryTasks();
         // 回运任务重建后再补 link 规划：新任务能直接挂上已建好的外矿 link
         this.syncLinkPlan();
+        // 推代码兜底：正常转发由投递成功后的 forwardLink 事件驱动，
+        // 推代码清空事件队列后，把积压在 link 里的能量一次性补发。
+        // 之后不再周期性转发，避免 10 tick 扫描空转。
+        if (this.memory.linkPlan) {
+            this.forwardRemoteLinks(this.memory.linkPlan);
+        }
+        // link 已就绪但中央 carrier 死了/任务被重建：补常驻搬运任务和一只 carrier
+        this.ensureCenterCarrier();
         this.registEvent(checkRoomLevelEvent(Game.time + 1));
     }
     initBuildList() {
@@ -8692,6 +8830,10 @@ class RoomExtension extends Room {
                 this.updateRemoteCarryLink(containerId, linkId);
             }
         }
+        // 中央 link 或第一条转发 link 建成：中转链一启用就补中央 carrier
+        if (linkPlan === null || linkPlan === void 0 ? void 0 : linkPlan.coreId) {
+            this.ensureCenterCarrier();
+        }
     }
     /**
      * link 规划/补工地：
@@ -8788,10 +8930,10 @@ class RoomExtension extends Room {
                 }
             }
         }
-        // 外矿/矿点 link 有能量就转发中央 link。
-        // 不能只在 creep 投递成功当 tick 转发：transfer 是 intent，回合末才结算，
-        // 当 tick 读到的 link.energy 还是 0。放这里按 10 tick 扫描兜底。
-        this.forwardRemoteLinks(plan);
+        // 转发不再按扫描周期做：creep 投递成功后会挂 +1 tick 的 forwardLink 事件
+        // （transfer 是 intent，当 tick 读到的 link.energy 还是旧值）。
+        // 推代码后的一次性兜底在 globalReset 里调用 forwardRemoteLinks。
+        this.centerCarrierPos();
         // 按优先级补工地，数量受 RCL 的 link 上限约束
         const level = this.controller.level;
         const limit = (_k = CONTROLLER_STRUCTURES[STRUCTURE_LINK][level]) !== null && _k !== void 0 ? _k : 0;
@@ -8842,24 +8984,7 @@ class RoomExtension extends Room {
      */
     layoutLinkPos() {
         var _a;
-        const planType = this.memory.roomPlanType;
-        const anchor = planType === 2 ? (_a = this.memory.plan2Pos) === null || _a === void 0 ? void 0 : _a.core : this.memory.plan1Pos;
-        if (!anchor) {
-            return undefined;
-        }
-        const map = planType === 2 ? plan2_Core : plan1;
-        // plan1: anchor + x - 11；plan2: anchor + x - 7 + 1
-        const offset = planType === 2 ? 1 : 0;
-        for (let y = 0; y < map.length; y++) {
-            const row = map[y].split(' ');
-            for (let x = 0; x < row.length; x++) {
-                if (row[x][0] !== 'L') {
-                    continue;
-                }
-                return [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset];
-            }
-        }
-        return undefined;
+        return (_a = this.layoutCoreStructures()) === null || _a === void 0 ? void 0 : _a.link;
     }
     /**
      * 矿点 link 位置：贴着矿点 container，但不贴矿点（用户指定的优先规则）。
@@ -9165,6 +9290,212 @@ class RoomExtension extends Room {
             return undefined;
         }
         return (_b = Game.getObjectById(id)) !== null && _b !== void 0 ? _b : undefined;
+    }
+    /**
+     * 布局里 storage / terminal / link 三个核心建筑的绝对坐标。
+     * 位置只由布局决定，和建筑是否建好无关（terminal 没建也有规划位）。
+     */
+    layoutCoreStructures() {
+        var _a;
+        const planType = this.memory.roomPlanType;
+        const anchor = planType === 2 ? (_a = this.memory.plan2Pos) === null || _a === void 0 ? void 0 : _a.core : this.memory.plan1Pos;
+        if (!anchor) {
+            return undefined;
+        }
+        const map = planType === 2 ? plan2_Core : plan1;
+        // plan1: anchor + x - 11；plan2: anchor + x - 7 + 1
+        const offset = planType === 2 ? 1 : 0;
+        const out = {};
+        for (let y = 0; y < map.length; y++) {
+            const row = map[y].split(' ');
+            for (let x = 0; x < row.length; x++) {
+                const marker = row[x][0];
+                if (marker !== 'S' && marker !== 'T' && marker !== 'L') {
+                    continue;
+                }
+                const abs = [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset];
+                if (marker === 'S') {
+                    out.storage = abs;
+                }
+                else if (marker === 'T') {
+                    out.terminal = abs;
+                }
+                else {
+                    out.link = abs;
+                }
+            }
+        }
+        return out;
+    }
+    /**
+     * 中央 carrier 的固定站位：布局里离 link/storage/terminal 最均衡的道路格。
+     * 用布局局部坐标算（terminal 没建也有位置），结果缓存在 linkPlan 里。
+     * plan1 的 S/T/L 不共邻，选贴着 link 和 storage 的那格（(25,18)）；
+     * plan2 三个都贴着（(3,3)，也就是阵型正中）。
+     */
+    centerCarrierPos() {
+        var _a, _b, _c;
+        if (!this.memory.creepTask) {
+            // 外矿/走廊房没有房间计划
+            return undefined;
+        }
+        const cached = (_a = this.memory.linkPlan) === null || _a === void 0 ? void 0 : _a.centerCarryPos;
+        if (cached) {
+            return cached;
+        }
+        const planType = this.memory.roomPlanType;
+        const anchor = planType === 2 ? (_b = this.memory.plan2Pos) === null || _b === void 0 ? void 0 : _b.core : this.memory.plan1Pos;
+        const map = planType === 2 ? plan2_Core : plan1;
+        const cores = this.layoutCoreStructures();
+        if (!anchor || !(cores === null || cores === void 0 ? void 0 : cores.storage) || !cores.link) {
+            return undefined;
+        }
+        const offset = planType === 2 ? 1 : 0;
+        const points = [cores.storage, cores.terminal, cores.link]
+            .filter((item) => !!item)
+            // 换成局部坐标打分，换算回绝对坐标时统一加 anchor
+            .map(item => [item[0] - anchor[0] + map.length - offset,
+            item[1] - anchor[1] + map.length - offset]);
+        points[0];
+        const link = points[points.length - 1];
+        const cheb = (a, b) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
+        const minX = Math.max(0, Math.min(...points.map(p => p[0])) - 1);
+        const maxX = Math.min(map.length - 1, Math.max(...points.map(p => p[0])) + 1);
+        const minY = Math.max(0, Math.min(...points.map(p => p[1])) - 1);
+        const maxY = Math.min(map.length - 1, Math.max(...points.map(p => p[1])) + 1);
+        const terrain = this.getTerrain();
+        let best;
+        for (let y = minY; y <= maxY; y++) {
+            const row = map[y].split(' ');
+            for (let x = minX; x <= maxX; x++) {
+                // 只站布局里的道路格：其它格是建筑或会被建筑占掉
+                if (!row[x] || row[x][0] !== 'r') {
+                    continue;
+                }
+                if (points.some(p => p[0] === x && p[1] === y)) {
+                    continue;
+                }
+                const abs = [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset];
+                if (terrain.get(abs[0], abs[1]) === TERRAIN_MASK_WALL) {
+                    continue;
+                }
+                // 先让最远的核心建筑尽量近（max），再贴着 link（搬运起点），最后看总和
+                const max = Math.max(...points.map(p => cheb(p, [x, y])));
+                const linkDist = cheb(link, [x, y]);
+                const sum = points.reduce((acc, p) => acc + cheb(p, [x, y]), 0);
+                if (!best
+                    || max < best.max
+                    || (max === best.max && linkDist < best.link)
+                    || (max === best.max && linkDist === best.link && sum < best.sum)) {
+                    best = { abs, max, link: linkDist, sum };
+                }
+            }
+        }
+        if (!best) {
+            return undefined;
+        }
+        const plan = (_c = this.memory.linkPlan) !== null && _c !== void 0 ? _c : (this.memory.linkPlan = {});
+        plan.centerCarryPos = best.abs;
+        return best.abs;
+    }
+    /**
+     * 中央 carrier 常驻补员。门槛：
+     * RCL 解锁 link（5 级）+ 中央 link 建好 + 至少一条外矿/矿点转发 link + storage。
+     * 任务用通用形式 [from, to, resourceType] 登记，目前只登记中央 link -> storage。
+     */
+    ensureCenterCarrier() {
+        var _a, _b, _c, _d;
+        if (!this.controller || !this.controller.my) {
+            return;
+        }
+        if (this.controller.level < 5) {
+            return;
+        }
+        const plan = this.memory.linkPlan;
+        if (!(plan === null || plan === void 0 ? void 0 : plan.coreId) || !this.getCoreLink()) {
+            return;
+        }
+        if (!this.storage) {
+            return;
+        }
+        // 一对 link 才有转发可搬：光有中央 link 没有来源就空转
+        let hasForwardingLink = false;
+        for (const sourceId in (_a = plan.sources) !== null && _a !== void 0 ? _a : {}) {
+            if ((_b = plan.sources[sourceId]) === null || _b === void 0 ? void 0 : _b.id) {
+                hasForwardingLink = true;
+                break;
+            }
+        }
+        if (!hasForwardingLink) {
+            for (const roomName in (_c = plan.remotes) !== null && _c !== void 0 ? _c : {}) {
+                if ((_d = plan.remotes[roomName]) === null || _d === void 0 ? void 0 : _d.id) {
+                    hasForwardingLink = true;
+                    break;
+                }
+            }
+        }
+        if (!hasForwardingLink) {
+            return;
+        }
+        const task = this.ensureCoreLinkTransferTask();
+        if (task && this.countRoleWithSpawnQueue('centerCarrier') === 0) {
+            this.addToSpawnList('centerCarrier');
+        }
+    }
+    /**
+     * 幂等登记中央 link -> storage 的通用搬运任务。
+     */
+    ensureCoreLinkTransferTask() {
+        var _a, _b, _c;
+        const tasks = getCoreLinkTransferTask(this);
+        if (!tasks.length) {
+            return undefined;
+        }
+        const want = tasks[0];
+        const [fromId, toId] = want.taskParam;
+        const buckets = this.normalizeTaskBuckets('transferTask');
+        for (const key in buckets) {
+            for (const task of (_a = buckets[key]) !== null && _a !== void 0 ? _a : []) {
+                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === fromId && ((_c = task.taskParam) === null || _c === void 0 ? void 0 : _c[1]) === toId) {
+                    return task;
+                }
+            }
+        }
+        return this.registTask(tasks)[0];
+    }
+    /**
+     * link 转发事件：把一条 link 里的能量发给中央 link。
+     * 由 remoteCarrier 投递成功后挂 +1 tick 执行（transfer 是 intent，当 tick 读不到）。
+     * 遇到冷却/中央 link 满时按事件推迟，不退回周期扫描。
+     */
+    forwardLink(linkId) {
+        const link = Game.getObjectById(linkId);
+        const core = this.getCoreLink();
+        if (!link || !core || core.id === link.id) {
+            return;
+        }
+        if (link.store.getUsedCapacity(RESOURCE_ENERGY) <= 0) {
+            return;
+        }
+        if (link.cooldown > 0) {
+            // 冷却还没好：冷却结束后再发一次
+            this.registEvent({
+                triggerTime: Game.time + link.cooldown,
+                triggerFunc: 'forwardLink',
+                param: [linkId]
+            });
+            return;
+        }
+        if (core.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
+            // 中央 link 满了（中央 carrier 还没搬走）：稍后再试，别把事件丢了
+            this.registEvent({
+                triggerTime: Game.time + 10,
+                triggerFunc: 'forwardLink',
+                param: [linkId]
+            });
+            return;
+        }
+        link.transferEnergy(core);
     }
     /**
      * 从顶层 memory 里查这个外矿房对应的 link（还在不在由引擎判定）。
@@ -10150,6 +10481,9 @@ class RoomExtension extends Room {
             'claimer': 0,
             // 反击队同理：refreshCounterSpawn 按弱敌情报按需补，死亡后不自动重孵
             'attacker': 0,
+            // 中央 carrier 由 ensureCenterCarrier 按 link 门槛补员，不进这张表；
+            // 配额 0 会让现存 carrier 的 reSpawn=false，死亡由 creepRecycle 单独兜底
+            'centerCarrier': 0,
             // sleep 是矿采空后的临时状态，从不孵化
             'sleep': 0,
         };
@@ -10272,13 +10606,15 @@ class RoomExtension extends Room {
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
-                    : role == 'viewer' ? 2
-                        : role == 'remoteHarvester' ? 3
-                            : role == 'remoteCarrier' ? 3
-                                : role == 'claimer' ? 3
-                                    // 反击队和经济补员同档：650 能量，不压 harvester/carrier
-                                    : role == 'attacker' ? 2
-                                        : 2,
+                    // 中央 carrier 500 能量，不压 carrier，但比外矿优先
+                    : role == 'centerCarrier' ? 1
+                        : role == 'viewer' ? 2
+                            : role == 'remoteHarvester' ? 3
+                                : role == 'remoteCarrier' ? 3
+                                    : role == 'claimer' ? 3
+                                        // 反击队和经济补员同档：650 能量，不压 harvester/carrier
+                                        : role == 'attacker' ? 2
+                                            : 2,
             capacity: 1,
             persistent: false,
             reservedBy: []
@@ -10568,6 +10904,11 @@ class RoomExtension extends Room {
                         if (sourceId) {
                             room.ensureHarvesterForSource(sourceId);
                         }
+                    }
+                    else if (memory.role === 'centerCarrier') {
+                        // 中央 carrier 是常驻单岗：initSpawn 配额为 0，推代码后必然
+                        // reSpawn=false，只能在这里按 link 门槛补员（不看 reSpawn）
+                        room.ensureCenterCarrier();
                     }
                     else if (memory.reSpawn) {
                         if (memory.role === 'worker') {

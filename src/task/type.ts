@@ -46,5 +46,7 @@ type TaskType = 'workTask'
     | 'spawnTask'
     | 'remoteHarvestTask'
     | 'remoteCarryTask'
+    // 通用建筑间搬运：taskParam = [fromId, toId, resourceType]
+    | 'transferTask'
     | 'scoutTask'
     | 'claimTask'

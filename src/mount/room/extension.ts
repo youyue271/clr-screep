@@ -2,7 +2,7 @@ import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, 
 import {mapping, plan1Buckets, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1, plan2CoreBuckets, plan2ClusterBuckets, EnergyBucketPlan} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, warSetting, workerSetting} from "@/setting";
-import {createBuildTask, getBucketCarryTask, getCarryList, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
+import {createBuildTask, getBucketCarryTask, getCarryList, getCoreLinkTransferTask, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
 import {isNpcUser, isRemotePaused} from "@/util/threat";
@@ -57,6 +57,8 @@ export default class RoomExtension extends Room {
             'spawnTask': {},
             'remoteHarvestTask': {},
             'remoteCarryTask': {},
+            // 通用建筑间搬运（中央 carrier 用）：[fromId, toId, resourceType]
+            'transferTask': {},
             'scoutTask': {},
             'claimTask': {}
         }
@@ -73,6 +75,15 @@ export default class RoomExtension extends Room {
         this.rearmRemoteCarryTasks()
         // 回运任务重建后再补 link 规划：新任务能直接挂上已建好的外矿 link
         this.syncLinkPlan()
+
+        // 推代码兜底：正常转发由投递成功后的 forwardLink 事件驱动，
+        // 推代码清空事件队列后，把积压在 link 里的能量一次性补发。
+        // 之后不再周期性转发，避免 10 tick 扫描空转。
+        if (this.memory.linkPlan) {
+            this.forwardRemoteLinks(this.memory.linkPlan)
+        }
+        // link 已就绪但中央 carrier 死了/任务被重建：补常驻搬运任务和一只 carrier
+        this.ensureCenterCarrier()
 
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
@@ -1187,6 +1198,10 @@ export default class RoomExtension extends Room {
                 this.updateRemoteCarryLink(containerId, linkId)
             }
         }
+        // 中央 link 或第一条转发 link 建成：中转链一启用就补中央 carrier
+        if (linkPlan?.coreId) {
+            this.ensureCenterCarrier()
+        }
     }
 
     /**
@@ -1284,10 +1299,10 @@ export default class RoomExtension extends Room {
             }
         }
 
-        // 外矿/矿点 link 有能量就转发中央 link。
-        // 不能只在 creep 投递成功当 tick 转发：transfer 是 intent，回合末才结算，
-        // 当 tick 读到的 link.energy 还是 0。放这里按 10 tick 扫描兜底。
-        this.forwardRemoteLinks(plan)
+        // 转发不再按扫描周期做：creep 投递成功后会挂 +1 tick 的 forwardLink 事件
+        // （transfer 是 intent，当 tick 读到的 link.energy 还是旧值）。
+        // 推代码后的一次性兜底在 globalReset 里调用 forwardRemoteLinks。
+        this.centerCarrierPos()
 
         // 按优先级补工地，数量受 RCL 的 link 上限约束
         const level = this.controller.level
@@ -1339,24 +1354,7 @@ export default class RoomExtension extends Room {
      * 布局里中央 link（大写 L）的坐标，公式和 constructPlan1 / buildLayout 保持一致。
      */
     private layoutLinkPos(): [number, number] | undefined {
-        const planType = this.memory.roomPlanType
-        const anchor = planType === 2 ? this.memory.plan2Pos?.core : this.memory.plan1Pos
-        if (!anchor) {
-            return undefined
-        }
-        const map = planType === 2 ? plan2_Core : plan1
-        // plan1: anchor + x - 11；plan2: anchor + x - 7 + 1
-        const offset = planType === 2 ? 1 : 0
-        for (let y = 0; y < map.length; y++) {
-            const row = map[y].split(' ')
-            for (let x = 0; x < row.length; x++) {
-                if (row[x][0] !== 'L') {
-                    continue
-                }
-                return [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset]
-            }
-        }
-        return undefined
+        return this.layoutCoreStructures()?.link
     }
 
     /**
@@ -1659,6 +1657,222 @@ export default class RoomExtension extends Room {
             return undefined
         }
         return Game.getObjectById<StructureLink>(id) ?? undefined
+    }
+
+    /**
+     * 布局里 storage / terminal / link 三个核心建筑的绝对坐标。
+     * 位置只由布局决定，和建筑是否建好无关（terminal 没建也有规划位）。
+     */
+    private layoutCoreStructures(): {
+        storage?: [number, number]
+        terminal?: [number, number]
+        link?: [number, number]
+    } | undefined {
+        const planType = this.memory.roomPlanType
+        const anchor = planType === 2 ? this.memory.plan2Pos?.core : this.memory.plan1Pos
+        if (!anchor) {
+            return undefined
+        }
+        const map = planType === 2 ? plan2_Core : plan1
+        // plan1: anchor + x - 11；plan2: anchor + x - 7 + 1
+        const offset = planType === 2 ? 1 : 0
+        const out: {
+            storage?: [number, number]
+            terminal?: [number, number]
+            link?: [number, number]
+        } = {}
+        for (let y = 0; y < map.length; y++) {
+            const row = map[y].split(' ')
+            for (let x = 0; x < row.length; x++) {
+                const marker = row[x][0]
+                if (marker !== 'S' && marker !== 'T' && marker !== 'L') {
+                    continue
+                }
+                const abs: [number, number] =
+                    [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset]
+                if (marker === 'S') {
+                    out.storage = abs
+                } else if (marker === 'T') {
+                    out.terminal = abs
+                } else {
+                    out.link = abs
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * 中央 carrier 的固定站位：布局里离 link/storage/terminal 最均衡的道路格。
+     * 用布局局部坐标算（terminal 没建也有位置），结果缓存在 linkPlan 里。
+     * plan1 的 S/T/L 不共邻，选贴着 link 和 storage 的那格（(25,18)）；
+     * plan2 三个都贴着（(3,3)，也就是阵型正中）。
+     */
+    centerCarrierPos(): [number, number] | undefined {
+        if (!this.memory.creepTask) {
+            // 外矿/走廊房没有房间计划
+            return undefined
+        }
+        const cached = this.memory.linkPlan?.centerCarryPos
+        if (cached) {
+            return cached
+        }
+        const planType = this.memory.roomPlanType
+        const anchor = planType === 2 ? this.memory.plan2Pos?.core : this.memory.plan1Pos
+        const map = planType === 2 ? plan2_Core : plan1
+        const cores = this.layoutCoreStructures()
+        if (!anchor || !cores?.storage || !cores.link) {
+            return undefined
+        }
+        const offset = planType === 2 ? 1 : 0
+        const points = [cores.storage, cores.terminal, cores.link]
+            .filter((item): item is [number, number] => !!item)
+            // 换成局部坐标打分，换算回绝对坐标时统一加 anchor
+            .map(item => [item[0] - anchor[0] + map.length - offset,
+                item[1] - anchor[1] + map.length - offset] as [number, number])
+        const storage = points[0]
+        const link = points[points.length - 1]
+        const cheb = (a: [number, number], b: [number, number]) =>
+            Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]))
+        const minX = Math.max(0, Math.min(...points.map(p => p[0])) - 1)
+        const maxX = Math.min(map.length - 1, Math.max(...points.map(p => p[0])) + 1)
+        const minY = Math.max(0, Math.min(...points.map(p => p[1])) - 1)
+        const maxY = Math.min(map.length - 1, Math.max(...points.map(p => p[1])) + 1)
+        const terrain = this.getTerrain()
+        let best: { abs: [number, number], max: number, link: number, sum: number } | undefined
+        for (let y = minY; y <= maxY; y++) {
+            const row = map[y].split(' ')
+            for (let x = minX; x <= maxX; x++) {
+                // 只站布局里的道路格：其它格是建筑或会被建筑占掉
+                if (!row[x] || row[x][0] !== 'r') {
+                    continue
+                }
+                if (points.some(p => p[0] === x && p[1] === y)) {
+                    continue
+                }
+                const abs: [number, number] =
+                    [anchor[0] + x - map.length + offset, anchor[1] + y - map.length + offset]
+                if (terrain.get(abs[0], abs[1]) === TERRAIN_MASK_WALL) {
+                    continue
+                }
+                // 先让最远的核心建筑尽量近（max），再贴着 link（搬运起点），最后看总和
+                const max = Math.max(...points.map(p => cheb(p, [x, y])))
+                const linkDist = cheb(link, [x, y])
+                const sum = points.reduce((acc, p) => acc + cheb(p, [x, y]), 0)
+                if (!best
+                    || max < best.max
+                    || (max === best.max && linkDist < best.link)
+                    || (max === best.max && linkDist === best.link && sum < best.sum)) {
+                    best = { abs, max, link: linkDist, sum }
+                }
+            }
+        }
+        if (!best) {
+            return undefined
+        }
+        const plan = this.memory.linkPlan ?? (this.memory.linkPlan = {})
+        plan.centerCarryPos = best.abs
+        return best.abs
+    }
+
+    /**
+     * 中央 carrier 常驻补员。门槛：
+     * RCL 解锁 link（5 级）+ 中央 link 建好 + 至少一条外矿/矿点转发 link + storage。
+     * 任务用通用形式 [from, to, resourceType] 登记，目前只登记中央 link -> storage。
+     */
+    ensureCenterCarrier(): void {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
+        if (this.controller.level < 5) {
+            return
+        }
+        const plan = this.memory.linkPlan
+        if (!plan?.coreId || !this.getCoreLink()) {
+            return
+        }
+        if (!this.storage) {
+            return
+        }
+        // 一对 link 才有转发可搬：光有中央 link 没有来源就空转
+        let hasForwardingLink = false
+        for (const sourceId in plan.sources ?? {}) {
+            if (plan.sources[sourceId]?.id) {
+                hasForwardingLink = true
+                break
+            }
+        }
+        if (!hasForwardingLink) {
+            for (const roomName in plan.remotes ?? {}) {
+                if (plan.remotes[roomName]?.id) {
+                    hasForwardingLink = true
+                    break
+                }
+            }
+        }
+        if (!hasForwardingLink) {
+            return
+        }
+        const task = this.ensureCoreLinkTransferTask()
+        if (task && this.countRoleWithSpawnQueue('centerCarrier') === 0) {
+            this.addToSpawnList('centerCarrier')
+        }
+    }
+
+    /**
+     * 幂等登记中央 link -> storage 的通用搬运任务。
+     */
+    private ensureCoreLinkTransferTask(): TaskEntity | undefined {
+        const tasks = getCoreLinkTransferTask(this)
+        if (!tasks.length) {
+            return undefined
+        }
+        const want = tasks[0]
+        const [fromId, toId] = want.taskParam as [string, string]
+        const buckets = this.normalizeTaskBuckets('transferTask')
+        for (const key in buckets) {
+            for (const task of buckets[key] ?? []) {
+                if (task?.taskParam?.[0] === fromId && task.taskParam?.[1] === toId) {
+                    return task
+                }
+            }
+        }
+        return this.registTask(tasks)[0]
+    }
+
+    /**
+     * link 转发事件：把一条 link 里的能量发给中央 link。
+     * 由 remoteCarrier 投递成功后挂 +1 tick 执行（transfer 是 intent，当 tick 读不到）。
+     * 遇到冷却/中央 link 满时按事件推迟，不退回周期扫描。
+     */
+    forwardLink(linkId: Id<StructureLink>): void {
+        const link = Game.getObjectById<StructureLink>(linkId)
+        const core = this.getCoreLink()
+        if (!link || !core || core.id === link.id) {
+            return
+        }
+        if (link.store.getUsedCapacity(RESOURCE_ENERGY) <= 0) {
+            return
+        }
+        if (link.cooldown > 0) {
+            // 冷却还没好：冷却结束后再发一次
+            this.registEvent({
+                triggerTime: Game.time + link.cooldown,
+                triggerFunc: 'forwardLink',
+                param: [linkId]
+            })
+            return
+        }
+        if (core.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
+            // 中央 link 满了（中央 carrier 还没搬走）：稍后再试，别把事件丢了
+            this.registEvent({
+                triggerTime: Game.time + 10,
+                triggerFunc: 'forwardLink',
+                param: [linkId]
+            })
+            return
+        }
+        link.transferEnergy(core)
     }
 
     /**
@@ -2651,6 +2865,9 @@ export default class RoomExtension extends Room {
             'claimer': 0,
             // 反击队同理：refreshCounterSpawn 按弱敌情报按需补，死亡后不自动重孵
             'attacker': 0,
+            // 中央 carrier 由 ensureCenterCarrier 按 link 门槛补员，不进这张表；
+            // 配额 0 会让现存 carrier 的 reSpawn=false，死亡由 creepRecycle 单独兜底
+            'centerCarrier': 0,
             // sleep 是矿采空后的临时状态，从不孵化
             'sleep': 0,
         }
@@ -2775,6 +2992,8 @@ export default class RoomExtension extends Room {
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
+                // 中央 carrier 500 能量，不压 carrier，但比外矿优先
+                : role == 'centerCarrier' ? 1
                 : role == 'viewer' ? 2
                 : role == 'remoteHarvester' ? 3
                 : role == 'remoteCarrier' ? 3
@@ -3079,6 +3298,10 @@ export default class RoomExtension extends Room {
                         if (sourceId) {
                             room.ensureHarvesterForSource(sourceId as Id<Source>)
                         }
+                    } else if (memory.role === 'centerCarrier') {
+                        // 中央 carrier 是常驻单岗：initSpawn 配额为 0，推代码后必然
+                        // reSpawn=false，只能在这里按 link 门槛补员（不看 reSpawn）
+                        room.ensureCenterCarrier()
                     } else if (memory.reSpawn) {
                         if (memory.role === 'worker') {
                             // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命

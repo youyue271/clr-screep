@@ -17,6 +17,9 @@ interface CreepMemory {
     recall?: boolean
     // 外矿 carrier 往返标记：已经离开外矿房、正在往回走
     remoteReturn?: boolean
+    // 外矿 carrier 回主房后 link 已满、正在等空位的连续 tick 数；
+    // 超过 remoteSetting.linkFullWaitTicks 才退回 drop 暂存
+    linkWaitTicks?: number
     // 外矿 container 已经消失（外矿房停用/被拆）：本次回程卸完货就结束循环
     remoteAbort?: boolean
     // 侦察兵当前要探的房间；探完清空，等待新目标
@@ -47,6 +50,9 @@ type Role = 'worker'
     | 'attacker'
     // 矿采空后的睡眠态：每 tick 只说 zzz，矿重生时由 wakeCreep 事件唤醒回原职业
     | 'sleep'
+    // 中央搬运：站在 link/storage/terminal 中间的固定格，只做建筑之间的中转搬运。
+    // 不领本地补能任务，任务形式是通用的 transferTask（from/to/resourceType）
+    | 'centerCarrier'
 
 interface Creep {
 
@@ -84,6 +90,11 @@ interface Creep {
      */
     suicideAndRespawn(): void
     carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean
+    /**
+     * 通用搬运：从 from 取 resourceType 送到 to，参数完全来自 transferTask。
+     * 目标满/来源空时原地等（persistent 任务不释放），目标消失才结束任务。
+     */
+    transferResource(fromId: Id<any>, toId: Id<any>, resourceType: ResourceConstant): boolean
     /**
      * 把能量补进一个桶：站桶节点，找桶内第一个没满的成员投递。
      * 桶内全部补满后自己把任务从队列里删掉。

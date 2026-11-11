@@ -66,6 +66,8 @@ type BaseRoleConstant =
     | 'viewer'
     | 'remoteHarvester'
     | 'remoteCarrier'
+    // 中央中转搬运：定点站立，只做建筑之间的搬运
+    | 'centerCarrier'
 
 type AdvancedRoleConstant =
     | 'attacker'

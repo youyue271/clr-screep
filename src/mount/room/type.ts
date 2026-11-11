@@ -136,6 +136,8 @@ interface LinkPlan {
     remotes?: { [roomName: string]: { pos: [number, number], id?: Id<StructureLink> } }
     // 按距离排好的建造顺序，key 形如 core / source:xxx / remote:xxx
     order?: string[]
+    // 中央 carrier 的固定站位：布局里 link/storage/terminal 中间的最近道路格
+    centerCarryPos?: [number, number]
 }
 
 /**
@@ -281,6 +283,24 @@ interface Room {
      * 中央 link（link 规划/建好后才有）
      */
     getCoreLink(): StructureLink | undefined
+
+    /**
+     * 中央 carrier 的固定站位：布局里 link/storage/terminal 中间的最近道路格。
+     * 从布局局部坐标算，和 terminal 是否建好无关，位置固定可缓存。
+     */
+    centerCarrierPos(): [number, number] | undefined
+
+    /**
+     * 中央 carrier 的常驻补员：link 解锁 + 中央 link/转发 link/storage 到位时，
+     * 保证中央 link -> storage 的通用搬运任务存在，并只养一只 centerCarrier。
+     */
+    ensureCenterCarrier(): void
+
+    /**
+     * link 转发事件（+1 tick）：把一条 link 里的能量发给中央 link。
+     * transfer 是 intent，回合末才结算，所以只能在投递后的下一 tick 触发。
+     */
+    forwardLink(linkId: Id<StructureLink>): void
 
     /**
      * 规划/补 link 工地：中央 > 外矿（离中央越远越先）> 矿点，

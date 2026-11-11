@@ -224,36 +224,35 @@ export function getStorageEnergy(room: Room): MyTask[] {
 }
 
 /**
- * 中央 link 的取能任务：外矿 link 转发过来的能量要及时搬走，
- * 否则 link 满了外矿 carrier 就投不进去，只能多走路回主房。
+ * 中央 carrier 的常驻搬运任务：中央 link -> storage。
+ * 任务形式是通用的 [from, to, resourceType]，work 函数 transferResource 只按参数搬运；
+ * 以后新增中转（terminal/lab 等）只需再登记一条同样形状的 transferTask。
  */
-export function getCoreLinkEnergy(room: Room): MyTask[] {
+export function getCoreLinkTransferTask(room: Room): MyTask[] {
     const link = room.getCoreLink()
-    if (!link) {
+    const storage = room.storage
+    if (!link || !storage) {
         return []
     }
-    const energy = link.store.getUsedCapacity(RESOURCE_ENERGY)
-    if (energy <= 0) {
-        return []
-    }
-    const maxCarry = room.carrierCapacity()
     return [{
-        taskType: 'energyTask',
-        taskFunc: 'getEnergyFromStructure',
-        priority: 2,
-        taskParam: [link.id, RESOURCE_ENERGY],
-        // link 容量 800，按满体型载重拆成 1~2 个并发就够了
-        capacity: Math.max(1, Math.min(2, Math.ceil(energy / maxCarry))),
+        taskType: 'transferTask',
+        taskFunc: 'transferResource',
+        taskParam: [link.id, storage.id, RESOURCE_ENERGY],
+        // 中转链路优先级最高：中央 link 满了转发就会停，外矿车就投不进来了
+        priority: 1,
+        // 定点单岗，只给一只 centerCarrier
+        capacity: 1,
+        persistent: true,
         targetId: link.id,
     }]
 }
 
 export function getEnergyTask(room: Room): MyTask[] {
     const containTasks = getContainerEnergy(room)
-    const linkTasks = getCoreLinkEnergy(room)
+    // 中央 link 由 centerCarrier 的 transferTask 专职搬，本地 carrier 不再插手
     const opportunityTasks = getOpportunityEnergy(room)
     const storageTasks = getStorageEnergy(room)
-    return [...containTasks, ...linkTasks, ...opportunityTasks, ...storageTasks]
+    return [...containTasks, ...opportunityTasks, ...storageTasks]
 }
 
 // export function getEnergyWithStorage(room: Room): MyTask[] {

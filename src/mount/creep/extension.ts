@@ -26,6 +26,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'attacker': [],
     // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
     'sleep': [],
+    // 中央 carrier 只领建筑间搬运任务，不参与本地补能/外矿
+    'centerCarrier': ['transferTask'],
 }
 
 export default class CreepExtension extends Creep {
@@ -79,6 +81,13 @@ export default class CreepExtension extends Creep {
             }
             if (!this.memory.working) {
                 if (!this.getWork()) {
+                    // 中央 carrier 没有任务时回阵型固定格待命，不随机走；
+                    // 顺便让房间自愈：link/storage 变化后重新挂上常驻搬运任务。
+                    if (this.memory.role === 'centerCarrier') {
+                        this.room.ensureCenterCarrier?.()
+                        this.moveToCenterPost()
+                        return
+                    }
                     // 本地没活：房间有 storage 就把富余能量搬进去（见 storeSurplusEnergy）。
                     // 必须放在随机走前面：随机走会覆盖这里发出的 moveTo 意图。
                     if (this.storeSurplusEnergy()) {
@@ -732,6 +741,91 @@ export default class CreepExtension extends Creep {
     }
 
     /**
+     * 通用建筑间搬运：fromId -> toId，resourceType 完全来自 transferTask 参数。
+     * 一次调用只发一个动作，下一 tick 按结算后的 store 继续：
+     * - 身上有货：目标有空位就投递；目标满了原地等（persistent 任务不释放）
+     * - 身上没货：来源有货就取；来源空了回固定站位等
+     * - from/to 消失（建筑被拆/规划变了）才算任务结束，把任务移出队列
+     */
+    transferResource(fromId: Id<any>, toId: Id<any>, resourceType: ResourceConstant): boolean {
+        const from: any = Game.getObjectById(fromId)
+        const to: any = Game.getObjectById(toId)
+        if (!from || !to) {
+            this.say('❓搬运目标没了')
+            this.removeCurrentWorkFromQueue()
+            this.releaseCurrentWork()
+            return true
+        }
+        // CARRY 部件被打光：不可能再搬货，自毁补员（和 emptyWorker 的处理一致）
+        if (!this.store.getCapacity(resourceType)) {
+            this.suicideAndRespawn()
+            return true
+        }
+        if (this.store.getUsedCapacity(resourceType) > 0) {
+            if (to.store.getFreeCapacity(resourceType) <= 0) {
+                // 目标满了：原地等（中央 link -> storage 时说明 storage 也满了），
+                // 不丢货、不释放任务，腾出空位后同一任务继续
+                this.say('⏳等目标空位')
+                this.moveToCenterPost()
+                return false
+            }
+            this.say('🚚中转搬运')
+            const res = this.transfer(to, resourceType)
+            if (res === ERR_NOT_IN_RANGE) {
+                this.moveTo(to, {visualizePathStyle: {stroke: '#66ccff'}})
+                return false
+            }
+            if (res === ACTION_BLOCKED) {
+                // 本 tick 已经发过动作：任务保留，下一 tick 再投
+                return false
+            }
+            if (res === OK || res === ERR_FULL || res === ERR_NOT_ENOUGH_RESOURCES) {
+                // OK：下一 tick 结算后继续投；FULL/不足是当 tick 读到的旧 store，下一 tick 再看
+                return false
+            }
+            this.removeCurrentWorkFromQueue()
+            this.releaseCurrentWork()
+            return true
+        }
+        if (from.store.getUsedCapacity(resourceType) <= 0) {
+            this.say('😴等货')
+            this.moveToCenterPost()
+            return false
+        }
+        this.say('🫳中转取货')
+        const res = this.withdraw(from, resourceType)
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(from, {visualizePathStyle: {stroke: '#ffff00'}})
+            return false
+        }
+        if (res === ACTION_BLOCKED) {
+            return false
+        }
+        if (res === OK || res === ERR_NOT_ENOUGH_RESOURCES || res === ERR_FULL) {
+            return false
+        }
+        this.removeCurrentWorkFromQueue()
+        this.releaseCurrentWork()
+        return true
+    }
+
+    /**
+     * 回中央 carrier 的固定站位（布局里 link/storage/terminal 中间的路格）。
+     * 没有站位（非主房/布局缺失）时原地不动。
+     */
+    private moveToCenterPost(): void {
+        const post = this.room.centerCarrierPos?.()
+        if (!post) {
+            return
+        }
+        if (this.pos.x === post[0] && this.pos.y === post[1]) {
+            return
+        }
+        this.moveTo(new RoomPosition(post[0], post[1], this.room.name),
+            {visualizePathStyle: {stroke: '#00ffff'}})
+    }
+
+    /**
      * 能量桶补能：走到桶节点，找桶内第一个没满的 extension 投递，
      * 桶内全部补满后自己把任务从队列里删掉。
      * 一个桶只占一个 carrier（capacity 1），桶内成员距离节点都是 1，
@@ -1172,24 +1266,46 @@ export default class CreepExtension extends Creep {
             this.finishRemoteTrip()
             return true
         }
-        // 主房有外矿 link 就投进去；link 满了也走暂存位，不原地等
+        // 主房有外矿 link 就投进去；link 满了先在旁边等中央 carrier 腾出中央 link
         const link = linkId ? Game.getObjectById<StructureLink>(linkId) : undefined
-        if (link && link.energy < link.energyCapacity) {
-            this.say('🔗外矿入link')
-            const res = this.transfer(link, RESOURCE_ENERGY)
-            if (res === ACTION_BLOCKED) {
-                // 本 tick 已经投递过能量：保留任务，下一 tick 再入 link。
-                // 绝不能落到下面的 drop 分支同 tick 再丢一次。
-                return false
-            }
-            if (res === ERR_NOT_IN_RANGE) {
-                this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } })
-                return false
-            }
-            if (res === OK) {
-                // link 收下了：冷却好了就转发中央 link，不用额外扫描
-                this.trySendLink(link)
-                return this.afterRemoteDelivery()
+        if (link) {
+            if (link.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                delete this.memory.linkWaitTicks
+                this.say('🔗外矿入link')
+                const res = this.transfer(link, RESOURCE_ENERGY)
+                if (res === ACTION_BLOCKED) {
+                    // 本 tick 已经投递过能量：保留任务，下一 tick 再入 link。
+                    // 绝不能落到下面的 drop 分支同 tick 再丢一次。
+                    return false
+                }
+                if (res === ERR_NOT_IN_RANGE) {
+                    this.moveTo(link, { visualizePathStyle: { stroke: '#66ccff' } })
+                    return false
+                }
+                if (res === OK) {
+                    // transfer 是 intent，回合末才结算，本 tick 读 link.energy 还是旧值。
+                    // 挂 +1 tick 的转发事件，投递成功后事件驱动地发往中央 link。
+                    this.room.registEvent({
+                        triggerTime: Game.time + 1,
+                        triggerFunc: 'forwardLink',
+                        param: [link.id]
+                    })
+                    return this.afterRemoteDelivery()
+                }
+            } else {
+                // link 满了：说明中央 link 还没被中央 carrier 搬空，转发进不去。
+                // 先在 link 旁边等，不把货丢地上（下一趟还要捡回来）。
+                // 等太久说明中转链真的堵了，才退回 drop 暂存，避免外矿车无限干等。
+                const waited = (this.memory.linkWaitTicks ?? 0) + 1
+                this.memory.linkWaitTicks = waited
+                if (waited <= remoteSetting.linkFullWaitTicks) {
+                    this.say('⏳等link空位')
+                    if (!this.pos.inRangeTo(link, 1)) {
+                        this.moveTo(link, { range: 1, visualizePathStyle: { stroke: '#66ccff' } })
+                    }
+                    return false
+                }
+                delete this.memory.linkWaitTicks
             }
         }
         // 没有可用 link：丢在外矿对应的 link 规划位旁边，等本地 carrier/emptyWorker 来收。
@@ -1282,20 +1398,7 @@ export default class CreepExtension extends Creep {
         // 转回本地 carrier 后不再绑定任何外矿矿点
         delete this.memory.remoteCarrySourceId
         delete this.memory.remoteCarryRoom
-    }
-
-    /**
-     * 把 link 里的能量转发中央 link（link→link 瞬发，有冷却和损耗）。
-     */
-    private trySendLink(link: StructureLink): void {
-        if (link.cooldown > 0 || !link.energy) {
-            return
-        }
-        const core = this.room.getCoreLink?.()
-        if (!core || core.id === link.id || core.energy >= core.energyCapacity) {
-            return
-        }
-        link.transferEnergy(core)
+        delete this.memory.linkWaitTicks
     }
 
     /**
