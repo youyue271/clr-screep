@@ -168,6 +168,12 @@ interface Room {
 
     initCreepRecycle(): void
 
+    /**
+     * 清理已死亡 creep 的内存/任务预约，并按角色决定是否补员。
+     * 正常由 TTL 事件触发；scan 每 10 tick 兜底调用一次，接住被敌人提前打死的情况。
+     */
+    creepRecycle(): void
+
     globalReset(): void
 
     normalizeTaskBuckets(taskType: TaskType): TaskBucket

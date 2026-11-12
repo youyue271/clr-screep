@@ -33,6 +33,16 @@ interface CreepMemory {
     // store 还是旧值，只能自己记账推算目标结算后会不会满（Game.time 变了就重置）
     transferTick?: number
     transferIssued?: number
+    // 外矿任务最后绑定的房间：finishRemoteTrip / 交还任务会把 remoteCarryRoom、
+    // currentWork 清掉，死亡回收时只能靠这里做归因
+    lastRemoteRoom?: string
+    // 最后所在房间 + 进入时间：用于死亡时判断是否刚离开外矿（边界被打回主房）
+    lastRoom?: string
+    lastRoomAt?: number
+    // 出生时算好的自然死亡 tick：Game.time 明显早于它就是提前死亡（被敌人打死）
+    dieAt?: number
+    // 这次事故已经上报给 war L1：死亡回收时不再重复上报
+    warReported?: boolean
 }
 
 type Role = 'worker'

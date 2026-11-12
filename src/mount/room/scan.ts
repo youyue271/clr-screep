@@ -50,6 +50,11 @@ export default class RoomScanExtension extends Room {
             // 新外矿房/新矿点出现后补 link 规划和工地（位置有缓存，正常只做几次 lookFor）
             this.syncLinkPlan()
             this.refreshRemoteSpawn()
+            // 提前死亡兜底：正常死亡有 TTL 事件，被敌人一击打死要等到原 TTL
+            // 才清内存/预约。10 tick 一次足够，内部按 global.lastRecycleTime 去重。
+            if (this.controller?.my) {
+                this.creepRecycle()
+            }
         }
         // 兜底重建 spawn/extension 顺序表，处理漏掉的建成/拆除
         if (cache.lastEnergyStructureScan === undefined

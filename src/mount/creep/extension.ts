@@ -2,7 +2,8 @@ import { getEnergyTask } from "@/task/roomTask";
 import { containerWatermark, remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { recordRoomIntel } from "@/global/autoplan/remotePlan";
-import { classifyThreat, hasArmedHostile, isRemotePaused } from "@/util/threat";
+import { classifyThreat, isRemotePaused } from "@/util/threat";
+import { onRemoteHarvestSignal, rememberRemoteTarget } from "@/global/war/remote/l1";
 import { ACTION_BLOCKED } from "./actionGuard";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
@@ -1069,6 +1070,8 @@ export default class CreepExtension extends Creep {
      * taskParam: [sourceId | null, 外矿房名, 主房名]
      */
     remoteHarvest(sourceId: Id<Source> | null, targetRoom: string, homeRoom: string): boolean {
+        // 记录最后任务房/最后所在房，死亡回收时才能归因到这次外矿
+        rememberRemoteTarget(this, targetRoom)
         // 外矿房被停用/移出计划：主房会把任务清掉，但 creep 手里还留着 currentWork 副本，
         // 不在这里校验就会一直挖到被敌人打死。交还任务并打召回标记，回主房待命到死。
         const planState = Memory.remotePlan?.[homeRoom]?.rooms?.[targetRoom]
@@ -1086,12 +1089,9 @@ export default class CreepExtension extends Creep {
         if (sourceId) {
             this.memory.harvestSourceId = sourceId
         }
-        // 外矿有武装敌对（强弱都一样）：先回主房避战，任务和预约都保留。
-        // 人在外矿房时直接看视野并立刻写情报，不然离开视野后主房要到
-        // 下一次 10 tick 扫描才知道有敌人，creep 会在走廊上被反复派回来。
-        if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
-            recordRoomIntel(homeRoom, this.room)
-        }
+        // 敌人检测全部走 war L1：被攻击/被占时由异常分支立刻上报；
+        // 平时由主房 10 tick 扫描（refreshRemoteTasks 里有视野时写情报）兜底，
+        // 不再每个 tick 对整房做 hasArmedHostile find。
         if (isRemotePaused(Memory.mapIntel?.[targetRoom])) {
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom)
@@ -1141,13 +1141,21 @@ export default class CreepExtension extends Creep {
             if (container.hits < container.hitsMax * remoteSetting.repairThreshold
                 && this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                 this.say('🔧修外矿')
-                if (this.repair(container) === ERR_NOT_IN_RANGE) {
+                const repairRes = this.repair(container)
+                if (this.handleRemoteHarvestResult(repairRes, homeRoom)) {
+                    return true
+                }
+                if (repairRes === ERR_NOT_IN_RANGE) {
                     this.moveTo(container.pos, { visualizePathStyle: { stroke: '#ffffff' } })
                 }
                 return false
             }
             this.say('⛏️外矿采矿')
-            if (this.harvest(source) === ERR_NOT_IN_RANGE) {
+            const harvestRes = this.harvest(source)
+            if (this.handleRemoteHarvestResult(harvestRes, homeRoom)) {
+                return true
+            }
+            if (harvestRes === ERR_NOT_IN_RANGE) {
                 this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
             }
             return false
@@ -1167,22 +1175,35 @@ export default class CreepExtension extends Creep {
                 if (state && (!state.containerPos || state.containerPos[0] !== pos.x || state.containerPos[1] !== pos.y)) {
                     state.containerPos = [pos.x, pos.y]
                 }
-                if (pos.createConstructionSite(STRUCTURE_CONTAINER) === OK) {
+                const siteRes = pos.createConstructionSite(STRUCTURE_CONTAINER)
+                if (siteRes === OK) {
                     site = pos.lookFor(LOOK_CONSTRUCTION_SITES)
                         .find(item => item.structureType === STRUCTURE_CONTAINER)
+                } else if (siteRes === ERR_NOT_OWNER) {
+                    // 房间有主/被别人 reserve：外矿已经不能再用，立刻召回
+                    this.reportRemoteOccupied(siteRes, homeRoom)
+                    return true
                 }
             }
         }
         if (site) {
             if (this.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                 this.say('🔨造外矿container')
-                if (this.build(site) === ERR_NOT_IN_RANGE) {
+                const buildRes = this.build(site)
+                if (this.handleRemoteHarvestResult(buildRes, homeRoom)) {
+                    return true
+                }
+                if (buildRes === ERR_NOT_IN_RANGE) {
                     this.moveTo(site, { visualizePathStyle: { stroke: '#ffffff' } })
                 }
                 return false
             }
             this.say('⛏️攒能量')
-            if (this.harvest(source) === ERR_NOT_IN_RANGE) {
+            const gatherRes = this.harvest(source)
+            if (this.handleRemoteHarvestResult(gatherRes, homeRoom)) {
+                return true
+            }
+            if (gatherRes === ERR_NOT_IN_RANGE) {
                 this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
             }
             return false
@@ -1192,9 +1213,43 @@ export default class CreepExtension extends Creep {
         if (!this.pos.inRangeTo(source, 1)) {
             this.moveTo(source, { visualizePathStyle: { stroke: '#ffffff' } })
         } else {
-            this.harvest(source)
+            const fallbackRes = this.harvest(source)
+            if (this.handleRemoteHarvestResult(fallbackRes, homeRoom)) {
+                return true
+            }
         }
         return false
+    }
+
+    /**
+     * 外矿采集/建造/修理动作的结果里能拿到的敌人信号：
+     * ERR_NO_BODYPART = WORK 被打光（只可能是在外矿被打的）；
+     * ERR_NOT_OWNER = 房间被别的玩家占领/reserve。
+     * 返回 true 表示本次任务已经结束，调用方直接退出。
+     */
+    private handleRemoteHarvestResult(res: ScreepsReturnCode, homeRoom: string): boolean {
+        if (res === ERR_NO_BODYPART) {
+            if (!this.memory.warReported) {
+                onRemoteHarvestSignal(this, { kind: 'noWork' })
+                this.memory.warReported = true
+            }
+            this.suicideAndRespawn()
+            return true
+        }
+        if (res === ERR_NOT_OWNER) {
+            this.reportRemoteOccupied(res, homeRoom)
+            return true
+        }
+        return false
+    }
+
+    private reportRemoteOccupied(code: ScreepsReturnCode, homeRoom: string): void {
+        if (!this.memory.warReported) {
+            onRemoteHarvestSignal(this, { kind: 'occupied', code })
+            this.memory.warReported = true
+        }
+        this.releaseRemoteWork(homeRoom)
+        this.memory.recall = true
     }
 
     /**
@@ -1206,11 +1261,11 @@ export default class CreepExtension extends Creep {
      * （任务参数结构不变），不再用于兜底投递。
      */
     remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>, linkId?: Id<StructureLink>): boolean {
+        // 记录最后任务房/最后所在房，carrier 被打死后由 creepRecycle 归因
+        rememberRemoteTarget(this, targetRoom)
         const energy = this.store.getUsedCapacity(RESOURCE_ENERGY)
-        // 外矿有武装敌对：不进屋取货。任务和预约保留，情报清场后自动恢复。
-        if (this.room.name === targetRoom && hasArmedHostile(this.room)) {
-            recordRoomIntel(homeRoom, this.room)
-        }
+        // 敌人检测走 war L1：carrier 没有可用的主动异常钩子，被打死/打残由
+        // creepRecycle 的提前死亡上报；平时靠主房 10 tick 扫描写情报。
         if (isRemotePaused(Memory.mapIntel?.[targetRoom])) {
             if (this.room.name !== homeRoom) {
                 // 在外面（含刚发现敌人的外矿房）：带能量的先回家投递

@@ -31,7 +31,11 @@ export const loop = errorMapper(() => {
         // // console.log(x, y)
         // Game.rooms[room].visualize(totalCluster1, x, y)
     }
-    debugDump()
+    // 每 tick 的调试转储开销很大（遍历房间/任务桶 + console），默认关闭。
+    // 需要时在控制台执行 global.debug = true 临时打开（推代码后自动失效）。
+    if (global.debug) {
+        debugDump()
+    }
 })
 
 function roomControl(){

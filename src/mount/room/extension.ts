@@ -5,6 +5,7 @@ import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repai
 import {createBuildTask, getBucketCarryTask, getCarryList, getCoreLinkTransferTask, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
+import {onRemoteDeath} from "@/global/war/remote/l1";
 import {isNpcUser, isRemotePaused} from "@/util/threat";
 
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
@@ -143,6 +144,11 @@ export default class RoomExtension extends Room {
 
     initCreepRecycle(): void {
         for(const creep of this.find(FIND_MY_CREEPS)){
+            // 兼容推代码前已经存在的 creep：记下自然死亡 tick，
+            // 提前死亡（被敌人打死）时 creepRecycle 才能识别出来
+            if (creep.memory.dieAt === undefined && creep.ticksToLive !== undefined) {
+                creep.memory.dieAt = Game.time + creep.ticksToLive
+            }
             this.registEvent({
             triggerTime: Game.time + creep.ticksToLive + 1,
             triggerFunc: "creepRecycle",
@@ -2896,6 +2902,12 @@ export default class RoomExtension extends Room {
                 // 专用运输车绑定的矿点/外矿房：丢了会被当成老车转职，补员也会重复孵化
                 const savedCarrySource = creep.memory.remoteCarrySourceId
                 const savedCarryRoom = creep.memory.remoteCarryRoom
+                // 外矿归因/提前死亡识别字段：重置后会把自然死亡误判成被打死
+                const savedLastRemoteRoom = creep.memory.lastRemoteRoom
+                const savedLastRoom = creep.memory.lastRoom
+                const savedLastRoomAt = creep.memory.lastRoomAt
+                const savedDieAt = creep.memory.dieAt
+                const savedWarReported = creep.memory.warReported
                 delete Memory.creeps[creepName]
                 creep.remember()
                 creep.memory.spawnRoom = this.name
@@ -2916,6 +2928,21 @@ export default class RoomExtension extends Room {
                 if (savedCarrySource) {
                     creep.memory.remoteCarrySourceId = savedCarrySource
                     creep.memory.remoteCarryRoom = savedCarryRoom
+                }
+                if (savedLastRemoteRoom) {
+                    creep.memory.lastRemoteRoom = savedLastRemoteRoom
+                }
+                if (savedLastRoom) {
+                    creep.memory.lastRoom = savedLastRoom
+                }
+                if (savedLastRoomAt !== undefined) {
+                    creep.memory.lastRoomAt = savedLastRoomAt
+                }
+                if (savedDieAt !== undefined) {
+                    creep.memory.dieAt = savedDieAt
+                }
+                if (savedWarReported) {
+                    creep.memory.warReported = true
                 }
                 // 推代码会清空房间事件：睡眠中的 creep 重新挂唤醒事件，否则会一直睡到死
                 if (creep.memory.currentWork?.taskFunc === 'sleep') {
@@ -3262,6 +3289,13 @@ export default class RoomExtension extends Room {
             if (!Game.creeps[creepName]) {
                 // creep 已经死了
                 const memory = Memory.creeps[creepName]
+                // 提前死亡（没活到自然 TTL）= 大概率被敌人打死。只上报事实，
+                // 是否停用外矿由 war L2 决定；主动上报过的事故（warReported）不重复报。
+                if (!memory.warReported
+                    && memory.dieAt !== undefined
+                    && Game.time < memory.dieAt - 20) {
+                    onRemoteDeath(creepName, memory)
+                }
                 const room = Game.rooms[memory.spawnRoom]
                 // 从房间所有任务队列里清除该 creep 的预约（persistent 任务同样要清）
                 if (room && room.memory.creepTask) {
@@ -3367,6 +3401,10 @@ export default class RoomExtension extends Room {
         const creep = Game.creeps[creepName]
         if (!creep) {
             return
+        }
+        // 出生时记下自然死亡 tick：提前死亡（被敌人打死）靠它识别
+        if (creep.memory.dieAt === undefined && creep.ticksToLive !== undefined) {
+            creep.memory.dieAt = Game.time + creep.ticksToLive
         }
         this.registEvent({
             triggerTime: Game.time + creep.ticksToLive + 1,
