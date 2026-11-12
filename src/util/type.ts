@@ -54,6 +54,28 @@ interface ThreatSummary {
     ids: Id<Creep>[]
 }
 
+/**
+ * 外矿 L2 分类：只描述"房间里是什么"，不描述怎么打。
+ * none 干净；harmless 只有无武装敌对；invaderCreep Invader 武装兵；
+ * invaderCore Invader 建筑/控制器保留；playerTroops 真实玩家的兵；
+ * playerControl 真实玩家控制（owner/reserve/建筑）；unknown 无视野。
+ */
+type RemoteCategory =
+    | 'none'
+    | 'harmless'
+    | 'invaderCreep'
+    | 'invaderCore'
+    | 'playerTroops'
+    | 'playerControl'
+    | 'unknown'
+
+/**
+ * 外矿 L2 决策意图，由执行层消费：
+ * counter 反击 Invader creep；avoid 撤退不交战；expedition 准备出征（L3）；
+ * scout 优先侦察；none 不做额外动作。
+ */
+type RemoteResponse = 'none' | 'counter' | 'avoid' | 'expedition' | 'scout'
+
 type CreepRoleConstant = BaseRoleConstant | AdvancedRoleConstant
 
 type BaseRoleConstant =

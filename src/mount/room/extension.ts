@@ -4,9 +4,10 @@ import log from "@/util/log";
 import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, warSetting, workerSetting} from "@/setting";
 import {createBuildTask, getBucketCarryTask, getCarryList, getCoreLinkTransferTask, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
-import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms, recordRoomIntel} from "@/global/autoplan/remotePlan";
+import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms} from "@/global/autoplan/remotePlan";
 import {onRemoteDeath} from "@/global/war/remote/l1";
-import {isNpcUser, isRemotePaused} from "@/util/threat";
+import {assessRemoteVision} from "@/global/war/remote/l2";
+import {isRemotePaused} from "@/util/threat";
 
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
 // 会严重低估升级速度，实测 diff=1 把下一次检查排到了 3 万多 tick 之后，
@@ -686,7 +687,7 @@ export default class RoomExtension extends Room {
             if (!state) {
                 continue
             }
-            // 停用房也要在有视野时复盘：recordRoomIntel 判安全会自动重开，
+            // 停用房也要在有视野时复盘：L2 判安全会自动重开，
             // 敌人在场则保持停用。不需要额外的定时扫描，侦察兵轮巡即可覆盖无视野的房。
             const remoteRoom = Game.rooms[roomName]
             if (remoteRoom) {
@@ -2045,14 +2046,10 @@ export default class RoomExtension extends Room {
         const desiredRooms = new Map<string, number>()
         for (const roomName in plan.rooms) {
             const intel = Memory.mapIntel?.[roomName]
-            if (!intel || !isRemotePaused(intel) || intel.threatLevel !== 'raid') {
-                continue
-            }
-            // 有主 / 被别的真实玩家 reserve：不主动开战。
-            // 自己 claimer 保留的房要照打：否则所有自留外矿都进不了反击名单。
-            const me = this.controller?.owner?.username
-            if (intel.owner
-                || (intel.reservation && !isNpcUser(intel.reservation) && intel.reservation !== me)) {
+            // 分类和"该不该打"由 L2 决定：只有 invaderCreep 会给 counter。
+            // 执行层目前仍只有 raid 级的 5 ATTACK 小队，assault/siege 等 L3 扩编再打。
+            if (!intel || !isRemotePaused(intel) || intel.response !== 'counter'
+                || intel.threatLevel !== 'raid') {
                 continue
             }
             const dps = intel.hostileDps ?? 0
@@ -2494,7 +2491,7 @@ export default class RoomExtension extends Room {
             }
         }
         // 顺带刷新情报：有主/被他人 reserve/有敌对时会把该外矿房停用
-        recordRoomIntel(this.name, remoteRoom)
+        assessRemoteVision(this.name, remoteRoom, 'cache')
     }
 
     /**
@@ -4529,7 +4526,7 @@ export default class RoomExtension extends Room {
         if (!this.controller || !this.controller.my) {
             return
         }
-        // 推代码后 creep 可能先于 room.init 跑（recordRoomIntel 会调到这里），
+        // 推代码后 creep 可能先于 room.init 跑（L2 评估会调到这里），
         // global.room 还没建好就先跳过，下一次 initBuildList 会补
         if (!global.room[this.name]) {
             return

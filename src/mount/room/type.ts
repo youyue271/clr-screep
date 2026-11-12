@@ -68,6 +68,24 @@ interface MapIntel {
     // 一队全灭后要等 counterReinforceTicks 才整队补派，最多 counterMaxAttempts 队
     counterAt?: number
     counterAttempts?: number
+    // L2 分类结果和决策意图：执行层只读 response，不再自己推导
+    category?: RemoteCategory
+    response?: RemoteResponse
+    // 视野里的敌对阵营（调试用）：玩家 / Invader
+    hostileUsers?: string[]
+    hostileStructureIds?: Id<Structure>[]
+    // Invader core：等级和剩余 hits，出征层以后据此评估
+    coreId?: Id<StructureInvaderCore>
+    coreLevel?: number
+    coreHits?: number
+    // 无视野时的伤害证据（丢部件/提前死亡）。suspicionSince 也视为暂停
+    suspicionSince?: number
+    suspicionLastAt?: number
+    suspicionCount?: number
+    // 这个 tick 已经做过一次视野分类，同 tick 重复调用直接跳过
+    assessedAt?: number
+    // 最近一次决策，调试/可视化用
+    lastDecision?: { tick: number, category: RemoteCategory, response: RemoteResponse, reason: string }
 }
 
 /**

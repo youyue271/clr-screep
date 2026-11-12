@@ -103,11 +103,12 @@ export function hasArmedHostile(room: Room): boolean {
 }
 
 /**
- * 情报里这一轮武装敌对还没结束（外矿暂停补员/出货）。
- * hostileSince 由 recordRoomIntel 在清场后连续 hostileCalmTicks 才删除。
+ * 情报里这一轮骚扰还没结束（外矿暂停补员/出货）。
+ * hostileSince 是确认敌情，suspicionSince 是无视野时的伤害证据；
+ * 两者都由 L2 写，清场/侦察确认干净后才会删除。
  */
 export function isRemotePaused(intel: MapIntel | undefined): boolean {
-    return !!intel && intel.hostileSince !== undefined
+    return !!intel && (intel.hostileSince !== undefined || intel.suspicionSince !== undefined)
 }
 
 /**

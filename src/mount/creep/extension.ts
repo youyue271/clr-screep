@@ -1,7 +1,7 @@
 import { getEnergyTask } from "@/task/roomTask";
 import { containerWatermark, remoteSetting } from "@/setting";
 import log from "@/util/log";
-import { recordRoomIntel } from "@/global/autoplan/remotePlan";
+import { assessRemoteVision } from "@/global/war/remote/l2";
 import { classifyThreat, isRemotePaused } from "@/util/threat";
 import { onRemoteHarvestSignal, rememberRemoteTarget } from "@/global/war/remote/l1";
 import { ACTION_BLOCKED } from "./actionGuard";
@@ -1475,7 +1475,7 @@ export default class CreepExtension extends Creep {
         if (target) {
             if (this.room.name === target) {
                 this.say('👁️侦察完毕')
-                recordRoomIntel(homeRoom, this.room)
+                assessRemoteVision(homeRoom, this.room, 'creep')
                 delete this.memory.scoutTarget
                 return false
             }
@@ -1510,7 +1510,7 @@ export default class CreepExtension extends Creep {
 
     /**
      * 常驻侦察兵轮巡：挑情报最老（scoutedAt 最小）的计划房，停用房也一起复查。
-     * 自动重开靠它兜底：到站后 scout() 会调 recordRoomIntel，安全就恢复 enabled。
+     * 自动重开靠它兜底：到站后 scout() 会调 L2 评估，安全就恢复 enabled。
      * 没有 scoutedAt 的房视为 0，优先探。
      */
     private pickScoutTarget(homeRoom: string): string | undefined {
@@ -1700,7 +1700,7 @@ export default class CreepExtension extends Creep {
             return false
         }
         // 有主、被保留满等：刷新情报后放弃，外部脚本可以重新写入
-        recordRoomIntel(homeRoom, this.room)
+        assessRemoteVision(homeRoom, this.room, 'creep')
         delete Memory.claimPlan?.[roomName]
         delete this.memory.claimerTarget
         return false
@@ -1723,7 +1723,7 @@ export default class CreepExtension extends Creep {
         if (!controller) {
             // highway / 无 controller 房：记下"没矿"让计划与补员逻辑自愈，解绑回家。
             // 不能只 return —— 停在出口格上会被引擎每 tick 弹回隔壁房（W34S50 实测）。
-            recordRoomIntel(homeRoom, this.room)
+            assessRemoteVision(homeRoom, this.room, 'creep')
             delete this.memory.claimerTarget
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom)
@@ -1732,7 +1732,7 @@ export default class CreepExtension extends Creep {
         }
         if (controller.owner) {
             // 已经有主：刷新情报（会写 unsafe/停用），下一 tick 由 isReserveTargetValid 解绑
-            recordRoomIntel(homeRoom, this.room)
+            assessRemoteVision(homeRoom, this.room, 'creep')
             return false
         }
         const res = this.reserveController(controller)
@@ -1758,7 +1758,7 @@ export default class CreepExtension extends Creep {
             return false
         }
         // 被别人保留满/无权限：用实时状态刷情报，避免反复尝试
-        recordRoomIntel(homeRoom, this.room)
+        assessRemoteVision(homeRoom, this.room, 'creep')
         return false
     }
 
@@ -1871,9 +1871,11 @@ export default class CreepExtension extends Creep {
                 return
             }
         }
-        // 目标丢了、外矿总开关关了或这一轮骚扰已经结束：回家等 TTL/回收
+        const intel = target ? Memory.mapIntel?.[target] : undefined
+        // 目标丢了、外矿总开关关了、这一轮骚扰结束，或 L2 已改判（玩家介入/只剩基地）：
+        // 回家等 TTL/回收。分类和交战许可都由 L2 给，这里只认 response。
         if (!target || Memory.remotePlan?.[homeRoom]?.enabled === false
-            || !isRemotePaused(Memory.mapIntel?.[target])) {
+            || !isRemotePaused(intel) || intel?.response !== 'counter') {
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom)
             }
@@ -1888,8 +1890,13 @@ export default class CreepExtension extends Creep {
             }
             return
         }
-        // 到站刷新情报：维持 hostileLastSeen，敌人增援升级时立刻能看出来
-        recordRoomIntel(homeRoom, this.room)
+        // 到站刷新情报：维持 hostileLastSeen，敌人增援/玩家介入时立刻能看出来
+        assessRemoteVision(homeRoom, this.room, 'attacker')
+        if (Memory.mapIntel?.[target]?.response !== 'counter') {
+            // L2 到站后改判（出现玩家部队/只剩 Invader 基地）：停止交战
+            this.moveToRoom(homeRoom)
+            return
+        }
         const hostiles = this.room.find(FIND_HOSTILE_CREEPS)
         const threat = classifyThreat(hostiles)
         if (threat.level === 'assault' || threat.level === 'siege') {

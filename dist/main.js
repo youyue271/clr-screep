@@ -3458,6 +3458,10 @@ const warSetting = {
     // 同一轮骚扰最多派几队；打光后等 reinforceTicks 再整队补派
     counterMaxAttempts: 3,
     counterReinforceTicks: 300,
+    // 看不到目标房时的伤害证据（丢部件/提前死亡）：
+    // 窗口内累计到这个次数才暂停外矿，单次只提前派侦察
+    suspicionWindow: 300,
+    suspicionLimit: 2,
 };
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
@@ -3994,25 +3998,12 @@ function classifyThreat(creeps) {
     return summary;
 }
 /**
- * 有攻击能力（含 CLAIM 抢控制器）的敌人才算威胁。
- * 纯 WORK 矿工、运输车、没有攻击部件的侦察兵不算。
- */
-function isArmedThreat(summary) {
-    return summary.level !== 'none' && summary.level !== 'harmless';
-}
-/**
- * 弱敌：无 HEAL、数量/总 DPS 在阈值内。
- * 现在先不反击，但外矿同样要撤离；下一批交给反击队。
- */
-function isWeakThreat(summary) {
-    return summary.level === 'raid';
-}
-/**
- * 情报里这一轮武装敌对还没结束（外矿暂停补员/出货）。
- * hostileSince 由 recordRoomIntel 在清场后连续 hostileCalmTicks 才删除。
+ * 情报里这一轮骚扰还没结束（外矿暂停补员/出货）。
+ * hostileSince 是确认敌情，suspicionSince 是无视野时的伤害证据；
+ * 两者都由 L2 写，清场/侦察确认干净后才会删除。
  */
 function isRemotePaused(intel) {
-    return !!intel && intel.hostileSince !== undefined;
+    return !!intel && (intel.hostileSince !== undefined || intel.suspicionSince !== undefined);
 }
 /**
  * NPC 阵营的用户名。反击队只清 NPC/野生敌对，
@@ -4023,131 +4014,193 @@ function isNpcUser(username) {
     return !!username && npcUsers.indexOf(username) >= 0;
 }
 
-/**
- * highway 通道房：房间名坐标能被 10 整除（如 W34S50、W40S49）。
- * 这类房没有 controller、没有 source，不能占领/保留；
- * 早期规划对"没探过"的相邻房一律当候选，必须靠房名先挡掉。
- */
-function isHighwayRoom(roomName) {
-    const m = /^([WE])(\d+)([NS])(\d+)$/.exec(roomName);
-    if (!m) {
-        return false;
+/** L1 信号入口：有目标房视野就走正常分类，看不到才累积伤害证据 */
+function callRemoteL2(report) {
+    const room = report.vision && report.observedRoom === report.targetRoom
+        ? Game.rooms[report.observedRoom]
+        : undefined;
+    if (room) {
+        assessRemoteVision(report.homeRoom, room, `l1:${report.signal.kind}`);
+        return;
     }
-    return parseInt(m[2], 10) % 10 === 0 || parseInt(m[4], 10) % 10 === 0;
+    noteSuspicion(report);
 }
 /**
- * 清掉计划里已经确定没有源的房（highway / 侦察确认无 source）。
- * 早期规划先于侦察，未知房会先占坑；探明后必须能自愈，
- * 否则会一直占 maxRooms 名额，并让 claimer 去一个没有 controller 的房常驻
- * —— 在出口格上原地打转（W34S50 实测）。
- * 返回被清掉的房名，方便调用方记日志/测试。
+ * 视野入口：scout/claimer/attacker 到站、主房 10 tick 扫描都会走这里。
+ * 同一 tick 多次调用只认第一次，避免 Memory 重复写。
  */
-function pruneSourcelessRemoteRooms(plan, intelMap) {
-    var _a;
-    const removed = [];
-    for (const roomName in plan.rooms) {
-        if (isHighwayRoom(roomName)) {
-            delete plan.rooms[roomName];
-            removed.push(roomName);
-            continue;
-        }
-        const sources = (_a = intelMap === null || intelMap === void 0 ? void 0 : intelMap[roomName]) === null || _a === void 0 ? void 0 : _a.sources;
-        if (Array.isArray(sources) && sources.length === 0) {
-            delete plan.rooms[roomName];
-            removed.push(roomName);
-        }
-    }
-    return removed;
-}
-/**
- * 外矿房自动规划：
- * - 相邻房用 Game.map.describeExits 拿，不需要视野、开销很小
- * - 已知 unsafe（有主/被他人 reserve/有敌对）的房直接排除
- * - 已知有矿的优先，未知的其次（交给侦察兵去探）
- * - 每个主房最多 remoteSetting.maxRooms 个
- */
-function planRemoteRooms(homeRoomName) {
-    var _a, _b, _c, _d, _e;
-    const exits = Game.map.describeExits(homeRoomName);
-    if (!exits) {
-        return [];
-    }
-    const intelMap = (_a = Memory.mapIntel) !== null && _a !== void 0 ? _a : {};
-    const seen = {};
-    const candidates = [];
-    for (const dir in exits) {
-        const name = exits[dir];
-        if (!name || seen[name] || isHighwayRoom(name)) {
-            continue;
-        }
-        seen[name] = true;
-        if (((_b = Game.map.getRoomStatus(name)) === null || _b === void 0 ? void 0 : _b.status) === 'closed') {
-            continue;
-        }
-        const intel = intelMap[name];
-        if (intel === null || intel === void 0 ? void 0 : intel.unsafe) {
-            continue;
-        }
-        const room = Game.rooms[name];
-        if ((_c = room === null || room === void 0 ? void 0 : room.controller) === null || _c === void 0 ? void 0 : _c.my) {
-            continue;
-        }
-        const sourceCount = (_e = (_d = intel === null || intel === void 0 ? void 0 : intel.sources) === null || _d === void 0 ? void 0 : _d.length) !== null && _e !== void 0 ? _e : -1;
-        if (sourceCount === 0) {
-            // 探明过但没有矿，不值得占外矿名额
-            continue;
-        }
-        candidates.push({
-            name,
-            // 已知 2 矿 > 已知 1 矿 > 未知
-            score: sourceCount >= 2 ? 3 : sourceCount === 1 ? 2 : 1,
-        });
-    }
-    candidates.sort((a, b) => b.score - a.score);
-    return candidates.map(item => item.name).slice(0, remoteSetting.maxRooms);
-}
-/**
- * 把一次视野里看到的外矿房信息写进 Memory.mapIntel，并同步 plan 状态。
- * 有主 / 被别人 reserve / 有敌对 → 停用该外矿房；
- * 已经是我们自己的房 → 从 plan 移除；安全 → 填 sources，交给采集流程。
- */
-function recordRoomIntel(homeRoomName, room) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m;
+function assessRemoteVision(homeRoom, room, source = 'vision') {
+    var _a, _b, _c, _d;
     if (!Memory.mapIntel) {
         Memory.mapIntel = {};
     }
     const intel = (_a = Memory.mapIntel[room.name]) !== null && _a !== void 0 ? _a : (Memory.mapIntel[room.name] = {});
-    const me = (_d = (_c = (_b = Game.rooms[homeRoomName]) === null || _b === void 0 ? void 0 : _b.controller) === null || _c === void 0 ? void 0 : _c.owner) === null || _d === void 0 ? void 0 : _d.username;
+    if (intel.assessedAt === Game.time) {
+        return;
+    }
+    const me = (_d = (_c = (_b = Game.rooms[homeRoom]) === null || _b === void 0 ? void 0 : _b.controller) === null || _c === void 0 ? void 0 : _c.owner) === null || _d === void 0 ? void 0 : _d.username;
+    const assessment = assessRoom(room, me);
+    applyAssessment(homeRoom, room, assessment, me, source);
+}
+function assessRoom(room, me) {
+    var _a, _b, _c;
+    const controller = room.controller;
+    const owner = (_a = controller === null || controller === void 0 ? void 0 : controller.owner) === null || _a === void 0 ? void 0 : _a.username;
+    const reservation = (_b = controller === null || controller === void 0 ? void 0 : controller.reservation) === null || _b === void 0 ? void 0 : _b.username;
+    const creeps = room.find(FIND_HOSTILE_CREEPS);
+    const structures = room.find(FIND_HOSTILE_STRUCTURES);
+    const threat = classifyThreat(creeps);
+    const users = [];
+    let playerCreeps = false;
+    let npcArmed = false;
+    for (const creep of creeps) {
+        const user = (_c = creep.owner) === null || _c === void 0 ? void 0 : _c.username;
+        if (user && users.indexOf(user) < 0) {
+            users.push(user);
+        }
+        if (!user || !isNpcUser(user)) {
+            // 没 owner 的 hostile creep 当玩家处理，保守
+            playerCreeps = true;
+        }
+        else if (isArmedCreep(creep)) {
+            npcArmed = true;
+        }
+    }
+    let playerStructure;
+    let core;
+    for (const structure of structures) {
+        const user = ownerOf(structure);
+        if (user && users.indexOf(user) < 0) {
+            users.push(user);
+        }
+        if (structure.structureType === STRUCTURE_INVADER_CORE) {
+            core = structure;
+        }
+        else if (!user || !isNpcUser(user)) {
+            playerStructure = structure;
+        }
+    }
+    const base = { threat, creeps, structures, users, owner, reservation, core };
+    const ownerIsPlayer = !!owner && owner !== me && !isNpcUser(owner);
+    const reservationIsPlayer = !!reservation && reservation !== me && !isNpcUser(reservation);
+    const npcReservation = !!reservation && reservation !== me && isNpcUser(reservation);
+    // 优先级：玩家控制 > 玩家部队 > Invader 部队 > Invader 建筑/保留 > 无害 > 干净。
+    // 只要房里混有真实玩家的东西，就按玩家处理，不会因为同房有 invader 就去打。
+    if (ownerIsPlayer) {
+        return Object.assign(Object.assign({}, base), { category: 'playerControl', response: 'avoid', reason: `owner:${owner}` });
+    }
+    if (reservationIsPlayer) {
+        return Object.assign(Object.assign({}, base), { category: 'playerControl', response: 'avoid', reason: `reserve:${reservation}` });
+    }
+    if (playerStructure) {
+        return Object.assign(Object.assign({}, base), { category: 'playerControl', response: 'avoid', reason: `structure:${ownerOf(playerStructure)}` });
+    }
+    if (playerCreeps) {
+        return Object.assign(Object.assign({}, base), { category: 'playerTroops', response: 'avoid', reason: `creeps:${users.join(',')}` });
+    }
+    if (npcArmed) {
+        return Object.assign(Object.assign({}, base), { category: 'invaderCreep', response: 'counter', reason: `invader:${threat.level}` });
+    }
+    if (core || npcReservation) {
+        return Object.assign(Object.assign({}, base), { category: 'invaderCore', response: 'expedition', reason: core ? `core:${core.level}` : `invaderReserve` });
+    }
+    if (creeps.length) {
+        return Object.assign(Object.assign({}, base), { category: 'harmless', response: 'none', reason: `harmless:${threat.count}` });
+    }
+    return Object.assign(Object.assign({}, base), { category: 'none', response: 'none', reason: 'clean' });
+}
+function applyAssessment(homeRoom, room, a, me, source) {
+    const intel = Memory.mapIntel[room.name];
+    const now = Game.time;
     const controller = room.controller;
     const sources = room.find(FIND_SOURCES);
-    // 按实际剩余战力分级：纯矿工/运输车不算威胁，小股武装先撤离，
-    // 有 HEAL/高 DPS/拆墙能力才停用外矿。
-    const threat = classifyThreat(room.find(FIND_HOSTILE_CREEPS));
-    const armed = isArmedThreat(threat);
-    const weak = isWeakThreat(threat);
-    intel.scoutedAt = Game.time;
-    intel.sources = sources.map(source => source.id);
-    intel.owner = (_e = controller === null || controller === void 0 ? void 0 : controller.owner) === null || _e === void 0 ? void 0 : _e.username;
-    intel.reservation = (_f = controller === null || controller === void 0 ? void 0 : controller.reservation) === null || _f === void 0 ? void 0 : _f.username;
-    intel.hostile = threat.count > 0;
-    intel.threatLevel = threat.level;
-    intel.hostileCount = threat.count;
-    intel.hostileDps = threat.dps;
-    if (armed) {
+    // 视野事实
+    intel.scoutedAt = now;
+    intel.sources = sources.map(item => item.id);
+    intel.owner = a.owner;
+    intel.reservation = a.reservation;
+    intel.hostile = a.creeps.length > 0;
+    intel.threatLevel = a.threat.level;
+    intel.hostileCount = a.threat.count;
+    intel.hostileDps = a.threat.dps;
+    intel.category = a.category;
+    intel.response = a.response;
+    intel.assessedAt = now;
+    if (a.users.length) {
+        intel.hostileUsers = a.users;
+    }
+    else {
+        delete intel.hostileUsers;
+    }
+    if (a.structures.length) {
+        intel.hostileStructureIds = a.structures.map(item => item.id);
+    }
+    else {
+        delete intel.hostileStructureIds;
+    }
+    if (a.core) {
+        intel.coreId = a.core.id;
+        intel.coreLevel = a.core.level;
+        intel.coreHits = a.core.hits;
+    }
+    else {
+        delete intel.coreId;
+        delete intel.coreLevel;
+        delete intel.coreHits;
+    }
+    intel.lastDecision = {
+        tick: now,
+        category: a.category,
+        response: a.response,
+        reason: `${source}:${a.reason}`,
+    };
+    // 玩家控制 / Invader 建筑：不让自动规划再把这个房选成外矿
+    intel.unsafe = a.category === 'playerControl' || a.category === 'invaderCore';
+    // 有视野时用真实保留剩余校正：不是我们的保留就清掉
+    if ((controller === null || controller === void 0 ? void 0 : controller.reservation) && controller.reservation.username === me) {
+        intel.reservedUntil = now + controller.reservation.ticksToEnd;
+    }
+    else {
+        delete intel.reservedUntil;
+    }
+    // 干净视野解除伤害证据；怀疑触发的暂停没有 hostileLastSeen，直接放行
+    const clean = a.category === 'none' || a.category === 'harmless';
+    if (clean) {
+        delete intel.suspicionSince;
+        delete intel.suspicionLastAt;
+        delete intel.suspicionCount;
+        if (intel.hostileSince !== undefined && intel.hostileLastSeen === undefined) {
+            delete intel.hostileSince;
+        }
+    }
+    updateEpisode(intel, a.category, now);
+    applyPlanState(homeRoom, room, a, sources);
+}
+/**
+ * 骚扰 episode：暂停类分类一出现就开 episode，连续 hostileCalmTicks
+ * 没再看到才解除。反击次数/冷却只在新 episode 开始时重置。
+ */
+function updateEpisode(intel, category, now) {
+    if (isPauseCategory(category)) {
         if (intel.hostileSince === undefined) {
-            // 新一轮骚扰：反击队的次数/冷却重新算
-            intel.hostileSince = Game.time;
+            intel.hostileSince = now;
             delete intel.counterAt;
             delete intel.counterAttempts;
         }
-        intel.hostileLastSeen = Game.time;
-        // 武装敌对还在：安排下一次复查。弱敌复查得勤一点，
-        // 强敌停用后隔久一点再回来看，避免侦察兵反复送死。
-        intel.retryAt = Game.time + (weak ? warSetting.hostileRecheckTicks : warSetting.rescoutTicks);
+        intel.hostileLastSeen = now;
+        intel.retryAt = now + (category === 'playerControl'
+            ? warSetting.rescoutTicks
+            : warSetting.hostileRecheckTicks);
+        return;
     }
-    else if (intel.hostileLastSeen !== undefined
-        && Game.time - intel.hostileLastSeen >= warSetting.hostileCalmTicks) {
-        // 连续这么久没看到武装敌对：这一轮骚扰结束，外矿恢复、复探标记清掉
+    if (intel.hostileSince === undefined) {
+        if (category === 'none' || category === 'harmless') {
+            delete intel.retryAt;
+        }
+        return;
+    }
+    if (intel.hostileLastSeen !== undefined
+        && now - intel.hostileLastSeen >= warSetting.hostileCalmTicks) {
         delete intel.hostileSince;
         delete intel.hostileLastSeen;
         delete intel.hostileCount;
@@ -4156,96 +4209,111 @@ function recordRoomIntel(homeRoomName, room) {
         delete intel.counterAt;
         delete intel.counterAttempts;
     }
-    // 弱敌不停用外矿：产线留着，先让 crew 撤离避战，下一批再交给反击队。
-    // 强敌 / 有主 / 被外人 reserve 才 unsafe。
-    intel.unsafe = (!weak && armed)
-        || !!((controller === null || controller === void 0 ? void 0 : controller.owner) && !controller.my)
-        || !!((controller === null || controller === void 0 ? void 0 : controller.reservation) && controller.reservation.username !== me);
-    // 有视野时用真实保留剩余校正：不是我们的保留就清掉，
-    // 避免别人抢走后 claimer 还按旧时间不去续
-    if ((controller === null || controller === void 0 ? void 0 : controller.reservation) && controller.reservation.username === me) {
-        intel.reservedUntil = Game.time + controller.reservation.ticksToEnd;
-    }
-    else {
-        delete intel.reservedUntil;
-    }
-    const plan = (_g = Memory.remotePlan) === null || _g === void 0 ? void 0 : _g[homeRoomName];
-    const state = (_h = plan === null || plan === void 0 ? void 0 : plan.rooms) === null || _h === void 0 ? void 0 : _h[room.name];
+}
+/**
+ * 计划状态：玩家控制才停用房；Invader 场景只暂停生产，计划保留，
+ * 让反击/出征意图有房可用。已占下来的房从外矿计划移除。
+ */
+function applyPlanState(homeRoom, room, a, sources) {
+    var _a, _b, _c, _d;
+    const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom];
+    const state = (_b = plan === null || plan === void 0 ? void 0 : plan.rooms) === null || _b === void 0 ? void 0 : _b[room.name];
     if (!plan || !plan.rooms || !state) {
         return;
     }
-    if (controller === null || controller === void 0 ? void 0 : controller.my) {
-        // 已经是我们自己的房间，不再算外矿
-        (_j = Game.rooms[homeRoomName]) === null || _j === void 0 ? void 0 : _j.removeRemoteCarryTasksOfRoom(room.name);
+    const home = Game.rooms[homeRoom];
+    if ((_c = room.controller) === null || _c === void 0 ? void 0 : _c.my) {
+        home === null || home === void 0 ? void 0 : home.removeRemoteCarryTasksOfRoom(room.name);
         delete plan.rooms[room.name];
         return;
     }
-    if (intel.unsafe) {
+    if (a.category === 'playerControl') {
         if (state.enabled !== false) {
-            // 停用是明确决定：立刻清掉回运任务，不等 10 tick 扫描
-            (_k = Game.rooms[homeRoomName]) === null || _k === void 0 ? void 0 : _k.removeRemoteCarryTasksOfRoom(room.name);
-            // 外矿停用：重算道路分段，pending 里不再保留这个房的路
-            (_l = Game.rooms[homeRoomName]) === null || _l === void 0 ? void 0 : _l.syncRoadPlan();
+            home === null || home === void 0 ? void 0 : home.removeRemoteCarryTasksOfRoom(room.name);
+            home === null || home === void 0 ? void 0 : home.syncRoadPlan();
         }
         state.enabled = false;
         return;
     }
     const wasEnabled = state.enabled === true;
     state.enabled = true;
-    const sourceStates = (_m = state.sources) !== null && _m !== void 0 ? _m : (state.sources = {});
+    const sourceStates = (_d = state.sources) !== null && _d !== void 0 ? _d : (state.sources = {});
     for (const source of sources) {
         if (!sourceStates[source.id]) {
             sourceStates[source.id] = {};
         }
     }
-    // 外矿房开启事件：有视野时直接看 source 旁是否已经有 container，
-    // 有就挂回运任务；没有就交给外矿 harvester 第一次看到 container 时再挂。
-    if (!wasEnabled) {
-        const homeRoom = Game.rooms[homeRoomName];
-        if (homeRoom) {
-            for (const source of sources) {
-                const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
-                    filter: (object) => object.structureType === STRUCTURE_CONTAINER
-                })[0];
-                if (!container) {
-                    continue;
-                }
-                const entry = sourceStates[source.id];
-                entry.containerId = container.id;
-                entry.containerPos = [container.pos.x, container.pos.y];
-                homeRoom.registerRemoteCarryTask(room.name, source.id, container.id);
+    // 从停用状态恢复：把矿点旁已有 container 的回运任务挂回去
+    if (!wasEnabled && home) {
+        for (const source of sources) {
+            const container = source.pos.findInRange(FIND_STRUCTURES, 1, {
+                filter: (object) => object.structureType === STRUCTURE_CONTAINER,
+            })[0];
+            if (!container) {
+                continue;
             }
-            // 外矿重新启用：remoteLinkPos 可能还在，道路目标集合变了，重算一次
-            homeRoom.syncRoadPlan();
+            const entry = sourceStates[source.id];
+            entry.containerId = container.id;
+            entry.containerPos = [container.pos.x, container.pos.y];
+            home.registerRemoteCarryTask(room.name, source.id, container.id);
         }
+        home.syncRoadPlan();
     }
 }
-
 /**
- * L2：拿到 L1 的事实后做分类和决策。
- *
- * 目前只做一个兼容适配器，保持旧行为：有视野、且确实看见敌人/确认被占时，
- * 写回现有情报系统（暂停/停用/清任务都由 recordRoomIntel 完成）。
- * 真正的分类（invader 兵/基地、别的玩家 claimer 等）以后在这里补。
+ * 看不到目标房时的伤害证据（harvester 丢部件 / creep 提前死亡）：
+ * 单次只提前侦察；窗口内累计够数才暂停生产。
  */
-function callRemoteL2(report) {
-    if (!report.vision) {
-        return;
+function noteSuspicion(report) {
+    var _a, _b, _c;
+    if (!Memory.mapIntel) {
+        Memory.mapIntel = {};
     }
-    // 走廊/主房里看到的敌人不能直接算到外矿房头上；L1 在主房时会自动改探外矿房
-    if (report.observedRoom !== report.targetRoom) {
-        return;
+    const intel = (_a = Memory.mapIntel[report.targetRoom]) !== null && _a !== void 0 ? _a : (Memory.mapIntel[report.targetRoom] = {});
+    const now = Game.time;
+    if (intel.suspicionLastAt !== undefined
+        && now - intel.suspicionLastAt > warSetting.suspicionWindow) {
+        delete intel.suspicionSince;
+        delete intel.suspicionCount;
     }
-    // 纯死亡/部件损失但视野干净：先不动计划和情报。
-    // 这类"可疑但有视野"的判定留给 L2 正式实现，避免误重开/误停用。
-    if (report.signal.kind !== 'occupied' && !report.hasHostile) {
-        return;
+    const count = ((_b = intel.suspicionCount) !== null && _b !== void 0 ? _b : 0) + 1;
+    intel.suspicionCount = count;
+    intel.suspicionLastAt = now;
+    if (intel.suspicionSince === undefined) {
+        intel.suspicionSince = now;
     }
-    const room = Game.rooms[report.observedRoom];
-    if (!room) {
-        return;
+    // 侦察兵优先去看这个房，确认到底有没有敌人
+    if (intel.retryAt === undefined || intel.retryAt > now) {
+        intel.retryAt = now;
     }
-    recordRoomIntel(report.homeRoom, room);
+    const hadEpisode = intel.hostileSince !== undefined;
+    const escalated = count >= warSetting.suspicionLimit;
+    if (escalated && !hadEpisode) {
+        intel.hostileSince = now;
+    }
+    // 已经确认过敌情（反击/撤退进行中）时别把 response 改回 scout
+    if (!hadEpisode || intel.response === undefined || intel.response === 'none') {
+        intel.response = 'scout';
+    }
+    intel.lastDecision = {
+        tick: now,
+        category: 'unknown',
+        response: (_c = intel.response) !== null && _c !== void 0 ? _c : 'scout',
+        reason: `${report.signal.kind}@${report.observedRoom}${escalated ? ` x${count}` : ''}`,
+    };
+}
+const pauseCategories = ['playerControl', 'playerTroops', 'invaderCreep', 'invaderCore'];
+function isPauseCategory(category) {
+    return pauseCategories.indexOf(category) >= 0;
+}
+function isArmedCreep(creep) {
+    return creep.getActiveBodyparts(ATTACK) > 0
+        || creep.getActiveBodyparts(RANGED_ATTACK) > 0
+        || creep.getActiveBodyparts(CLAIM) > 0;
+}
+function ownerOf(structure) {
+    var _a;
+    return (_a = structure.owner) === null || _a === void 0 ? void 0 : _a.username;
 }
 
 /** 离开外矿房后多少 tick 内死亡仍然归因到这次外矿任务 */
@@ -5935,7 +6003,7 @@ class CreepExtension extends Creep {
         if (target) {
             if (this.room.name === target) {
                 this.say('👁️侦察完毕');
-                recordRoomIntel(homeRoom, this.room);
+                assessRemoteVision(homeRoom, this.room, 'creep');
                 delete this.memory.scoutTarget;
                 return false;
             }
@@ -5969,7 +6037,7 @@ class CreepExtension extends Creep {
     }
     /**
      * 常驻侦察兵轮巡：挑情报最老（scoutedAt 最小）的计划房，停用房也一起复查。
-     * 自动重开靠它兜底：到站后 scout() 会调 recordRoomIntel，安全就恢复 enabled。
+     * 自动重开靠它兜底：到站后 scout() 会调 L2 评估，安全就恢复 enabled。
      * 没有 scoutedAt 的房视为 0，优先探。
      */
     pickScoutTarget(homeRoom) {
@@ -6160,7 +6228,7 @@ class CreepExtension extends Creep {
             return false;
         }
         // 有主、被保留满等：刷新情报后放弃，外部脚本可以重新写入
-        recordRoomIntel(homeRoom, this.room);
+        assessRemoteVision(homeRoom, this.room, 'creep');
         (_g = Memory.claimPlan) === null || _g === void 0 ? true : delete _g[roomName];
         delete this.memory.claimerTarget;
         return false;
@@ -6183,7 +6251,7 @@ class CreepExtension extends Creep {
         if (!controller) {
             // highway / 无 controller 房：记下"没矿"让计划与补员逻辑自愈，解绑回家。
             // 不能只 return —— 停在出口格上会被引擎每 tick 弹回隔壁房（W34S50 实测）。
-            recordRoomIntel(homeRoom, this.room);
+            assessRemoteVision(homeRoom, this.room, 'creep');
             delete this.memory.claimerTarget;
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom);
@@ -6192,7 +6260,7 @@ class CreepExtension extends Creep {
         }
         if (controller.owner) {
             // 已经有主：刷新情报（会写 unsafe/停用），下一 tick 由 isReserveTargetValid 解绑
-            recordRoomIntel(homeRoom, this.room);
+            assessRemoteVision(homeRoom, this.room, 'creep');
             return false;
         }
         const res = this.reserveController(controller);
@@ -6218,7 +6286,7 @@ class CreepExtension extends Creep {
             return false;
         }
         // 被别人保留满/无权限：用实时状态刷情报，避免反复尝试
-        recordRoomIntel(homeRoom, this.room);
+        assessRemoteVision(homeRoom, this.room, 'creep');
         return false;
     }
     /**
@@ -6317,7 +6385,7 @@ class CreepExtension extends Creep {
      * - 只打有 ATTACK/RANGED_ATTACK/CLAIM 部件的敌人，先打最近的
      */
     counterAttack() {
-        var _a, _b, _c;
+        var _a, _b, _c, _d, _e;
         const homeRoom = this.memory.spawnRoom;
         const target = this.memory.attackerTarget;
         const home = Game.rooms[homeRoom];
@@ -6330,9 +6398,11 @@ class CreepExtension extends Creep {
                 return;
             }
         }
-        // 目标丢了、外矿总开关关了或这一轮骚扰已经结束：回家等 TTL/回收
-        if (!target || ((_b = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom]) === null || _b === void 0 ? void 0 : _b.enabled) === false
-            || !isRemotePaused((_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[target])) {
+        const intel = target ? (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[target] : undefined;
+        // 目标丢了、外矿总开关关了、这一轮骚扰结束，或 L2 已改判（玩家介入/只剩基地）：
+        // 回家等 TTL/回收。分类和交战许可都由 L2 给，这里只认 response。
+        if (!target || ((_c = (_b = Memory.remotePlan) === null || _b === void 0 ? void 0 : _b[homeRoom]) === null || _c === void 0 ? void 0 : _c.enabled) === false
+            || !isRemotePaused(intel) || (intel === null || intel === void 0 ? void 0 : intel.response) !== 'counter') {
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom);
             }
@@ -6348,8 +6418,13 @@ class CreepExtension extends Creep {
             }
             return;
         }
-        // 到站刷新情报：维持 hostileLastSeen，敌人增援升级时立刻能看出来
-        recordRoomIntel(homeRoom, this.room);
+        // 到站刷新情报：维持 hostileLastSeen，敌人增援/玩家介入时立刻能看出来
+        assessRemoteVision(homeRoom, this.room, 'attacker');
+        if (((_e = (_d = Memory.mapIntel) === null || _d === void 0 ? void 0 : _d[target]) === null || _e === void 0 ? void 0 : _e.response) !== 'counter') {
+            // L2 到站后改判（出现玩家部队/只剩 Invader 基地）：停止交战
+            this.moveToRoom(homeRoom);
+            return;
+        }
         const hostiles = this.room.find(FIND_HOSTILE_CREEPS);
         const threat = classifyThreat(hostiles);
         if (threat.level === 'assault' || threat.level === 'siege') {
@@ -7843,6 +7918,90 @@ function checkRoomLevelEvent(time) {
 //     }
 // }
 
+/**
+ * highway 通道房：房间名坐标能被 10 整除（如 W34S50、W40S49）。
+ * 这类房没有 controller、没有 source，不能占领/保留；
+ * 早期规划对"没探过"的相邻房一律当候选，必须靠房名先挡掉。
+ */
+function isHighwayRoom(roomName) {
+    const m = /^([WE])(\d+)([NS])(\d+)$/.exec(roomName);
+    if (!m) {
+        return false;
+    }
+    return parseInt(m[2], 10) % 10 === 0 || parseInt(m[4], 10) % 10 === 0;
+}
+/**
+ * 清掉计划里已经确定没有源的房（highway / 侦察确认无 source）。
+ * 早期规划先于侦察，未知房会先占坑；探明后必须能自愈，
+ * 否则会一直占 maxRooms 名额，并让 claimer 去一个没有 controller 的房常驻
+ * —— 在出口格上原地打转（W34S50 实测）。
+ * 返回被清掉的房名，方便调用方记日志/测试。
+ */
+function pruneSourcelessRemoteRooms(plan, intelMap) {
+    var _a;
+    const removed = [];
+    for (const roomName in plan.rooms) {
+        if (isHighwayRoom(roomName)) {
+            delete plan.rooms[roomName];
+            removed.push(roomName);
+            continue;
+        }
+        const sources = (_a = intelMap === null || intelMap === void 0 ? void 0 : intelMap[roomName]) === null || _a === void 0 ? void 0 : _a.sources;
+        if (Array.isArray(sources) && sources.length === 0) {
+            delete plan.rooms[roomName];
+            removed.push(roomName);
+        }
+    }
+    return removed;
+}
+/**
+ * 外矿房自动规划：
+ * - 相邻房用 Game.map.describeExits 拿，不需要视野、开销很小
+ * - 已知 unsafe（有主/被他人 reserve/有 Invader 建筑）的房直接排除
+ * - 已知有矿的优先，未知的其次（交给侦察兵去探）
+ * - 每个主房最多 remoteSetting.maxRooms 个
+ */
+function planRemoteRooms(homeRoomName) {
+    var _a, _b, _c, _d, _e;
+    const exits = Game.map.describeExits(homeRoomName);
+    if (!exits) {
+        return [];
+    }
+    const intelMap = (_a = Memory.mapIntel) !== null && _a !== void 0 ? _a : {};
+    const seen = {};
+    const candidates = [];
+    for (const dir in exits) {
+        const name = exits[dir];
+        if (!name || seen[name] || isHighwayRoom(name)) {
+            continue;
+        }
+        seen[name] = true;
+        if (((_b = Game.map.getRoomStatus(name)) === null || _b === void 0 ? void 0 : _b.status) === 'closed') {
+            continue;
+        }
+        const intel = intelMap[name];
+        if (intel === null || intel === void 0 ? void 0 : intel.unsafe) {
+            continue;
+        }
+        const room = Game.rooms[name];
+        if ((_c = room === null || room === void 0 ? void 0 : room.controller) === null || _c === void 0 ? void 0 : _c.my) {
+            continue;
+        }
+        const sourceCount = (_e = (_d = intel === null || intel === void 0 ? void 0 : intel.sources) === null || _d === void 0 ? void 0 : _d.length) !== null && _e !== void 0 ? _e : -1;
+        if (sourceCount === 0) {
+            // 探明过但没有矿，不值得占外矿名额
+            continue;
+        }
+        candidates.push({
+            name,
+            // 已知 2 矿 > 已知 1 矿 > 未知
+            score: sourceCount >= 2 ? 3 : sourceCount === 1 ? 2 : 1,
+        });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.map(item => item.name).slice(0, remoteSetting.maxRooms);
+}
+
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
 // 会严重低估升级速度，实测 diff=1 把下一次检查排到了 3 万多 tick 之后，
 // 房间升级后迟迟补不上新等级的工地。封顶后最坏 3000 tick 检查一次。
@@ -8496,7 +8655,7 @@ class RoomExtension extends Room {
             if (!state) {
                 continue;
             }
-            // 停用房也要在有视野时复盘：recordRoomIntel 判安全会自动重开，
+            // 停用房也要在有视野时复盘：L2 判安全会自动重开，
             // 敌人在场则保持停用。不需要额外的定时扫描，侦察兵轮巡即可覆盖无视野的房。
             const remoteRoom = Game.rooms[roomName];
             if (remoteRoom) {
@@ -9836,22 +9995,18 @@ class RoomExtension extends Room {
      * - 每轮骚扰最多派 counterMaxAttempts 队；一队全灭后等 counterReinforceTicks 再整队补派
      */
     refreshCounterSpawn(plan) {
-        var _a, _b, _c, _d, _e, _f;
+        var _a, _b, _c, _d;
         const now = Game.time;
         const desiredRooms = new Map();
         for (const roomName in plan.rooms) {
             const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName];
-            if (!intel || !isRemotePaused(intel) || intel.threatLevel !== 'raid') {
+            // 分类和"该不该打"由 L2 决定：只有 invaderCreep 会给 counter。
+            // 执行层目前仍只有 raid 级的 5 ATTACK 小队，assault/siege 等 L3 扩编再打。
+            if (!intel || !isRemotePaused(intel) || intel.response !== 'counter'
+                || intel.threatLevel !== 'raid') {
                 continue;
             }
-            // 有主 / 被别的真实玩家 reserve：不主动开战。
-            // 自己 claimer 保留的房要照打：否则所有自留外矿都进不了反击名单。
-            const me = (_c = (_b = this.controller) === null || _b === void 0 ? void 0 : _b.owner) === null || _c === void 0 ? void 0 : _c.username;
-            if (intel.owner
-                || (intel.reservation && !isNpcUser(intel.reservation) && intel.reservation !== me)) {
-                continue;
-            }
-            const dps = (_d = intel.hostileDps) !== null && _d !== void 0 ? _d : 0;
+            const dps = (_b = intel.hostileDps) !== null && _b !== void 0 ? _b : 0;
             const need = Math.min(warSetting.counterMaxPerRoom, Math.max(1, Math.ceil(dps / warSetting.counterDpsEach)));
             desiredRooms.set(roomName, need);
         }
@@ -9866,11 +10021,11 @@ class RoomExtension extends Room {
             if (budget <= 0) {
                 break;
             }
-            const intel = (_e = Memory.mapIntel) === null || _e === void 0 ? void 0 : _e[roomName];
+            const intel = (_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[roomName];
             if (!intel) {
                 continue;
             }
-            const attempts = (_f = intel.counterAttempts) !== null && _f !== void 0 ? _f : 0;
+            const attempts = (_d = intel.counterAttempts) !== null && _d !== void 0 ? _d : 0;
             if (attempts >= warSetting.counterMaxAttempts) {
                 continue;
             }
@@ -10281,7 +10436,7 @@ class RoomExtension extends Room {
             }
         }
         // 顺带刷新情报：有主/被他人 reserve/有敌对时会把该外矿房停用
-        recordRoomIntel(this.name, remoteRoom);
+        assessRemoteVision(this.name, remoteRoom, 'cache');
     }
     /**
      * 主房接收外矿能量的目标：storage 优先，没有 storage 就选空位最多的 container，
@@ -12239,7 +12394,7 @@ class RoomExtension extends Room {
         if (!this.controller || !this.controller.my) {
             return;
         }
-        // 推代码后 creep 可能先于 room.init 跑（recordRoomIntel 会调到这里），
+        // 推代码后 creep 可能先于 room.init 跑（L2 评估会调到这里），
         // global.room 还没建好就先跳过，下一次 initBuildList 会补
         if (!global.room[this.name]) {
             return;

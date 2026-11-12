@@ -228,6 +228,10 @@ export const warSetting = {
     // 同一轮骚扰最多派几队；打光后等 reinforceTicks 再整队补派
     counterMaxAttempts: 3,
     counterReinforceTicks: 300,
+    // 看不到目标房时的伤害证据（丢部件/提前死亡）：
+    // 窗口内累计到这个次数才暂停外矿，单次只提前派侦察
+    suspicionWindow: 300,
+    suspicionLimit: 2,
 }
 
 export const towerSetting = {
