@@ -8,6 +8,7 @@ import {
     repairPriority,
     repairSetting,
     storageSetting,
+    towerSetting,
     upgradeSetting,
     upgradeTaskCapacity,
     wallSetting
@@ -201,9 +202,34 @@ export function getOpportunityEnergy(room: Room): MyTask[] {
     }))
 }
 
+/**
+ * 房间当前是否真的缺能量：spawn/extension 没满，或者有塔低于补能阈值。
+ * 全满时从 storage 取能只会取出来再存回去，属于空转。
+ */
+function hasLocalEnergyDemand(room: Room): boolean {
+    if (room.energyAvailable < room.energyCapacityAvailable) {
+        return true
+    }
+    const towers = room.find(FIND_MY_STRUCTURES, {
+        filter: (object: any) => object.structureType === STRUCTURE_TOWER
+    }) as StructureTower[]
+    for (const tower of towers) {
+        if (tower.store.getUsedCapacity(RESOURCE_ENERGY)
+            < tower.store.getCapacity(RESOURCE_ENERGY) * towerSetting.refillThreshold) {
+            return true
+        }
+    }
+    return false
+}
+
 export function getStorageEnergy(room: Room): MyTask[] {
     const storage = room.storage
     if (!storage) {
+        return []
+    }
+    // 没有补能需求时不要把 storage 的能量派出去：空闲 carrier 取出来以后
+    // 没地方可投，只能原样存回 storage（会在 storage 里进进出出空转）
+    if (!hasLocalEnergyDemand(room)) {
         return []
     }
     const energy = storage.store.getUsedCapacity(RESOURCE_ENERGY)
