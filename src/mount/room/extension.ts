@@ -7,6 +7,8 @@ import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms} from "@/global/autoplan/remotePlan";
 import {onRemoteDeath} from "@/global/war/remote/l1";
 import {assessRemoteVision} from "@/global/war/remote/l2";
+import {abortHomeMissions, onMissionMemberDied, reconcileHomeMissions, syncMissions} from "@/global/war/remote/l3";
+import {missionsOf, pendingSpawnCount} from "@/global/war/mission/store";
 import {isRemotePaused} from "@/util/threat";
 
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
@@ -933,8 +935,11 @@ export default class RoomExtension extends Room {
         }
         const plan = Memory.remotePlan?.[this.name]
         if (!plan || plan.enabled === false) {
-            // 外矿总开关关掉：排队的反击队也取消，别在停用后还孵化出去
-            this.cancelStaleCounterSpawnTasks(new Set())
+            // 外矿总开关关掉：任务作废、排队的作战单位取消，别在停用后还孵化出去。
+            // 必须在 return 前主动收尾：下面按计划跑的对账/存续检查都不会执行，
+            // 光取消 spawn 任务会让没人也没排队的任务一直留在 Memory 里。
+            abortHomeMissions(this.name, 'plan-disabled')
+            this.cancelStaleWarSpawnTasks(new Set())
             return
         }
         // 回运任务并发跟着 container 现存能量走，先更新再按最新容量补车
@@ -942,8 +947,13 @@ export default class RoomExtension extends Room {
         // 外矿角色都不进 initSpawn 配额：按"每个矿点一只"在这里补员。
         this.refreshRemoteHarvesterSpawn(plan)
         this.refreshRemoteCarrierSpawn(plan)
-        // 弱敌反击队：按情报派 ATTACK+MOVE，只打没有 HEAL 的小股武装
-        this.refreshCounterSpawn(plan)
+        // L3 作战任务：先对账（建任务），再按缺额排 spawn，最后才做存续对账。
+        // syncMissions 会把"没人也没排队"的任务判成 wiped；推代码后 spawn 队列
+        // 会被 globalReset 清空，如果先 sync 再 refreshWarSpawn，正在集合的任务
+        // 会被误杀。先排队再判存续，重新排上的任务就不会被误判。
+        reconcileHomeMissions(this.name)
+        this.refreshWarSpawn(plan)
+        syncMissions(this.name)
     }
 
     /**
@@ -1929,10 +1939,9 @@ export default class RoomExtension extends Room {
     private refreshRemoteHarvesterSpawn(plan: RemotePlan): void {
         // 旧逻辑留下的、没绑定矿点的孵化任务没法计入任何一个矿点的覆盖，直接清掉
         this.cancelUnboundRemoteSpawnTasks('remoteHarvester')
-        // 首次开矿（还没有 container）仍受富余能量门槛限制；
-        // 已经建好 container 的矿点是稳定产线，harvester 死了必须立刻补，
-        // 不能再等本地 container 涨到高水位——否则外矿会整片停摆。
-        const gate = plan.force || this.remoteGate()
+        // 首次开矿不再看本地富余门槛：remoteHarvester 孵化优先级靠后，
+        // 饿了自然排在本地补员之后，不会影响主房正常运营。
+        // 没有 container 的矿点由 harvester 自己放工地边采边建。
         const validSources = new Set<string>()
         const body = getBody('remoteHarvester', this)
         const spawnTicks = calcSpawnTicks(body)
@@ -1952,10 +1961,6 @@ export default class RoomExtension extends Room {
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin
             for (const sourceId in state.sources ?? {}) {
                 validSources.add(sourceId)
-                const established = !!state.sources[sourceId]?.containerId
-                if (!established && !gate) {
-                    continue
-                }
                 if (this.remoteSourceCovered('remoteHarvester', sourceId, threshold)) {
                     // 有健康的人就清掉多余替补，避免扫描间隔内重复排队
                     this.cancelRemoteSourceSpawnTasks('remoteHarvester', sourceId)
@@ -2035,99 +2040,50 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * 弱敌反击队：情报显示某相邻房这一轮武装敌对是 raid 级（无 HEAL、数量/总 DPS 在阈值内），
-     * 就按 DPS 派 1-2 只 ATTACK+MOVE 去清场。
-     * - 只有弱敌才派；情报过期后敌人升级成 assault/siege 时，attacker 到场会自己撤回来
-     * - 别的玩家 owner/reserve 的房不打，只清 NPC（Invader/Source Keeper）和野生敌对
-     * - 每轮骚扰最多派 counterMaxAttempts 队；一队全灭后等 counterReinforceTicks 再整队补派
+     * L3 作战任务补员：按任务缺额（满编 - 活着 - 排队中）排 attacker。
+     * 任务本身由 L3 建/关，这里只负责孵化；全房同时存在的作战单位
+     * 数量受 counterMaxTotal 限制，避免多房开战把经济掏空。
      */
-    private refreshCounterSpawn(plan: RemotePlan): void {
-        const now = Game.time
-        const desiredRooms = new Map<string, number>()
-        for (const roomName in plan.rooms) {
-            const intel = Memory.mapIntel?.[roomName]
-            // 分类和"该不该打"由 L2 决定：只有 invaderCreep 会给 counter。
-            // 执行层目前仍只有 raid 级的 5 ATTACK 小队，assault/siege 等 L3 扩编再打。
-            if (!intel || !isRemotePaused(intel) || intel.response !== 'counter'
-                || intel.threatLevel !== 'raid') {
-                continue
-            }
-            const dps = intel.hostileDps ?? 0
-            const need = Math.min(
-                warSetting.counterMaxPerRoom,
-                Math.max(1, Math.ceil(dps / warSetting.counterDpsEach))
-            )
-            desiredRooms.set(roomName, need)
+    private refreshWarSpawn(plan: RemotePlan): void {
+        const missions = missionsOf(this.name)
+        const validIds = new Set<string>()
+        for (const mission of missions) {
+            validIds.add(mission.id)
         }
-        // 这一轮已经清了/房间不在计划里的，排队中的反击队取消
-        this.cancelStaleCounterSpawnTasks(new Set(desiredRooms.keys()))
-        if (!desiredRooms.size) {
+        // 任务已经关了（清场/撤回/失败）：排队中的作战单位一起取消
+        this.cancelStaleWarSpawnTasks(validIds)
+        if (!missions.length) {
             return
         }
-        // 全房间总上限：活着的 + 排队的一起算，避免多房同时开战把经济掏空
-        let budget = warSetting.counterMaxTotal - this.countCounterTotal()
-        for (const [roomName, need] of desiredRooms) {
+        let budget = warSetting.counterMaxTotal - this.countWarCreeps()
+        for (const mission of missions) {
             if (budget <= 0) {
                 break
             }
-            const intel = Memory.mapIntel?.[roomName]
-            if (!intel) {
-                continue
-            }
-            const attempts = intel.counterAttempts ?? 0
-            if (attempts >= warSetting.counterMaxAttempts) {
-                continue
-            }
-            const have = this.countCounterFor(roomName)
-            if (have >= need) {
-                continue
-            }
-            // 整队打光后的补派冷却：上一队还有活人（have>0）就直接补人
-            if (have === 0 && intel.counterAt !== undefined
-                && now - intel.counterAt < warSetting.counterReinforceTicks) {
-                continue
-            }
-            for (let i = have; i < need && budget > 0; i++) {
-                this.addToSpawnList('attacker', undefined, roomName)
+            const missing = mission.desired.attacker
+                - this.countMissionWarCreeps(mission.id)
+                - pendingSpawnCount(this.name, mission.id)
+            for (let i = 0; i < missing && budget > 0; i++) {
+                this.addToSpawnList('attacker', undefined, mission.targetRoom, mission.id)
                 budget -= 1
             }
-            intel.counterAt = now
-            intel.counterAttempts = attempts + 1
         }
     }
 
-    /**
-     * 某个房已经派出的反击队人数（活着 + 排队/孵化中）。
-     */
-    private countCounterFor(roomName: string): number {
-        let count = 0
-        for (const name in Game.creeps) {
-            const creep = Game.creeps[name]
-            if (creep.memory.spawnRoom === this.name
-                && creep.memory.role === 'attacker'
-                && creep.memory.attackerTarget === roomName) {
-                count++
-            }
-        }
-        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
-        for (const key in spawnBuckets) {
-            for (const task of spawnBuckets[key] ?? []) {
-                if (task?.taskParam?.[0] === 'attacker' && task?.taskParam?.[4] === roomName) {
-                    count++
-                }
-            }
-        }
-        return count
-    }
-
-    /**
-     * 本房全部反击队人数（活着 + 排队/孵化中），用于全房间总数上限。
-     */
-    private countCounterTotal(): number {
+    /** 本房作战单位数量（活着 + 排队/孵化中），用于全房总上限 */
+    private countWarCreeps(): number {
         let count = 0
         for (const name in Game.creeps) {
             const creep = Game.creeps[name]
             if (creep.memory.spawnRoom === this.name && creep.memory.role === 'attacker') {
+                count++
+            }
+        }
+        // 正在孵化但还没进 Game.creeps 的也要算，否则多个任务同时补员会超编
+        for (const spawn of this.find(FIND_MY_SPAWNS)) {
+            const name = spawn.spawning?.name
+            const memory = name ? Memory.creeps[name] : undefined
+            if (memory && memory.spawnRoom === this.name && memory.role === 'attacker') {
                 count++
             }
         }
@@ -2142,10 +2098,25 @@ export default class RoomExtension extends Room {
         return count
     }
 
+    /** 某个任务活着的成员数 */
+    private countMissionWarCreeps(missionId: string): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name
+                && creep.memory.role === 'attacker'
+                && creep.memory.missionId === missionId) {
+                count++
+            }
+        }
+        return count
+    }
+
     /**
-     * 清掉目标房已经不需要反击的排队任务（清场/强敌/停用/换目标）。
+     * 清掉已经不在任务表里的排队作战单位（任务关闭/清场/外矿停用）。
+     * 旧版本没有 missionId 的 attacker 任务也一起清：它们没有任务可执行。
      */
-    private cancelStaleCounterSpawnTasks(validTargets: Set<string>): void {
+    private cancelStaleWarSpawnTasks(validIds: Set<string>): void {
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
         for (const key in spawnBuckets) {
             const queue = spawnBuckets[key]
@@ -2156,8 +2127,8 @@ export default class RoomExtension extends Room {
                 if (task?.taskParam?.[0] !== 'attacker') {
                     return true
                 }
-                const target = task?.taskParam?.[4] as string | undefined
-                return !!target && validTargets.has(target)
+                const missionId = task?.taskParam?.[5] as string | undefined
+                return !!missionId && validIds.has(missionId)
             })
             if (next.length) {
                 spawnBuckets[key] = next
@@ -2893,6 +2864,9 @@ export default class RoomExtension extends Room {
                 const savedClaimerTarget = creep.memory.claimerTarget
                 // 反击队的目标房同理：丢了会回家摆烂，这一轮弱敌就没人清了
                 const savedAttackerTarget = creep.memory.attackerTarget
+                // L3 任务绑定：推代码后丢了 missionId，小队会被当成无任务的旧单位
+                // 直接回家报废，正在进行的任务也会被误判成全灭
+                const savedMissionId = creep.memory.missionId
                 // 外矿召回标记也要保住：否则推代码后召回过的 harvester 会重新领任务
                 // 跑回停用房；保住后它继续在主房待命到死
                 const savedRecall = creep.memory.recall
@@ -2918,6 +2892,9 @@ export default class RoomExtension extends Room {
                 }
                 if (savedAttackerTarget) {
                     creep.memory.attackerTarget = savedAttackerTarget
+                }
+                if (savedMissionId) {
+                    creep.memory.missionId = savedMissionId
                 }
                 if (savedRecall) {
                     creep.memory.recall = true
@@ -2987,7 +2964,7 @@ export default class RoomExtension extends Room {
         }
     }
 
-    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string) {
+    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string) {
         if (!this.memory.creepTask) {
             return
         }
@@ -2998,15 +2975,16 @@ export default class RoomExtension extends Room {
         const task: TaskEntity = {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
-            // 第三、四、五个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
-            // reSpawn 标记、目标房（claimer 绑定要驻守/占领的房）。
+            // 第三到第六个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
+            // reSpawn 标记、目标房（claimer 绑定要驻守/占领的房）、
+            // 任务 id（作战单位绑定 L3 任务）。
             // 外矿/侦察角色的补员统一由扫描逻辑决定，死亡后不走
             // creepRecycle 无条件重孵：否则两者会在死亡同一 tick 各补一只（竞态超编），
             // 停用房也会继续补人
             taskParam: [role, getBody(role, this), sourceId,
                 role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
                 && role !== 'claimer' && role !== 'attacker',
-                targetRoom],
+                targetRoom, missionId],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
@@ -3292,6 +3270,10 @@ export default class RoomExtension extends Room {
                     && memory.dieAt !== undefined
                     && Game.time < memory.dieAt - 20) {
                     onRemoteDeath(creepName, memory)
+                }
+                // 作战单位死亡：从 L3 任务里摘掉，必要时整队收尾
+                if (memory.missionId) {
+                    onMissionMemberDied(creepName, memory)
                 }
                 const room = Game.rooms[memory.spawnRoom]
                 // 从房间所有任务队列里清除该 creep 的预约（persistent 任务同样要清）

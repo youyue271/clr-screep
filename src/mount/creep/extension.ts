@@ -4,6 +4,15 @@ import log from "@/util/log";
 import { assessRemoteVision } from "@/global/war/remote/l2";
 import { classifyThreat, isRemotePaused } from "@/util/threat";
 import { onRemoteHarvestSignal, rememberRemoteTarget } from "@/global/war/remote/l1";
+import {
+    ensureMissionMember,
+    onMissionAborted,
+    onMissionArrived,
+    onMissionCleared,
+    onMissionHome,
+    onMissionTravel,
+} from "@/global/war/remote/l3";
+import { getMission } from "@/global/war/mission/store";
 import { ACTION_BLOCKED } from "./actionGuard";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
@@ -23,7 +32,7 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'viewer': ['scoutTask'],
     // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
     'claimer': ['claimTask'],
-    // 反击队不领任务：work() 里直接走 counterAttack，只认孵化时绑定的外矿房
+    // 作战单位不领任务：work() 里直接走 soldierBehavior，只认孵化时绑定的任务
     'attacker': [],
     // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
     'sleep': [],
@@ -45,9 +54,9 @@ export default class CreepExtension extends Creep {
             // console.log(this.ticksToLive)
             return
         }
-        // 反击队：不领任务，自己按 attackerTarget 去外矿清弱敌
+        // 作战单位：不领任务，按孵化时绑定的 L3 任务集合/赶路/交战
         if (this.memory.role === 'attacker') {
-            this.counterAttack()
+            this.soldierBehavior()
             return
         }
         // 外矿房被停用（敌对/被别人占用/已移出计划）后任务会被主房清掉，
@@ -1853,15 +1862,17 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 反击队行为：只清 attackerTarget 这一轮骚扰里的弱敌（无 HEAL 的小股武装）。
-     * - 主房遭强敌：先回家防守，不出去送
-     * - 目标房清空 / episode 结束 / 情报升级成 assault/siege：撤回主房
-     * - 只打有 ATTACK/RANGED_ATTACK/CLAIM 部件的敌人，先打最近的
+     * 作战单位行为：只认孵化时绑定的 L3 任务（missionId）。
+     * - forming：在 home 集合点等，先出来的不单独出发
+     * - travel：回 home 再出相邻房，到站上报
+     * - engage：counter 打最近武装 Invader；expedition 打 Invader core
+     * - 任务被关闭（清场/玩家介入/失败）：回家等 TTL 回收
      */
-    private counterAttack(): void {
+    private soldierBehavior(): void {
         const homeRoom = this.memory.spawnRoom
-        const target = this.memory.attackerTarget
+        const mission = getMission(this.memory.missionId)
         const home = Game.rooms[homeRoom]
+        // 主房遭强敌：先回防，任务里的人也不例外
         if (home) {
             const homeLevel = classifyThreat(home.find(FIND_HOSTILE_CREEPS)).level
             if (homeLevel === 'assault' || homeLevel === 'siege') {
@@ -1871,36 +1882,97 @@ export default class CreepExtension extends Creep {
                 return
             }
         }
-        const intel = target ? Memory.mapIntel?.[target] : undefined
-        // 目标丢了、外矿总开关关了、这一轮骚扰结束，或 L2 已改判（玩家介入/只剩基地）：
-        // 回家等 TTL/回收。分类和交战许可都由 L2 给，这里只认 response。
-        if (!target || Memory.remotePlan?.[homeRoom]?.enabled === false
-            || !isRemotePaused(intel) || intel?.response !== 'counter') {
+        if (!mission) {
+            // 任务已结束（清场/撤回/失败），或推代码前出生的旧小队。
+            // 任务 id 是 `${home}|${target}|${kind}`：目标还需要打（L2 还是
+            // counter/expedition，只是因冷却/次数暂时没建任务）时留在主房，
+            // 任务一重建就能凭同一个 missionId 重新入列；目标已经不需要打，
+            // 就回主房自毁——作战单位没有常驻价值，留着会白占 counterMaxTotal
+            // 的名额，让下一场任务最多等一个 TTL 才凑得齐人。
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom)
+                return
+            }
+            const [, target, kind] = (this.memory.missionId ?? '').split('|')
+            const intel = target ? Memory.mapIntel?.[target] : undefined
+            // 和 L3 建任务的条件保持一致：expedition 没有 coreId 时（只剩
+            // Invader reserve）不会重建任务，等着只是白占名额
+            const stillWanted = !!intel && intel.response === kind
+                && (kind !== 'expedition' || intel.coreId !== undefined)
+            if (stillWanted) {
+                this.waitAtHome(homeRoom, home)
+            } else {
+                this.say('🏳️任务结束')
+                this.suicideAndRespawn()
             }
             return
         }
-        if (this.room.name !== target) {
+        ensureMissionMember(mission, this.name)
+        if (Memory.remotePlan?.[homeRoom]?.enabled === false) {
+            // 外矿总开关关了：任务作废，回家
+            onMissionAborted(mission.id, 'plan-disabled')
+            this.moveToRoom(homeRoom)
+            return
+        }
+        if (mission.state === 'forming') {
+            this.waitAtHome(homeRoom, home)
+            return
+        }
+        if (this.room.name !== mission.targetRoom) {
+            onMissionTravel(mission.id, this.name)
             // moveToRoom 只支持相邻房：先回主房，再从主房出门
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom)
             } else {
-                this.moveToRoom(target)
+                this.moveToRoom(mission.targetRoom)
             }
             return
         }
+        onMissionArrived(mission.id, this.name)
         // 到站刷新情报：维持 hostileLastSeen，敌人增援/玩家介入时立刻能看出来
-        assessRemoteVision(homeRoom, this.room, 'attacker')
-        if (Memory.mapIntel?.[target]?.response !== 'counter') {
-            // L2 到站后改判（出现玩家部队/只剩 Invader 基地）：停止交战
+        assessRemoteVision(homeRoom, this.room, 'soldier')
+        // L2 到站后可能已经改判并关掉任务，重新确认一次
+        const live = getMission(mission.id)
+        if (!live) {
+            return
+        }
+        if (live.kind === 'counter') {
+            this.counterEngage(live, homeRoom)
+        } else {
+            this.expeditionEngage(live, homeRoom)
+        }
+    }
+
+    /** 集合阶段：在 home 里等，停在 controller 附近不挡 spawn */
+    private waitAtHome(homeRoom: string, home: Room | undefined): void {
+        if (this.room.name !== homeRoom) {
+            this.moveToRoom(homeRoom)
+            return
+        }
+        this.say('⏳集合')
+        const anchor = home?.controller
+        if (anchor && !this.pos.inRangeTo(anchor, 4)) {
+            this.moveTo(anchor, {range: 3, reusePath: 10})
+        }
+    }
+
+    /** 反击：只打无 HEAL 的小股武装；情报升级就撤 */
+    private counterEngage(mission: WarMission, homeRoom: string): void {
+        const intel = Memory.mapIntel?.[mission.targetRoom]
+        if (!intel || intel.response !== 'counter') {
+            if (intel?.response === 'none') {
+                onMissionCleared(mission.id)
+            } else {
+                onMissionAborted(mission.id, `response:${intel?.response}`)
+            }
             this.moveToRoom(homeRoom)
             return
         }
         const hostiles = this.room.find(FIND_HOSTILE_CREEPS)
         const threat = classifyThreat(hostiles)
         if (threat.level === 'assault' || threat.level === 'siege') {
-            // 情报过期，敌人已经不是弱敌：撤退，把房留给下一阶段
+            // 敌人增援已经不是弱敌：撤退，把房留给后续扩编
+            onMissionAborted(mission.id, 'threat-up')
             this.moveToRoom(homeRoom)
             return
         }
@@ -1909,13 +1981,53 @@ export default class CreepExtension extends Creep {
             || creep.getActiveBodyparts(RANGED_ATTACK) > 0
             || creep.getActiveBodyparts(CLAIM) > 0)
         if (!armed.length) {
-            // 清场完毕：回家等 episode 自然结束
+            // 清场完毕：任务完成，回家
+            onMissionCleared(mission.id)
             this.moveToRoom(homeRoom)
             return
         }
-        // 有 HEAL 的敌人已经被 classifyThreat 判成 assault 撤了，这里只剩无奶弱敌：打最近的
         armed.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b))
         const goal = armed[0]
+        if (this.pos.isNearTo(goal)) {
+            this.attack(goal)
+        } else {
+            this.moveTo(goal, {reusePath: 5})
+        }
+    }
+
+    /** 出征：优先拆 Invader core；core 旁边有防守兵先清兵 */
+    private expeditionEngage(mission: WarMission, homeRoom: string): void {
+        const intel = Memory.mapIntel?.[mission.targetRoom]
+        if (!intel || intel.response !== 'expedition') {
+            if (intel?.response === 'none') {
+                onMissionCleared(mission.id)
+            } else {
+                onMissionAborted(mission.id, `response:${intel?.response}`)
+            }
+            this.moveToRoom(homeRoom)
+            return
+        }
+        if ((intel.coreDeploy ?? 0) > 0) {
+            // 部署中的 core 无敌，等下一轮
+            onMissionAborted(mission.id, 'core-deploying')
+            this.moveToRoom(homeRoom)
+            return
+        }
+        const core = (intel.coreId ? Game.getObjectById(intel.coreId) : undefined)
+            ?? this.room.find(FIND_STRUCTURES, {
+                filter: (object: Structure) => object.structureType === STRUCTURE_INVADER_CORE,
+            })[0] as StructureInvaderCore | undefined
+        if (!core) {
+            onMissionCleared(mission.id)
+            this.moveToRoom(homeRoom)
+            return
+        }
+        // core 刷出来的防守兵挡路就先打近的
+        const defenders = this.room.find(FIND_HOSTILE_CREEPS).filter(creep =>
+            creep.getActiveBodyparts(ATTACK) > 0
+            || creep.getActiveBodyparts(RANGED_ATTACK) > 0)
+        const guard = defenders.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b))[0]
+        const goal = guard && this.pos.getRangeTo(guard) <= 3 ? guard : core
         if (this.pos.isNearTo(goal)) {
             this.attack(goal)
         } else {

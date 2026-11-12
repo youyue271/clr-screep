@@ -78,6 +78,8 @@ interface MapIntel {
     coreId?: Id<StructureInvaderCore>
     coreLevel?: number
     coreHits?: number
+    // 部署倒计时：>0 时 core 打不掉，出征队先不动
+    coreDeploy?: number
     // 无视野时的伤害证据（丢部件/提前死亡）。suspicionSince 也视为暂停
     suspicionSince?: number
     suspicionLastAt?: number
@@ -86,6 +88,11 @@ interface MapIntel {
     assessedAt?: number
     // 最近一次决策，调试/可视化用
     lastDecision?: { tick: number, category: RemoteCategory, response: RemoteResponse, reason: string }
+    // L3 回写的最近一次战斗结果（debug/复盘用）
+    lastBattle?: { tick: number, kind: MissionKind, result: MissionResultKind, detail: string }
+    // 出征连续失败次数 / 冷却。冷却期内 L2 把 expedition 降级成 scout
+    expeditionFails?: number
+    expeditionCooldownUntil?: number
 }
 
 /**
@@ -107,6 +114,8 @@ interface Memory {
     // 已经清过一次旧墙的房间。放顶层：globalInit 会 delete Memory.rooms，
     // 放房间 memory 里会导致每次推代码都重新清一遍，把后来建的墙也拆掉。
     legacyWallCleared?: { [roomName: string]: boolean }
+    // L3 作战任务与历史（反击/出征）
+    war?: WarMemory
 }
 
 interface RoomMemory {
@@ -362,7 +371,7 @@ interface Room {
      * 对添加孵化列表的简单封装
      * @param role
      */
-    addToSpawnList(role: Role, sourceId?: Id<Source>): void
+    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string): void
 
     /**
      * event相关

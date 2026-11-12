@@ -96,3 +96,65 @@ type AdvancedRoleConstant =
     | 'remoteBuilder'
     // sleep 不是可孵化角色，只是让 Role 联合类型能传给 getBody 的签名检查
     | 'sleep'
+
+/**
+ * L3 任务：把 L2 的 response 变成可执行的作战单位。
+ * counter 清 Invader creep；expedition 打 Invader core。
+ */
+type MissionKind = 'counter' | 'expedition'
+
+/** 任务阶段：集合 -> 赶路 -> 交战；收尾时任务直接删除，成员自己回家 */
+type MissionState = 'forming' | 'travel' | 'engage'
+
+/** 任务结束原因，回写 intel.lastBattle / 冷却 */
+type MissionResultKind = 'cleared' | 'wiped' | 'aborted' | 'timeout'
+
+/** 任务成员状态，由 creep 自己上报，避免 L3 每 tick 扫全场 */
+type MissionMemberState = 'waiting' | 'travel' | 'arrived' | 'home'
+
+interface WarMissionMember {
+    role: 'attacker'
+    state: MissionMemberState
+    lastSeen: number
+}
+
+/**
+ * 一支作战任务。id 用 `${home}|${target}|${kind}` 稳定生成，
+ * 天然防止同房同类任务重复创建。
+ */
+interface WarMission {
+    id: string
+    kind: MissionKind
+    homeRoom: string
+    targetRoom: string
+    state: MissionState
+    createdAt: number
+    updatedAt: number
+    attempt: number
+    /** 满编需求；形成阶段按它判断是否出发 */
+    desired: { attacker: number }
+    members: { [creepName: string]: WarMissionMember }
+    /** 最近一次看到的具体目标（core），交战层优先按 id 找 */
+    targetId?: Id<StructureInvaderCore>
+    /** 超时时间：到点还没打完就撤，避免小队在外面耗死 */
+    deadline?: number
+}
+
+/**
+ * 任务历史：按 home|target|kind 记在同一轮骚扰 episode 内派了几队、
+ * 失败几次、冷却到什么时候。新 episode（hostileSince 变了）自动清零。
+ */
+interface MissionRecord {
+    attempt: number
+    fails: number
+    lastAt: number
+    lastResult?: MissionResultKind
+    cooldownUntil?: number
+    /** 归属的骚扰 episode，用来判断是否重置 */
+    hostileSince?: number
+}
+
+interface WarMemory {
+    missions?: { [id: string]: WarMission }
+    records?: { [id: string]: MissionRecord }
+}

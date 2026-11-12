@@ -27,8 +27,10 @@ interface CreepMemory {
     // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
     // 每个目标房常驻一只，避免一只 claimer 在多房间之间来回跑
     claimerTarget?: string
-    // 反击队孵化时绑定的外矿房：这一轮骚扰结束前只去这个房清弱敌
+    // 反击队孵化时绑定的外矿房（旧字段，任务化以后不再写入/读取）
     attackerTarget?: string
+    // 作战单位孵化时绑定的 L3 任务 id（Memory.war.missions）
+    missionId?: string
     // 本 tick 已经发出的 transfer 量。transfer 要到回合末才结算，本 tick 读到的
     // store 还是旧值，只能自己记账推算目标结算后会不会满（Game.time 变了就重置）
     transferTick?: number

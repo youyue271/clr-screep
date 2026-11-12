@@ -232,6 +232,22 @@ export const warSetting = {
     // 窗口内累计到这个次数才暂停外矿，单次只提前派侦察
     suspicionWindow: 300,
     suspicionLimit: 2,
+    // L3 任务：集合阶段最多等多久。单 spawn 房间里 4 只 10 部件的小队
+    // 需要 120 tick，留了 3 倍余量；到点最多允许 counter 部分出发。
+    missionFormTimeout: 400,
+    // 任务总时限：超出就撤回，避免小队在外面耗到 TTL 耗尽
+    missionTimeout: 1200,
+    // 新 episode 开始后最多派几队（counter 与 counterMaxAttempts 对齐）
+    expeditionMaxAttempts: 2,
+    // 出征连续失败几次后进入冷却
+    expeditionMaxFails: 2,
+    expeditionCooldownTicks: 5000,
+    // 出征只打低等级 core：等级高的强心带塔/城墙，小队打不动
+    expeditionMaxCoreLevel: 2,
+    // 单只 attacker 在一次任务里能输出的有效 tick（扣掉赶路/撤退余量）
+    expeditionCombatTicks: 300,
+    // 出征队上限：再多人 spawn 时间就超过 TTL 预算了
+    expeditionMaxAttackers: 4,
 }
 
 export const towerSetting = {

@@ -1,6 +1,7 @@
 import { warSetting } from "@/setting"
 import { classifyThreat, isNpcUser } from "@/util/threat"
 import type { RemoteL1Report } from "../types"
+import { onRemoteDecision } from "./l3"
 
 /**
  * L2：外矿对敌的分类与决策层。
@@ -148,6 +149,14 @@ function applyAssessment(
     const controller = room.controller
     const sources = room.find(FIND_SOURCES)
 
+    // 出征冷却期内不重复派队：只侦察，等冷却结束再评估
+    let response = a.response
+    let reason = a.reason
+    if (response === 'expedition' && (intel.expeditionCooldownUntil ?? 0) > now) {
+        response = 'scout'
+        reason = `${a.reason}:cooldown`
+    }
+
     // 视野事实
     intel.scoutedAt = now
     intel.sources = sources.map(item => item.id)
@@ -158,7 +167,7 @@ function applyAssessment(
     intel.hostileCount = a.threat.count
     intel.hostileDps = a.threat.dps
     intel.category = a.category
-    intel.response = a.response
+    intel.response = response
     intel.assessedAt = now
     if (a.users.length) {
         intel.hostileUsers = a.users
@@ -174,16 +183,18 @@ function applyAssessment(
         intel.coreId = a.core.id
         intel.coreLevel = a.core.level
         intel.coreHits = a.core.hits
+        intel.coreDeploy = a.core.ticksToDeploy
     } else {
         delete intel.coreId
         delete intel.coreLevel
         delete intel.coreHits
+        delete intel.coreDeploy
     }
     intel.lastDecision = {
         tick: now,
         category: a.category,
-        response: a.response,
-        reason: `${source}:${a.reason}`,
+        response,
+        reason: `${source}:${reason}`,
     }
     // 玩家控制 / Invader 建筑：不让自动规划再把这个房选成外矿
     intel.unsafe = a.category === 'playerControl' || a.category === 'invaderCore'
@@ -206,6 +217,9 @@ function applyAssessment(
     }
     updateEpisode(intel, a.category, now)
     applyPlanState(homeRoom, room, a, sources)
+    // 决策交给 L3：响应幂等，10 tick 扫描和 creep 到站刷新都会走这里，
+    // 任务被清掉后能自动补建（冷却/次数由 L3 控制）
+    onRemoteDecision(homeRoom, room.name, response)
 }
 
 /**

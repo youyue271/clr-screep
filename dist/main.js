@@ -3462,6 +3462,22 @@ const warSetting = {
     // 窗口内累计到这个次数才暂停外矿，单次只提前派侦察
     suspicionWindow: 300,
     suspicionLimit: 2,
+    // L3 任务：集合阶段最多等多久。单 spawn 房间里 4 只 10 部件的小队
+    // 需要 120 tick，留了 3 倍余量；到点最多允许 counter 部分出发。
+    missionFormTimeout: 400,
+    // 任务总时限：超出就撤回，避免小队在外面耗到 TTL 耗尽
+    missionTimeout: 1200,
+    // 新 episode 开始后最多派几队（counter 与 counterMaxAttempts 对齐）
+    expeditionMaxAttempts: 2,
+    // 出征连续失败几次后进入冷却
+    expeditionMaxFails: 2,
+    expeditionCooldownTicks: 5000,
+    // 出征只打低等级 core：等级高的强心带塔/城墙，小队打不动
+    expeditionMaxCoreLevel: 2,
+    // 单只 attacker 在一次任务里能输出的有效 tick（扣掉赶路/撤退余量）
+    expeditionCombatTicks: 300,
+    // 出征队上限：再多人 spawn 时间就超过 TTL 预算了
+    expeditionMaxAttackers: 4,
 };
 const towerSetting = {
     // 和平时期每 5 tick 扫描一次敌对 creep，防御时期每 tick 扫描
@@ -3661,9 +3677,33 @@ function getOpportunityEnergy(room) {
         capacity: Math.max(1, Math.min(opportunitySetting.maxCapacity, Math.ceil(candidate.amount / maxCarry)))
     }));
 }
+/**
+ * 房间当前是否真的缺能量：spawn/extension 没满，或者有塔低于补能阈值。
+ * 全满时从 storage 取能只会取出来再存回去，属于空转。
+ */
+function hasLocalEnergyDemand(room) {
+    if (room.energyAvailable < room.energyCapacityAvailable) {
+        return true;
+    }
+    const towers = room.find(FIND_MY_STRUCTURES, {
+        filter: (object) => object.structureType === STRUCTURE_TOWER
+    });
+    for (const tower of towers) {
+        if (tower.store.getUsedCapacity(RESOURCE_ENERGY)
+            < tower.store.getCapacity(RESOURCE_ENERGY) * towerSetting.refillThreshold) {
+            return true;
+        }
+    }
+    return false;
+}
 function getStorageEnergy(room) {
     const storage = room.storage;
     if (!storage) {
+        return [];
+    }
+    // 没有补能需求时不要把 storage 的能量派出去：空闲 carrier 取出来以后
+    // 没地方可投，只能原样存回 storage（会在 storage 里进进出出空转）
+    if (!hasLocalEnergyDemand(room)) {
         return [];
     }
     const energy = storage.store.getUsedCapacity(RESOURCE_ENERGY);
@@ -4014,6 +4054,490 @@ function isNpcUser(username) {
     return !!username && npcUsers.indexOf(username) >= 0;
 }
 
+/**
+ * L3 编成规则：只根据 L2 写好的情报算"该派几只"，
+ * 不碰 Memory、不管出生时间，纯函数，方便私服单测。
+ */
+/**
+ * 反击队人数：按敌方总 DPS / 单只输出向上取整，夹在 1..counterMaxPerRoom。
+ * 只有 raid 级（无 HEAL、小股）才出队；assault/siege 留给后续扩编。
+ */
+function counterSquadSize(intel) {
+    var _a;
+    if (intel.response !== 'counter' || intel.threatLevel !== 'raid') {
+        return undefined;
+    }
+    const dps = (_a = intel.hostileDps) !== null && _a !== void 0 ? _a : 0;
+    if (dps <= 0) {
+        return undefined;
+    }
+    return Math.min(warSetting.counterMaxPerRoom, Math.max(1, Math.ceil(dps / warSetting.counterDpsEach)));
+}
+/**
+ * 出征队人数：core 的 hits / (单只 DPS × 有效战斗 tick) 向上取整。
+ * 等级太高、还在部署（无敌）或所需人数超上限就不出征，只保留侦察。
+ */
+function expeditionSquadSize(intel) {
+    var _a, _b, _c;
+    if (intel.response !== 'expedition' || !intel.coreId) {
+        return undefined;
+    }
+    if (((_a = intel.coreLevel) !== null && _a !== void 0 ? _a : 0) > warSetting.expeditionMaxCoreLevel) {
+        return undefined;
+    }
+    if (((_b = intel.coreDeploy) !== null && _b !== void 0 ? _b : 0) > 0) {
+        // 部署中的 core 打不掉，等它部署完再看
+        return undefined;
+    }
+    const hits = (_c = intel.coreHits) !== null && _c !== void 0 ? _c : 0;
+    if (hits <= 0) {
+        return undefined;
+    }
+    const perAttacker = warSetting.counterDpsEach * warSetting.expeditionCombatTicks;
+    const need = Math.ceil(hits / perAttacker);
+    if (need > warSetting.expeditionMaxAttackers) {
+        return undefined;
+    }
+    return Math.max(1, need);
+}
+
+/**
+ * L3 任务存储：Memory.war 的唯一读写方。
+ *
+ * - missions：活着的任务，key 是 `${home}|${target}|${kind}`，天然去重
+ * - records：每个房每类任务的历史（派了几队/失败几次/冷却），新 episode 清零
+ *
+ * 只在这里写 Memory.war；creep 侧通过 l3 的事件入口上报，不直接改任务。
+ */
+function missionKey(homeRoom, targetRoom, kind) {
+    return `${homeRoom}|${targetRoom}|${kind}`;
+}
+function war() {
+    let memory = Memory.war;
+    if (!memory) {
+        memory = Memory.war = {};
+    }
+    return memory;
+}
+function missionMap() {
+    var _a;
+    const memory = war();
+    return (_a = memory.missions) !== null && _a !== void 0 ? _a : (memory.missions = {});
+}
+function getMission(id) {
+    var _a, _b;
+    return id ? (_b = (_a = Memory.war) === null || _a === void 0 ? void 0 : _a.missions) === null || _b === void 0 ? void 0 : _b[id] : undefined;
+}
+function findMission(homeRoom, targetRoom, kind) {
+    return getMission(missionKey(homeRoom, targetRoom, kind));
+}
+function missionsOf(homeRoom) {
+    var _a;
+    const missions = (_a = Memory.war) === null || _a === void 0 ? void 0 : _a.missions;
+    if (!missions) {
+        return [];
+    }
+    const list = [];
+    for (const id in missions) {
+        const mission = missions[id];
+        if (mission && mission.homeRoom === homeRoom) {
+            list.push(mission);
+        }
+    }
+    return list;
+}
+function createMission(homeRoom, targetRoom, kind, desired, attempt, targetId) {
+    const now = Game.time;
+    const id = missionKey(homeRoom, targetRoom, kind);
+    const mission = {
+        id,
+        kind,
+        homeRoom,
+        targetRoom,
+        state: 'forming',
+        createdAt: now,
+        updatedAt: now,
+        attempt,
+        desired,
+        members: {},
+        targetId,
+        deadline: now + warSetting.missionTimeout,
+    };
+    missionMap()[id] = mission;
+    return mission;
+}
+/**
+ * 关闭任务：任务从 Memory 删除，成员下一 tick 发现任务没了就自己回家。
+ * 结果回写给 L2：lastBattle 永远写，出征失败累计到冷却。
+ */
+function closeMission(mission, result, detail) {
+    var _a, _b, _c, _d;
+    const now = Game.time;
+    const missions = (_a = Memory.war) === null || _a === void 0 ? void 0 : _a.missions;
+    if (missions) {
+        delete missions[mission.id];
+    }
+    const record = missionRecord(mission.homeRoom, mission.targetRoom, mission.kind);
+    record.lastAt = now;
+    record.lastResult = result;
+    if (result === 'cleared') {
+        record.attempt = 0;
+        record.fails = 0;
+        delete record.cooldownUntil;
+    }
+    else {
+        record.fails = ((_b = record.fails) !== null && _b !== void 0 ? _b : 0) + 1;
+        record.cooldownUntil = now + (mission.kind === 'expedition'
+            ? (record.fails >= warSetting.expeditionMaxFails
+                ? warSetting.expeditionCooldownTicks
+                : warSetting.counterReinforceTicks)
+            : warSetting.counterReinforceTicks);
+    }
+    const intel = (_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[mission.targetRoom];
+    if (!intel) {
+        return;
+    }
+    intel.lastBattle = { tick: now, kind: mission.kind, result, detail };
+    if (mission.kind !== 'expedition') {
+        return;
+    }
+    if (result === 'cleared') {
+        delete intel.expeditionFails;
+        delete intel.expeditionCooldownUntil;
+        return;
+    }
+    const fails = ((_d = intel.expeditionFails) !== null && _d !== void 0 ? _d : 0) + 1;
+    intel.expeditionFails = fails;
+    if (fails >= warSetting.expeditionMaxFails) {
+        intel.expeditionCooldownUntil = now + warSetting.expeditionCooldownTicks;
+    }
+}
+/**
+ * 任务历史。新 episode（L2 的 hostileSince 变了）代表上一轮骚扰结束，
+ * 派队次数和冷却全部清零，不给下一轮背债务。
+ */
+function missionRecord(homeRoom, targetRoom, kind) {
+    var _a, _b;
+    const memory = war();
+    const records = (_a = memory.records) !== null && _a !== void 0 ? _a : (memory.records = {});
+    const id = missionKey(homeRoom, targetRoom, kind);
+    return (_b = records[id]) !== null && _b !== void 0 ? _b : (records[id] = { attempt: 0, fails: 0, lastAt: 0 });
+}
+function resetRecordForEpisode(record, intel) {
+    if (record.hostileSince === intel.hostileSince) {
+        return;
+    }
+    record.hostileSince = intel.hostileSince;
+    record.attempt = 0;
+    record.fails = 0;
+    delete record.lastResult;
+    delete record.cooldownUntil;
+}
+/** 还能不能再派一队：冷却 + 本轮次数上限 */
+function canAttempt(homeRoom, targetRoom, kind, intel, maxAttempts) {
+    const record = missionRecord(homeRoom, targetRoom, kind);
+    resetRecordForEpisode(record, intel);
+    const now = Game.time;
+    if (record.cooldownUntil !== undefined && now < record.cooldownUntil) {
+        return undefined;
+    }
+    if (record.attempt >= maxAttempts) {
+        return undefined;
+    }
+    record.attempt += 1;
+    record.lastAt = now;
+    return record.attempt;
+}
+function addMissionMember(mission, creepName) {
+    if (mission.members[creepName]) {
+        return;
+    }
+    mission.members[creepName] = {
+        role: 'attacker',
+        state: 'waiting',
+        lastSeen: Game.time,
+    };
+    mission.updatedAt = Game.time;
+}
+function removeMissionMember(mission, creepName) {
+    if (!mission.members[creepName]) {
+        return;
+    }
+    delete mission.members[creepName];
+    mission.updatedAt = Game.time;
+}
+function setMissionMemberState(mission, creepName, state) {
+    const member = mission.members[creepName];
+    if (!member) {
+        return;
+    }
+    member.lastSeen = Game.time;
+    if (member.state === state) {
+        return;
+    }
+    member.state = state;
+    mission.updatedAt = Game.time;
+}
+/**
+ * 主房这个任务"还没能上场"的人数：spawn 队列里排队的 + 正在孵化的。
+ *
+ * 排队中的任务在开始孵化时就会从 spawnTask 出队，但 creep 要等孵化完成
+ * 才进 Game.creeps（10 部件 attacker 30 tick）。这中间如果只数队列，
+ * 补员逻辑会以为缺人、每 tick 重复排队，任务对账也可能误判成全灭。
+ */
+function pendingSpawnCount(homeRoom, missionId) {
+    var _a, _b, _c, _d, _e, _f, _g, _h;
+    let count = 0;
+    const buckets = (_c = (_b = (_a = Memory.rooms) === null || _a === void 0 ? void 0 : _a[homeRoom]) === null || _b === void 0 ? void 0 : _b.creepTask) === null || _c === void 0 ? void 0 : _c.spawnTask;
+    if (buckets) {
+        for (const priority in buckets) {
+            for (const task of (_d = buckets[priority]) !== null && _d !== void 0 ? _d : []) {
+                if (((_e = task === null || task === void 0 ? void 0 : task.taskParam) === null || _e === void 0 ? void 0 : _e[0]) === 'attacker' && ((_f = task === null || task === void 0 ? void 0 : task.taskParam) === null || _f === void 0 ? void 0 : _f[5]) === missionId) {
+                    count++;
+                }
+            }
+        }
+    }
+    const room = Game.rooms[homeRoom];
+    if (room) {
+        for (const spawn of room.find(FIND_MY_SPAWNS)) {
+            const name = (_g = spawn.spawning) === null || _g === void 0 ? void 0 : _g.name;
+            if (name && ((_h = Memory.creeps[name]) === null || _h === void 0 ? void 0 : _h.missionId) === missionId) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+/**
+ * L3：任务执行层。
+ *
+ * 只消费 L2 写好的 intel.response，把它变成 Memory.war 里的任务：
+ * - counter：清 Invader 武装 creep（当前只有 raid 级）
+ * - expedition：打 Invader core（只打低等级、部署完成、算得过来的）
+ *
+ * 分工：
+ * - 决策变化 / 10 tick 扫描 -> onRemoteDecision / reconcileHomeMissions 建任务
+ * - 主房 spawn 刷新 -> refreshWarSpawn 按任务缺额排队
+ * - creep 自己上报到达/回家/目标消失/死亡 -> 这里推进状态或关任务
+ * - 任务结果回写 intel.lastBattle，出征失败进入冷却（L2 会把 expedition 降级成 scout）
+ */
+/** L2 每次评估后调用：按最新 response 建/关任务 */
+function onRemoteDecision(homeRoom, targetRoom, response) {
+    var _a;
+    const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[targetRoom];
+    if (!intel) {
+        return;
+    }
+    const counter = findMission(homeRoom, targetRoom, 'counter');
+    const expedition = findMission(homeRoom, targetRoom, 'expedition');
+    if (response === 'counter') {
+        if (expedition) {
+            closeMission(expedition, 'aborted', 'decision:counter');
+        }
+        if (!counter) {
+            createCounterMission(homeRoom, targetRoom, intel);
+        }
+        return;
+    }
+    if (response === 'expedition') {
+        if (counter) {
+            closeMission(counter, 'aborted', 'decision:expedition');
+        }
+        if (!expedition) {
+            createExpeditionMission(homeRoom, targetRoom, intel);
+        }
+        return;
+    }
+    // none/harmless 是确认干净，其余（avoid/scout）是被动中断
+    const result = response === 'none' ? 'cleared' : 'aborted';
+    if (counter) {
+        closeMission(counter, result, `decision:${response}`);
+    }
+    if (expedition) {
+        closeMission(expedition, result, `decision:${response}`);
+    }
+}
+function createCounterMission(homeRoom, targetRoom, intel) {
+    const desired = counterSquadSize(intel);
+    if (!desired) {
+        return;
+    }
+    // 全房同时进行的反击任务上限，避免多房开战把经济掏空
+    const active = missionsOf(homeRoom).filter(mission => mission.kind === 'counter').length;
+    if (active >= warSetting.counterMaxTotal) {
+        return;
+    }
+    const attempt = canAttempt(homeRoom, targetRoom, 'counter', intel, warSetting.counterMaxAttempts);
+    if (!attempt) {
+        return;
+    }
+    createMission(homeRoom, targetRoom, 'counter', { attacker: desired }, attempt);
+}
+function createExpeditionMission(homeRoom, targetRoom, intel) {
+    const desired = expeditionSquadSize(intel);
+    if (!desired) {
+        return;
+    }
+    const active = missionsOf(homeRoom).filter(mission => mission.kind === 'expedition').length;
+    if (active >= 1) {
+        return;
+    }
+    const attempt = canAttempt(homeRoom, targetRoom, 'expedition', intel, warSetting.expeditionMaxAttempts);
+    if (!attempt) {
+        return;
+    }
+    createMission(homeRoom, targetRoom, 'expedition', { attacker: desired }, attempt, intel.coreId);
+}
+/**
+ * 10 tick 兜底对账：L2 决策没变但任务已经失败/被清掉时，
+ * 靠这里重新建任务（冷却/次数由 canAttempt 控制）。
+ */
+function reconcileHomeMissions(homeRoom) {
+    var _a, _b;
+    const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[homeRoom];
+    if (!plan || !plan.rooms) {
+        return;
+    }
+    for (const roomName in plan.rooms) {
+        const intel = (_b = Memory.mapIntel) === null || _b === void 0 ? void 0 : _b[roomName];
+        if (!intel) {
+            continue;
+        }
+        if (intel.response === 'counter' || intel.response === 'expedition') {
+            onRemoteDecision(homeRoom, roomName, intel.response);
+        }
+    }
+}
+/** 任务存续对账：成员死亡清理、集合完成、超时/全灭关闭 */
+function syncMissions(homeRoom) {
+    var _a, _b, _c, _d;
+    const missions = (_a = Memory.war) === null || _a === void 0 ? void 0 : _a.missions;
+    if (!missions) {
+        return;
+    }
+    const now = Game.time;
+    // 一次遍历统计每个任务实际的存活人数：不能只看 mission.members，
+    // creep 刚孵化出来的那一 tick 还没进 soldier 登记，会被误判成"全灭"
+    const aliveByMission = {};
+    for (const name in Game.creeps) {
+        const missionId = Game.creeps[name].memory.missionId;
+        if (missionId) {
+            aliveByMission[missionId] = ((_b = aliveByMission[missionId]) !== null && _b !== void 0 ? _b : 0) + 1;
+        }
+    }
+    const ids = [];
+    for (const id in missions) {
+        ids.push(id);
+    }
+    for (const id of ids) {
+        const mission = missions[id];
+        if (!mission || (homeRoom && mission.homeRoom !== homeRoom)) {
+            continue;
+        }
+        // 房间已经移出计划（被占/停用）：任务作废
+        const plan = (_c = Memory.remotePlan) === null || _c === void 0 ? void 0 : _c[mission.homeRoom];
+        if (plan && plan.rooms && !plan.rooms[mission.targetRoom]) {
+            closeMission(mission, 'aborted', 'left-plan');
+            continue;
+        }
+        for (const name in mission.members) {
+            if (!Game.creeps[name]) {
+                delete mission.members[name];
+            }
+        }
+        const alive = (_d = aliveByMission[mission.id]) !== null && _d !== void 0 ? _d : 0;
+        const pending = pendingSpawnCount(mission.homeRoom, mission.id);
+        if (mission.state === 'forming') {
+            if (alive >= mission.desired.attacker) {
+                mission.state = 'travel';
+                mission.updatedAt = now;
+            }
+            else if (now - mission.createdAt >= warSetting.missionFormTimeout) {
+                if (alive > 0 && pending === 0 && mission.kind === 'counter') {
+                    // 补不满就按现有兵力出发，别让已经出来的在集合点白等
+                    mission.state = 'travel';
+                    mission.updatedAt = now;
+                }
+                else if (alive === 0 && pending === 0) {
+                    closeMission(mission, 'timeout', 'forming-empty');
+                    continue;
+                }
+                else if (alive > 0 && pending === 0) {
+                    // 出征要求满编，人不够直接放弃
+                    closeMission(mission, 'timeout', 'forming-partial');
+                    continue;
+                }
+            }
+        }
+        if (mission.deadline !== undefined && now >= mission.deadline) {
+            closeMission(mission, 'timeout', 'deadline');
+            continue;
+        }
+        // 建任务和首次孵化之间有几 tick 空窗，过了窗口还没人也没排队就是全灭
+        if (alive === 0 && pending === 0 && now - mission.createdAt > 20) {
+            closeMission(mission, 'wiped', 'no-members');
+        }
+    }
+}
+/** 外矿总开关关闭/计划被移除：本房所有任务作废，排队中的作战单位由 spawn 侧取消 */
+function abortHomeMissions(homeRoom, detail) {
+    for (const mission of missionsOf(homeRoom)) {
+        closeMission(mission, 'aborted', detail);
+    }
+}
+/** creep 出生后第一次进 soldier 时登记，避免 spawn 侧和任务侧各写一份 */
+function ensureMissionMember(mission, creepName) {
+    addMissionMember(mission, creepName);
+}
+function onMissionArrived(missionId, creepName) {
+    const mission = getMission(missionId);
+    if (!mission) {
+        return;
+    }
+    setMissionMemberState(mission, creepName, 'arrived');
+    if (mission.state === 'travel') {
+        mission.state = 'engage';
+        mission.updatedAt = Game.time;
+        // 集合排队 + 赶路可能吃掉建任务时 deadline 的一大半。进入交战这一刻
+        // 按"真正需要的输出时间"重设时限，否则会出现全员到了、打了半血、
+        // 到点强制撤回（实测 3 只 attacker 把 100k core 打到 42.7k 被 deadline 掐断）。
+        if (mission.kind === 'expedition') {
+            mission.deadline = Game.time + warSetting.expeditionCombatTicks + 200;
+        }
+    }
+}
+function onMissionTravel(missionId, creepName) {
+    const mission = getMission(missionId);
+    if (mission) {
+        setMissionMemberState(mission, creepName, 'travel');
+    }
+}
+/** 目标已消失（清场/核心被拆）：任务完成，成员自己回家 */
+function onMissionCleared(missionId) {
+    const mission = getMission(missionId);
+    if (mission) {
+        closeMission(mission, 'cleared', 'target-gone');
+    }
+}
+/** 交战条件失效（升级成强敌/玩家介入）：撤回 */
+function onMissionAborted(missionId, detail) {
+    const mission = getMission(missionId);
+    if (mission) {
+        closeMission(mission, 'aborted', detail);
+    }
+}
+/** 成员死亡：只按任务人数收尾，不单独记战损（死亡本身由 L1 上报） */
+function onMissionMemberDied(creepName, memory) {
+    const mission = getMission(memory.missionId);
+    if (!mission) {
+        return;
+    }
+    removeMissionMember(mission, creepName);
+    syncMissions(mission.homeRoom);
+}
+
 /** L1 信号入口：有目标房视野就走正常分类，看不到才累积伤害证据 */
 function callRemoteL2(report) {
     const room = report.vision && report.observedRoom === report.targetRoom
@@ -4110,10 +4634,18 @@ function assessRoom(room, me) {
     return Object.assign(Object.assign({}, base), { category: 'none', response: 'none', reason: 'clean' });
 }
 function applyAssessment(homeRoom, room, a, me, source) {
+    var _a;
     const intel = Memory.mapIntel[room.name];
     const now = Game.time;
     const controller = room.controller;
     const sources = room.find(FIND_SOURCES);
+    // 出征冷却期内不重复派队：只侦察，等冷却结束再评估
+    let response = a.response;
+    let reason = a.reason;
+    if (response === 'expedition' && ((_a = intel.expeditionCooldownUntil) !== null && _a !== void 0 ? _a : 0) > now) {
+        response = 'scout';
+        reason = `${a.reason}:cooldown`;
+    }
     // 视野事实
     intel.scoutedAt = now;
     intel.sources = sources.map(item => item.id);
@@ -4124,7 +4656,7 @@ function applyAssessment(homeRoom, room, a, me, source) {
     intel.hostileCount = a.threat.count;
     intel.hostileDps = a.threat.dps;
     intel.category = a.category;
-    intel.response = a.response;
+    intel.response = response;
     intel.assessedAt = now;
     if (a.users.length) {
         intel.hostileUsers = a.users;
@@ -4142,17 +4674,19 @@ function applyAssessment(homeRoom, room, a, me, source) {
         intel.coreId = a.core.id;
         intel.coreLevel = a.core.level;
         intel.coreHits = a.core.hits;
+        intel.coreDeploy = a.core.ticksToDeploy;
     }
     else {
         delete intel.coreId;
         delete intel.coreLevel;
         delete intel.coreHits;
+        delete intel.coreDeploy;
     }
     intel.lastDecision = {
         tick: now,
         category: a.category,
-        response: a.response,
-        reason: `${source}:${a.reason}`,
+        response,
+        reason: `${source}:${reason}`,
     };
     // 玩家控制 / Invader 建筑：不让自动规划再把这个房选成外矿
     intel.unsafe = a.category === 'playerControl' || a.category === 'invaderCore';
@@ -4175,6 +4709,9 @@ function applyAssessment(homeRoom, room, a, me, source) {
     }
     updateEpisode(intel, a.category, now);
     applyPlanState(homeRoom, room, a, sources);
+    // 决策交给 L3：响应幂等，10 tick 扫描和 creep 到站刷新都会走这里，
+    // 任务被清掉后能自动补建（冷却/次数由 L3 控制）
+    onRemoteDecision(homeRoom, room.name, response);
 }
 /**
  * 骚扰 episode：暂停类分类一出现就开 episode，连续 hostileCalmTicks
@@ -4552,7 +5089,7 @@ const roleToTask = {
     'viewer': ['scoutTask'],
     // claimer 同样只有一个常驻任务：自己挑要续保留/要占领的控制器
     'claimer': ['claimTask'],
-    // 反击队不领任务：work() 里直接走 counterAttack，只认孵化时绑定的外矿房
+    // 作战单位不领任务：work() 里直接走 soldierBehavior，只认孵化时绑定的任务
     'attacker': [],
     // 睡眠态不领任务：currentWork 是自造的 sleep 伪任务，醒来由事件恢复原任务
     'sleep': [],
@@ -4573,9 +5110,9 @@ class CreepExtension extends Creep {
             // console.log(this.ticksToLive)
             return;
         }
-        // 反击队：不领任务，自己按 attackerTarget 去外矿清弱敌
+        // 作战单位：不领任务，按孵化时绑定的 L3 任务集合/赶路/交战
         if (this.memory.role === 'attacker') {
-            this.counterAttack();
+            this.soldierBehavior();
             return;
         }
         // 外矿房被停用（敌对/被别人占用/已移出计划）后任务会被主房清掉，
@@ -6379,16 +6916,18 @@ class CreepExtension extends Creep {
         return best;
     }
     /**
-     * 反击队行为：只清 attackerTarget 这一轮骚扰里的弱敌（无 HEAL 的小股武装）。
-     * - 主房遭强敌：先回家防守，不出去送
-     * - 目标房清空 / episode 结束 / 情报升级成 assault/siege：撤回主房
-     * - 只打有 ATTACK/RANGED_ATTACK/CLAIM 部件的敌人，先打最近的
+     * 作战单位行为：只认孵化时绑定的 L3 任务（missionId）。
+     * - forming：在 home 集合点等，先出来的不单独出发
+     * - travel：回 home 再出相邻房，到站上报
+     * - engage：counter 打最近武装 Invader；expedition 打 Invader core
+     * - 任务被关闭（清场/玩家介入/失败）：回家等 TTL 回收
      */
-    counterAttack() {
-        var _a, _b, _c, _d, _e;
+    soldierBehavior() {
+        var _a, _b, _c, _d;
         const homeRoom = this.memory.spawnRoom;
-        const target = this.memory.attackerTarget;
+        const mission = getMission(this.memory.missionId);
         const home = Game.rooms[homeRoom];
+        // 主房遭强敌：先回防，任务里的人也不例外
         if (home) {
             const homeLevel = classifyThreat(home.find(FIND_HOSTILE_CREEPS)).level;
             if (homeLevel === 'assault' || homeLevel === 'siege') {
@@ -6398,37 +6937,100 @@ class CreepExtension extends Creep {
                 return;
             }
         }
-        const intel = target ? (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[target] : undefined;
-        // 目标丢了、外矿总开关关了、这一轮骚扰结束，或 L2 已改判（玩家介入/只剩基地）：
-        // 回家等 TTL/回收。分类和交战许可都由 L2 给，这里只认 response。
-        if (!target || ((_c = (_b = Memory.remotePlan) === null || _b === void 0 ? void 0 : _b[homeRoom]) === null || _c === void 0 ? void 0 : _c.enabled) === false
-            || !isRemotePaused(intel) || (intel === null || intel === void 0 ? void 0 : intel.response) !== 'counter') {
+        if (!mission) {
+            // 任务已结束（清场/撤回/失败），或推代码前出生的旧小队。
+            // 任务 id 是 `${home}|${target}|${kind}`：目标还需要打（L2 还是
+            // counter/expedition，只是因冷却/次数暂时没建任务）时留在主房，
+            // 任务一重建就能凭同一个 missionId 重新入列；目标已经不需要打，
+            // 就回主房自毁——作战单位没有常驻价值，留着会白占 counterMaxTotal
+            // 的名额，让下一场任务最多等一个 TTL 才凑得齐人。
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom);
+                return;
+            }
+            const [, target, kind] = ((_a = this.memory.missionId) !== null && _a !== void 0 ? _a : '').split('|');
+            const intel = target ? (_b = Memory.mapIntel) === null || _b === void 0 ? void 0 : _b[target] : undefined;
+            // 和 L3 建任务的条件保持一致：expedition 没有 coreId 时（只剩
+            // Invader reserve）不会重建任务，等着只是白占名额
+            const stillWanted = !!intel && intel.response === kind
+                && (kind !== 'expedition' || intel.coreId !== undefined);
+            if (stillWanted) {
+                this.waitAtHome(homeRoom, home);
+            }
+            else {
+                this.say('🏳️任务结束');
+                this.suicideAndRespawn();
             }
             return;
         }
-        if (this.room.name !== target) {
+        ensureMissionMember(mission, this.name);
+        if (((_d = (_c = Memory.remotePlan) === null || _c === void 0 ? void 0 : _c[homeRoom]) === null || _d === void 0 ? void 0 : _d.enabled) === false) {
+            // 外矿总开关关了：任务作废，回家
+            onMissionAborted(mission.id, 'plan-disabled');
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        if (mission.state === 'forming') {
+            this.waitAtHome(homeRoom, home);
+            return;
+        }
+        if (this.room.name !== mission.targetRoom) {
+            onMissionTravel(mission.id, this.name);
             // moveToRoom 只支持相邻房：先回主房，再从主房出门
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom);
             }
             else {
-                this.moveToRoom(target);
+                this.moveToRoom(mission.targetRoom);
             }
             return;
         }
+        onMissionArrived(mission.id, this.name);
         // 到站刷新情报：维持 hostileLastSeen，敌人增援/玩家介入时立刻能看出来
-        assessRemoteVision(homeRoom, this.room, 'attacker');
-        if (((_e = (_d = Memory.mapIntel) === null || _d === void 0 ? void 0 : _d[target]) === null || _e === void 0 ? void 0 : _e.response) !== 'counter') {
-            // L2 到站后改判（出现玩家部队/只剩 Invader 基地）：停止交战
+        assessRemoteVision(homeRoom, this.room, 'soldier');
+        // L2 到站后可能已经改判并关掉任务，重新确认一次
+        const live = getMission(mission.id);
+        if (!live) {
+            return;
+        }
+        if (live.kind === 'counter') {
+            this.counterEngage(live, homeRoom);
+        }
+        else {
+            this.expeditionEngage(live, homeRoom);
+        }
+    }
+    /** 集合阶段：在 home 里等，停在 controller 附近不挡 spawn */
+    waitAtHome(homeRoom, home) {
+        if (this.room.name !== homeRoom) {
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        this.say('⏳集合');
+        const anchor = home === null || home === void 0 ? void 0 : home.controller;
+        if (anchor && !this.pos.inRangeTo(anchor, 4)) {
+            this.moveTo(anchor, { range: 3, reusePath: 10 });
+        }
+    }
+    /** 反击：只打无 HEAL 的小股武装；情报升级就撤 */
+    counterEngage(mission, homeRoom) {
+        var _a;
+        const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[mission.targetRoom];
+        if (!intel || intel.response !== 'counter') {
+            if ((intel === null || intel === void 0 ? void 0 : intel.response) === 'none') {
+                onMissionCleared(mission.id);
+            }
+            else {
+                onMissionAborted(mission.id, `response:${intel === null || intel === void 0 ? void 0 : intel.response}`);
+            }
             this.moveToRoom(homeRoom);
             return;
         }
         const hostiles = this.room.find(FIND_HOSTILE_CREEPS);
         const threat = classifyThreat(hostiles);
         if (threat.level === 'assault' || threat.level === 'siege') {
-            // 情报过期，敌人已经不是弱敌：撤退，把房留给下一阶段
+            // 敌人增援已经不是弱敌：撤退，把房留给后续扩编
+            onMissionAborted(mission.id, 'threat-up');
             this.moveToRoom(homeRoom);
             return;
         }
@@ -6436,13 +7038,53 @@ class CreepExtension extends Creep {
             || creep.getActiveBodyparts(RANGED_ATTACK) > 0
             || creep.getActiveBodyparts(CLAIM) > 0);
         if (!armed.length) {
-            // 清场完毕：回家等 episode 自然结束
+            // 清场完毕：任务完成，回家
+            onMissionCleared(mission.id);
             this.moveToRoom(homeRoom);
             return;
         }
-        // 有 HEAL 的敌人已经被 classifyThreat 判成 assault 撤了，这里只剩无奶弱敌：打最近的
         armed.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b));
         const goal = armed[0];
+        if (this.pos.isNearTo(goal)) {
+            this.attack(goal);
+        }
+        else {
+            this.moveTo(goal, { reusePath: 5 });
+        }
+    }
+    /** 出征：优先拆 Invader core；core 旁边有防守兵先清兵 */
+    expeditionEngage(mission, homeRoom) {
+        var _a, _b, _c;
+        const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[mission.targetRoom];
+        if (!intel || intel.response !== 'expedition') {
+            if ((intel === null || intel === void 0 ? void 0 : intel.response) === 'none') {
+                onMissionCleared(mission.id);
+            }
+            else {
+                onMissionAborted(mission.id, `response:${intel === null || intel === void 0 ? void 0 : intel.response}`);
+            }
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        if (((_b = intel.coreDeploy) !== null && _b !== void 0 ? _b : 0) > 0) {
+            // 部署中的 core 无敌，等下一轮
+            onMissionAborted(mission.id, 'core-deploying');
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        const core = (_c = (intel.coreId ? Game.getObjectById(intel.coreId) : undefined)) !== null && _c !== void 0 ? _c : this.room.find(FIND_STRUCTURES, {
+            filter: (object) => object.structureType === STRUCTURE_INVADER_CORE,
+        })[0];
+        if (!core) {
+            onMissionCleared(mission.id);
+            this.moveToRoom(homeRoom);
+            return;
+        }
+        // core 刷出来的防守兵挡路就先打近的
+        const defenders = this.room.find(FIND_HOSTILE_CREEPS).filter(creep => creep.getActiveBodyparts(ATTACK) > 0
+            || creep.getActiveBodyparts(RANGED_ATTACK) > 0);
+        const guard = defenders.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b))[0];
+        const goal = guard && this.pos.getRangeTo(guard) <= 3 ? guard : core;
         if (this.pos.isNearTo(goal)) {
             this.attack(goal);
         }
@@ -8899,8 +9541,11 @@ class RoomExtension extends Room {
         }
         const plan = (_a = Memory.remotePlan) === null || _a === void 0 ? void 0 : _a[this.name];
         if (!plan || plan.enabled === false) {
-            // 外矿总开关关掉：排队的反击队也取消，别在停用后还孵化出去
-            this.cancelStaleCounterSpawnTasks(new Set());
+            // 外矿总开关关掉：任务作废、排队的作战单位取消，别在停用后还孵化出去。
+            // 必须在 return 前主动收尾：下面按计划跑的对账/存续检查都不会执行，
+            // 光取消 spawn 任务会让没人也没排队的任务一直留在 Memory 里。
+            abortHomeMissions(this.name, 'plan-disabled');
+            this.cancelStaleWarSpawnTasks(new Set());
             return;
         }
         // 回运任务并发跟着 container 现存能量走，先更新再按最新容量补车
@@ -8908,8 +9553,13 @@ class RoomExtension extends Room {
         // 外矿角色都不进 initSpawn 配额：按"每个矿点一只"在这里补员。
         this.refreshRemoteHarvesterSpawn(plan);
         this.refreshRemoteCarrierSpawn(plan);
-        // 弱敌反击队：按情报派 ATTACK+MOVE，只打没有 HEAL 的小股武装
-        this.refreshCounterSpawn(plan);
+        // L3 作战任务：先对账（建任务），再按缺额排 spawn，最后才做存续对账。
+        // syncMissions 会把"没人也没排队"的任务判成 wiped；推代码后 spawn 队列
+        // 会被 globalReset 清空，如果先 sync 再 refreshWarSpawn，正在集合的任务
+        // 会被误杀。先排队再判存续，重新排上的任务就不会被误判。
+        reconcileHomeMissions(this.name);
+        this.refreshWarSpawn(plan);
+        syncMissions(this.name);
     }
     /**
      * 外矿回运任务的动态并发：capacity = ceil(container 能量 / 房间最大 carry 容量)，
@@ -9880,13 +10530,12 @@ class RoomExtension extends Room {
      * 孵化时把矿点 id 写进 harvestSourceId，新 creep 才会只认这一个矿。
      */
     refreshRemoteHarvesterSpawn(plan) {
-        var _a, _b, _c;
+        var _a, _b;
         // 旧逻辑留下的、没绑定矿点的孵化任务没法计入任何一个矿点的覆盖，直接清掉
         this.cancelUnboundRemoteSpawnTasks('remoteHarvester');
-        // 首次开矿（还没有 container）仍受富余能量门槛限制；
-        // 已经建好 container 的矿点是稳定产线，harvester 死了必须立刻补，
-        // 不能再等本地 container 涨到高水位——否则外矿会整片停摆。
-        const gate = plan.force || this.remoteGate();
+        // 首次开矿不再看本地富余门槛：remoteHarvester 孵化优先级靠后，
+        // 饿了自然排在本地补员之后，不会影响主房正常运营。
+        // 没有 container 的矿点由 harvester 自己放工地边采边建。
         const validSources = new Set();
         const body = getBody('remoteHarvester', this);
         const spawnTicks = calcSpawnTicks(body);
@@ -9906,10 +10555,6 @@ class RoomExtension extends Room {
             const threshold = spawnTicks + travel * ticksPerTile + harvestSetting.earlyMargin;
             for (const sourceId in (_b = state.sources) !== null && _b !== void 0 ? _b : {}) {
                 validSources.add(sourceId);
-                const established = !!((_c = state.sources[sourceId]) === null || _c === void 0 ? void 0 : _c.containerId);
-                if (!established && !gate) {
-                    continue;
-                }
                 if (this.remoteSourceCovered('remoteHarvester', sourceId, threshold)) {
                     // 有健康的人就清掉多余替补，避免扫描间隔内重复排队
                     this.cancelRemoteSourceSpawnTasks('remoteHarvester', sourceId);
@@ -9988,93 +10633,38 @@ class RoomExtension extends Room {
         this.cancelStaleRemoteSpawnTasks('remoteCarrier', validSources);
     }
     /**
-     * 弱敌反击队：情报显示某相邻房这一轮武装敌对是 raid 级（无 HEAL、数量/总 DPS 在阈值内），
-     * 就按 DPS 派 1-2 只 ATTACK+MOVE 去清场。
-     * - 只有弱敌才派；情报过期后敌人升级成 assault/siege 时，attacker 到场会自己撤回来
-     * - 别的玩家 owner/reserve 的房不打，只清 NPC（Invader/Source Keeper）和野生敌对
-     * - 每轮骚扰最多派 counterMaxAttempts 队；一队全灭后等 counterReinforceTicks 再整队补派
+     * L3 作战任务补员：按任务缺额（满编 - 活着 - 排队中）排 attacker。
+     * 任务本身由 L3 建/关，这里只负责孵化；全房同时存在的作战单位
+     * 数量受 counterMaxTotal 限制，避免多房开战把经济掏空。
      */
-    refreshCounterSpawn(plan) {
-        var _a, _b, _c, _d;
-        const now = Game.time;
-        const desiredRooms = new Map();
-        for (const roomName in plan.rooms) {
-            const intel = (_a = Memory.mapIntel) === null || _a === void 0 ? void 0 : _a[roomName];
-            // 分类和"该不该打"由 L2 决定：只有 invaderCreep 会给 counter。
-            // 执行层目前仍只有 raid 级的 5 ATTACK 小队，assault/siege 等 L3 扩编再打。
-            if (!intel || !isRemotePaused(intel) || intel.response !== 'counter'
-                || intel.threatLevel !== 'raid') {
-                continue;
-            }
-            const dps = (_b = intel.hostileDps) !== null && _b !== void 0 ? _b : 0;
-            const need = Math.min(warSetting.counterMaxPerRoom, Math.max(1, Math.ceil(dps / warSetting.counterDpsEach)));
-            desiredRooms.set(roomName, need);
+    refreshWarSpawn(plan) {
+        const missions = missionsOf(this.name);
+        const validIds = new Set();
+        for (const mission of missions) {
+            validIds.add(mission.id);
         }
-        // 这一轮已经清了/房间不在计划里的，排队中的反击队取消
-        this.cancelStaleCounterSpawnTasks(new Set(desiredRooms.keys()));
-        if (!desiredRooms.size) {
+        // 任务已经关了（清场/撤回/失败）：排队中的作战单位一起取消
+        this.cancelStaleWarSpawnTasks(validIds);
+        if (!missions.length) {
             return;
         }
-        // 全房间总上限：活着的 + 排队的一起算，避免多房同时开战把经济掏空
-        let budget = warSetting.counterMaxTotal - this.countCounterTotal();
-        for (const [roomName, need] of desiredRooms) {
+        let budget = warSetting.counterMaxTotal - this.countWarCreeps();
+        for (const mission of missions) {
             if (budget <= 0) {
                 break;
             }
-            const intel = (_c = Memory.mapIntel) === null || _c === void 0 ? void 0 : _c[roomName];
-            if (!intel) {
-                continue;
-            }
-            const attempts = (_d = intel.counterAttempts) !== null && _d !== void 0 ? _d : 0;
-            if (attempts >= warSetting.counterMaxAttempts) {
-                continue;
-            }
-            const have = this.countCounterFor(roomName);
-            if (have >= need) {
-                continue;
-            }
-            // 整队打光后的补派冷却：上一队还有活人（have>0）就直接补人
-            if (have === 0 && intel.counterAt !== undefined
-                && now - intel.counterAt < warSetting.counterReinforceTicks) {
-                continue;
-            }
-            for (let i = have; i < need && budget > 0; i++) {
-                this.addToSpawnList('attacker', undefined, roomName);
+            const missing = mission.desired.attacker
+                - this.countMissionWarCreeps(mission.id)
+                - pendingSpawnCount(this.name, mission.id);
+            for (let i = 0; i < missing && budget > 0; i++) {
+                this.addToSpawnList('attacker', undefined, mission.targetRoom, mission.id);
                 budget -= 1;
             }
-            intel.counterAt = now;
-            intel.counterAttempts = attempts + 1;
         }
     }
-    /**
-     * 某个房已经派出的反击队人数（活着 + 排队/孵化中）。
-     */
-    countCounterFor(roomName) {
+    /** 本房作战单位数量（活着 + 排队/孵化中），用于全房总上限 */
+    countWarCreeps() {
         var _a, _b, _c;
-        let count = 0;
-        for (const name in Game.creeps) {
-            const creep = Game.creeps[name];
-            if (creep.memory.spawnRoom === this.name
-                && creep.memory.role === 'attacker'
-                && creep.memory.attackerTarget === roomName) {
-                count++;
-            }
-        }
-        const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
-        for (const key in spawnBuckets) {
-            for (const task of (_a = spawnBuckets[key]) !== null && _a !== void 0 ? _a : []) {
-                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === 'attacker' && ((_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[4]) === roomName) {
-                    count++;
-                }
-            }
-        }
-        return count;
-    }
-    /**
-     * 本房全部反击队人数（活着 + 排队/孵化中），用于全房间总数上限。
-     */
-    countCounterTotal() {
-        var _a, _b;
         let count = 0;
         for (const name in Game.creeps) {
             const creep = Game.creeps[name];
@@ -10082,20 +10672,42 @@ class RoomExtension extends Room {
                 count++;
             }
         }
+        // 正在孵化但还没进 Game.creeps 的也要算，否则多个任务同时补员会超编
+        for (const spawn of this.find(FIND_MY_SPAWNS)) {
+            const name = (_a = spawn.spawning) === null || _a === void 0 ? void 0 : _a.name;
+            const memory = name ? Memory.creeps[name] : undefined;
+            if (memory && memory.spawnRoom === this.name && memory.role === 'attacker') {
+                count++;
+            }
+        }
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
-            for (const task of (_a = spawnBuckets[key]) !== null && _a !== void 0 ? _a : []) {
-                if (((_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[0]) === 'attacker') {
+            for (const task of (_b = spawnBuckets[key]) !== null && _b !== void 0 ? _b : []) {
+                if (((_c = task === null || task === void 0 ? void 0 : task.taskParam) === null || _c === void 0 ? void 0 : _c[0]) === 'attacker') {
                     count++;
                 }
             }
         }
         return count;
     }
+    /** 某个任务活着的成员数 */
+    countMissionWarCreeps(missionId) {
+        let count = 0;
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name];
+            if (creep.memory.spawnRoom === this.name
+                && creep.memory.role === 'attacker'
+                && creep.memory.missionId === missionId) {
+                count++;
+            }
+        }
+        return count;
+    }
     /**
-     * 清掉目标房已经不需要反击的排队任务（清场/强敌/停用/换目标）。
+     * 清掉已经不在任务表里的排队作战单位（任务关闭/清场/外矿停用）。
+     * 旧版本没有 missionId 的 attacker 任务也一起清：它们没有任务可执行。
      */
-    cancelStaleCounterSpawnTasks(validTargets) {
+    cancelStaleWarSpawnTasks(validIds) {
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask');
         for (const key in spawnBuckets) {
             const queue = spawnBuckets[key];
@@ -10107,8 +10719,8 @@ class RoomExtension extends Room {
                 if (((_a = task === null || task === void 0 ? void 0 : task.taskParam) === null || _a === void 0 ? void 0 : _a[0]) !== 'attacker') {
                     return true;
                 }
-                const target = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[4];
-                return !!target && validTargets.has(target);
+                const missionId = (_b = task === null || task === void 0 ? void 0 : task.taskParam) === null || _b === void 0 ? void 0 : _b[5];
+                return !!missionId && validIds.has(missionId);
             });
             if (next.length) {
                 spawnBuckets[key] = next;
@@ -10839,6 +11451,9 @@ class RoomExtension extends Room {
                 const savedClaimerTarget = creep.memory.claimerTarget;
                 // 反击队的目标房同理：丢了会回家摆烂，这一轮弱敌就没人清了
                 const savedAttackerTarget = creep.memory.attackerTarget;
+                // L3 任务绑定：推代码后丢了 missionId，小队会被当成无任务的旧单位
+                // 直接回家报废，正在进行的任务也会被误判成全灭
+                const savedMissionId = creep.memory.missionId;
                 // 外矿召回标记也要保住：否则推代码后召回过的 harvester 会重新领任务
                 // 跑回停用房；保住后它继续在主房待命到死
                 const savedRecall = creep.memory.recall;
@@ -10864,6 +11479,9 @@ class RoomExtension extends Room {
                 }
                 if (savedAttackerTarget) {
                     creep.memory.attackerTarget = savedAttackerTarget;
+                }
+                if (savedMissionId) {
+                    creep.memory.missionId = savedMissionId;
                 }
                 if (savedRecall) {
                     creep.memory.recall = true;
@@ -10932,7 +11550,7 @@ class RoomExtension extends Room {
             }
         }
     }
-    addToSpawnList(role, sourceId, targetRoom) {
+    addToSpawnList(role, sourceId, targetRoom, missionId) {
         if (!this.memory.creepTask) {
             return;
         }
@@ -10943,15 +11561,16 @@ class RoomExtension extends Room {
         const task = {
             id: `spawn-${role}-${Game.time}-${Math.random().toString(36).slice(2)}`,
             taskFunc: "spawnCreep",
-            // 第三、四、五个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
-            // reSpawn 标记、目标房（claimer 绑定要驻守/占领的房）。
+            // 第三到第六个参数：矿点 id（提前换班的 harvester 只认这个矿点）、
+            // reSpawn 标记、目标房（claimer 绑定要驻守/占领的房）、
+            // 任务 id（作战单位绑定 L3 任务）。
             // 外矿/侦察角色的补员统一由扫描逻辑决定，死亡后不走
             // creepRecycle 无条件重孵：否则两者会在死亡同一 tick 各补一只（竞态超编），
             // 停用房也会继续补人
             taskParam: [role, getBody(role, this), sourceId,
                 role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
                     && role !== 'claimer' && role !== 'attacker',
-                targetRoom],
+                targetRoom, missionId],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
             queuedAt: Game.time,
@@ -11230,6 +11849,10 @@ class RoomExtension extends Room {
                     && memory.dieAt !== undefined
                     && Game.time < memory.dieAt - 20) {
                     onRemoteDeath(creepName, memory);
+                }
+                // 作战单位死亡：从 L3 任务里摘掉，必要时整队收尾
+                if (memory.missionId) {
+                    onMissionMemberDied(creepName, memory);
                 }
                 const room = Game.rooms[memory.spawnRoom];
                 // 从房间所有任务队列里清除该 creep 的预约（persistent 任务同样要清）
@@ -12976,9 +13599,9 @@ class SpawnExtension extends Spawn {
                             claimerTarget: role === 'claimer'
                                 ? (_g = task === null || task === void 0 ? void 0 : task.taskParam) === null || _g === void 0 ? void 0 : _g[4]
                                 : undefined,
-                            // 反击队孵化时绑定外矿房，这一轮骚扰结束前只去这个房
-                            attackerTarget: role === 'attacker'
-                                ? (_h = task === null || task === void 0 ? void 0 : task.taskParam) === null || _h === void 0 ? void 0 : _h[4]
+                            // 作战单位孵化时绑定 L3 任务：集合/赶路/交战都按任务走
+                            missionId: role === 'attacker'
+                                ? (_h = task === null || task === void 0 ? void 0 : task.taskParam) === null || _h === void 0 ? void 0 : _h[5]
                                 : undefined
                         },
                         energyStructures: picked.structures

@@ -135,9 +135,9 @@ export default class SpawnExtension extends Spawn {
                             claimerTarget: role === 'claimer'
                                 ? task?.taskParam?.[4] as string | undefined
                                 : undefined,
-                            // 反击队孵化时绑定外矿房，这一轮骚扰结束前只去这个房
-                            attackerTarget: role === 'attacker'
-                                ? task?.taskParam?.[4] as string | undefined
+                            // 作战单位孵化时绑定 L3 任务：集合/赶路/交战都按任务走
+                            missionId: role === 'attacker'
+                                ? task?.taskParam?.[5] as string | undefined
                                 : undefined
                         },
                         energyStructures: picked.structures
