@@ -146,6 +146,10 @@ export default class SpawnExtension extends Spawn {
                             claimerTarget: role === 'claimer'
                                 ? task?.taskParam?.[4] as string | undefined
                                 : undefined,
+                            // viewer 孵化时绑定驻守房：每房一只，到房后不再跨房巡游
+                            viewerRoom: role === 'viewer'
+                                ? task?.taskParam?.[4] as string | undefined
+                                : undefined,
                             // 作战单位孵化时绑定 L3 任务：集合/赶路/交战都按任务走
                             missionId: role === 'attacker'
                                 ? task?.taskParam?.[5] as string | undefined
