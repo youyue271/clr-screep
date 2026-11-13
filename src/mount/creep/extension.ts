@@ -1560,16 +1560,11 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 外矿对应的主房 link 规划位。优先用顶层 remotePlan 里持久化的位置，
-     * 没有就退回房间 linkPlan（每次规划时算出的位置）。
+     * 外矿对应的主房 link 规划位。由主房统一读持久化计划并做可用性校验，
+     * 失效的旧坐标（墙/矿点/不在出口带内）不会再被拿来丢货。
      */
     private remoteLinkPosOf(homeRoom: string, targetRoom: string): RoomPosition | undefined {
-        const pos = Memory.remotePlan?.[homeRoom]?.rooms?.[targetRoom]?.remoteLinkPos
-            ?? this.room.memory.linkPlan?.remotes?.[targetRoom]?.pos
-        if (!pos || pos.length < 2) {
-            return undefined
-        }
-        return new RoomPosition(pos[0], pos[1], homeRoom)
+        return Game.rooms[homeRoom]?.remoteLinkDropPosOf(targetRoom)
     }
 
     /**

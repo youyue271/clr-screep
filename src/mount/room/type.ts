@@ -349,6 +349,12 @@ interface Room {
     syncLinkPlan(): void
 
     /**
+     * 外矿回运没有可用 link 时的兜底丢货位（主房内、该外矿出口附近）。
+     * 会对持久化的规划位做可用性校验。
+     */
+    remoteLinkDropPosOf(remoteRoom: string): RoomPosition | undefined
+
+    /**
      * 房间环境扫描（敌对/受伤/维修队列），结果缓存在 global.room
      */
     scan(): void
