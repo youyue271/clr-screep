@@ -1220,11 +1220,48 @@ export default class CreepExtension extends Creep {
             return false
         }
         if (this.pos.isEqualTo(exitPos)) {
-            // 站在出口格上，回合结束引擎会自动把 creep 送到隔壁房间
+            // 站在出口格上，回合结束引擎会自动把 creep 送到隔壁房间。
+            // 打标记让 leaveBorderIfIdle 放过这种"正在跨房"的 creep，
+            // 否则兜底会把它又推回房内，和引擎的转场意图打架。
+            ;(this as any).__crossTick = Game.time
             return true
         }
         this.moveTo(exitPos, { visualizePathStyle: { stroke: '#00ffff' } })
         return true
+    }
+
+    /**
+     * 本 tick 没有移动意图、却停在房间出口格上的 creep，往房内走一步。
+     * 引擎会把停在出口格上的 creep 每 tick 送到隔壁房：空闲的 claimer /
+     * remoteCarrier 一停在边界，就会和隔壁房无限乒乓（官服 W34S49↔W35S49 实测），
+     * 看起来像"卡在边边角"，TTL 还照常掉。
+     * 只处理"停住"的 creep：
+     * - __moveTick === Game.time：这 tick 动过（含正常跨房），不动它
+     * - __crossTick === Game.time：moveToRoom 正站在出口格等引擎转场，不动它
+     * - spawning / 没有 MOVE 部件：动不了，跳过
+     */
+    leaveBorderIfIdle(): void {
+        const pos = this.pos
+        if (pos.x !== 0 && pos.x !== 49 && pos.y !== 0 && pos.y !== 49) {
+            return
+        }
+        const g = this as any
+        if (g.__moveTick === Game.time || g.__crossTick === Game.time) {
+            return
+        }
+        if (this.spawning || this.getActiveBodyparts(MOVE) === 0) {
+            return
+        }
+        // 走到房内一个稳定锚点（控制器优先），一步离开边界后本方法就不再触发。
+        // 用 range 1：目标本身通常不可走；已经在范围内时退回房中心，
+        // 否则 moveTo 会直接返回 OK 而一格都不动。
+        let anchor = this.room.controller
+            ? this.room.controller.pos
+            : new RoomPosition(25, 25, this.room.name)
+        if (this.pos.inRangeTo(anchor, 1)) {
+            anchor = new RoomPosition(25, 25, this.room.name)
+        }
+        this.moveTo(anchor, { range: 1 })
     }
 
     /**

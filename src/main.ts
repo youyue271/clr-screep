@@ -73,6 +73,8 @@ function creepControl() {
     for (let creepName in Game.creeps) {
         const creep = Game.creeps[creepName]
         creep.work()
+        // 兜底：空闲 creep 停在出口格上会被引擎每 tick 弹到隔壁房，来回乒乓
+        creep.leaveBorderIfIdle()
     }
 }
 
