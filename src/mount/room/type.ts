@@ -474,9 +474,22 @@ interface Room {
     refreshWorkerQuota(): void
 
     /**
-     * 10 tick 扫描调用：本地 carrier 低于保底数量时补一个。
+     * 10 tick 扫描兜底：本地 carrier 低于稳态目标时补一个。
+     * 稳态目标 = 本地矿点产能 × 往返 / 单车运力，保底 localFloor。
      */
     refreshCarrierQuota(): void
+
+    /**
+     * 本地 carrier 稳态补员：按出生职业（名字）计数，低于目标才排孵化。
+     * 转职去外矿不改变身份，所以转职/回程不会触发补员。
+     */
+    reconcileCarrier(): void
+
+    /**
+     * 外矿回运车稳态补员：按产能/运力算每个矿点的目标车数，
+     * 覆盖数包含临时转职过来的本地 carrier。死亡/回程/建成/升级后调用。
+     */
+    reconcileRemoteCarriers(): void
 
     /**
      * 某个职业的人数（含排队/孵化中的 spawn 任务）。emptyWorker/sleep 按原职业折算。

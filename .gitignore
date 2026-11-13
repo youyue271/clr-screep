@@ -1,5 +1,9 @@
+# WSL 下 Windows 路径转义失败、误写进仓库的构建产物目录
+C:*
+
 .idea
 .secret.json
 node_modules/
 node_modules/.cache/
-dist/main.js.map.js
+# 构建产物不入库：多分支/多 agent 时 dist 每次 build 都变，合并必冲突
+dist/

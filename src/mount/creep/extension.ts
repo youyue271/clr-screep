@@ -14,6 +14,7 @@ import {
 } from "@/global/war/remote/l3";
 import { getMission } from "@/global/war/mission/store";
 import { ACTION_BLOCKED } from "./actionGuard";
+import { baseRoleOf } from "@/util/role";
 // import {getCarryList, getEnergyWithStorage} from "@/task/roomTask";
 
 const roleToTask: { [role in Role]: TaskType[] } = {
@@ -260,8 +261,8 @@ export default class CreepExtension extends Creep {
             return this.remoteCarrierIdle()
         }
         // 本地运输体型有空闲外矿运输位、且本地运输体型超过保底数量时，转职去跑外矿：
-        // 运输车和本地 carrier 体型完全一样，不用重新孵化。转职后死亡不进 initSpawn
-        // 配额（reSpawn=false），由主房扫描按矿点动态补员；本地保底由 refreshCarrierQuota 兜底。
+        // 运输车和本地 carrier 体型完全一样，不用重新孵化。转职只是临时岗位，
+        // 名字仍是 carrier，死亡补员按本地池走；外矿覆盖由主房扫描单独补。
         // emptyWorker 也要参与：本地没活时 carrier 会被转成 emptyWorker 去取能，
         // 不在这里重新指派的话，本地 carrier 数量一低于保底，外矿满了也永远没人去搬。
         if ((this.memory.role === 'carrier'
@@ -1540,7 +1541,7 @@ export default class CreepExtension extends Creep {
         }
         // 没有规划位 / 丢不下（极少见）：退回旧行为，转回 carrier 交给本地 carryTask
         delete this.memory.remoteReturn
-        this.finishRemoteTrip()
+        this.finishRemoteTrip(true)
         return true
     }
 
@@ -1552,7 +1553,7 @@ export default class CreepExtension extends Creep {
         const aborted = this.memory.remoteAbort
         delete this.memory.remoteReturn
         if (aborted) {
-            this.finishRemoteTrip()
+            this.finishRemoteTrip(true)
             return true
         }
         return false
@@ -1588,7 +1589,7 @@ export default class CreepExtension extends Creep {
         this.memory.remoteCarrySourceId = opening.sourceId
         this.memory.remoteCarryRoom = opening.remoteRoom
         delete this.memory.oldRole
-        this.memory.reSpawn = false
+        // reSpawn 不动：名字仍是 carrier，本地池按身份计数，转职不该影响补员
         if (this.getWork()) {
             return true
         }
@@ -1598,17 +1599,31 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 外矿往返结束：循环任务保留，只把角色切回 carrier。
-     * oldRole 必须删掉，否则死的时候会重孵 remoteCarrier（现在不再特招这个角色）。
+     * 结束当前外矿往返。
+     *
+     * 专职外矿车（名字就是 remoteCarrier）：绑定目标还在时**不转职**，只结束这一趟，
+     * 保持身份等 container 重新攒够货。否则"运空 → 转成本地 carrier → 下个扫描
+     * 发现覆盖不够又孵一只"会来回震荡，稳态永远收敛不了。
+     *
+     * retire=true（外矿停用 / container 没了 / link 规划缺失）或本地 carrier
+     * 临时转职过来的车：切回本地 carrier 用到死，并清掉矿点绑定。
+     * 名字不变，死亡补员仍按出生职业走各自池子。
      */
-    private finishRemoteTrip(): void {
+    private finishRemoteTrip(retire = false): void {
+        const stayRemote = !retire && baseRoleOf(this.name) === 'remoteCarrier'
+        delete this.memory.remoteAbort
+        delete this.memory.linkWaitTicks
+        delete this.memory.remoteReturn
+        if (stayRemote) {
+            return
+        }
         this.changeRole('carrier')
         delete this.memory.oldRole
-        delete this.memory.remoteAbort
         // 转回本地 carrier 后不再绑定任何外矿矿点
         delete this.memory.remoteCarrySourceId
         delete this.memory.remoteCarryRoom
-        delete this.memory.linkWaitTicks
+        // 覆盖少了一只：按稳态目标补回运车（home 房可能不是当前所在房）
+        Game.rooms[this.memory.spawnRoom]?.reconcileRemoteCarriers()
     }
 
     /**
@@ -2201,7 +2216,7 @@ export default class CreepExtension extends Creep {
             return false
         }
         // 绑定目标没了 / 老版本没绑定的车：转回普通 carrier，本地补能优先。
-        this.finishRemoteTrip()
+        this.finishRemoteTrip(true)
         return false
     }
 

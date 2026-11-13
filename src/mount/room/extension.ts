@@ -10,6 +10,7 @@ import {assessRemoteVision} from "@/global/war/remote/l2";
 import {abortHomeMissions, onMissionMemberDied, reconcileHomeMissions, syncMissions} from "@/global/war/remote/l3";
 import {missionsOf, pendingSpawnCount} from "@/global/war/mission/store";
 import {isRemotePaused} from "@/util/threat";
+import {baseRoleOf} from "@/util/role";
 
 // checkRoomLevel 的最长排期间隔：diff 采样落在升级停滞窗口时（比如工人全在建造/维修）
 // 会严重低估升级速度，实测 diff=1 把下一次检查排到了 3 万多 tick 之后，
@@ -1020,14 +1021,6 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * 外矿 task 当前的目标并发（任务不存在时为 0）。
-     */
-    private remoteCarryTaskCapacityOf(containerId: string): number {
-        const task = this.findRemoteCarryTask(this.normalizeTaskBuckets('remoteCarryTask'), containerId)
-        return task?.capacity ?? 0
-    }
-
-    /**
      * 登记外矿 container 的循环回运任务（幂等）。
      * 事件来源：外矿 harvester 第一次看到 container / container 换 id / 推代码重建。
      * 只读写顶层 memory 和主房任务桶，不扫描世界。
@@ -1730,8 +1723,8 @@ export default class RoomExtension extends Room {
     /**
      * 中央 carrier 的固定站位：布局里离 link/storage/terminal 最均衡的道路格。
      * 用布局局部坐标算（terminal 没建也有位置），结果缓存在 linkPlan 里。
-     * plan1 的 S/T/L 不共邻，选贴着 link 和 storage 的那格（(25,18)）；
-     * plan2 三个都贴着（(3,3)，也就是阵型正中）。
+     * plan1 的 link 挪到 (3,5) 后，S/T/L（以及隔壁的 factory）都贴着 (4,5)；
+     * plan2 同理，三个都贴着 (3,3)，也就是阵型正中。
      */
     centerCarrierPos(): [number, number] | undefined {
         if (!this.memory.creepTask) {
@@ -2324,17 +2317,23 @@ export default class RoomExtension extends Room {
                     continue
                 }
                 validSources.add(sourceId)
-                // 目标数量 = 该 container 当前应派的车数（按能量动态算）
-                const desired = this.remoteCarryTaskCapacityOf(containerId)
-                const pending = this.remoteSourcePending('remoteCarrier', sourceId)
-                const covered = this.remoteSourceCarrierCount(sourceId, threshold) + (pending ? 1 : 0)
-                if (covered >= desired) {
-                    // 车够了：清掉扫描间隔内多排的孵化任务
+                // 目标数量 = 稳态数量（产能 × 往返 / 单车运力），和 container 当前积压无关：
+                // 积压只是产量变化时的暂态，按产能算才不会出现"运空→没人→再积压"的震荡
+                const desired = this.remoteCarrierTargetOf(roomName)
+                const alive = this.remoteSourceCarrierCount(sourceId, threshold)
+                if (alive >= desired) {
+                    // 活着的车已经够：清掉扫描间隔内多排的孵化任务
                     this.cancelRemoteSourceSpawnTasks('remoteCarrier', sourceId)
                     continue
                 }
+                const pending = this.remoteSourcePending('remoteCarrier', sourceId)
+                // 缺口 = 目标 - 活着的 - 排队/孵化中的数量。排队中的本来就该算覆盖，
+                // 不能只按 1 只算（spawn 忙时会每个扫描周期多加一只）
+                let missing = desired - alive - pending
+                if (missing <= 0) {
+                    continue
+                }
                 // 先用可转职的空闲本地 carrier 抵掉缺口，剩下的才占 spawn
-                let missing = desired - covered
                 const converted = Math.min(convertible, missing)
                 convertible -= converted
                 missing -= converted
@@ -2342,9 +2341,6 @@ export default class RoomExtension extends Room {
                     continue
                 }
                 // 本扫描每个矿点最多排一只，避免一次把 spawn 塞满
-                if (pending) {
-                    continue
-                }
                 this.addToSpawnList('remoteCarrier', sourceId as Id<Source>, roomName)
             }
         }
@@ -2498,9 +2494,55 @@ export default class RoomExtension extends Room {
         return Math.max(0, Math.min(idleEmpty, locals - floor))
     }
 
+    /**
+     * 本地 carrier 稳态数量：本地矿点总产能 × 单车往返时间 / 单车运力。
+     * 产量和运力都是固定的，算出来就是稳态，只在事件（建成/升级/死亡）时重算。
+     * 往返按矿点→spawn 的距离估（container 就在矿点旁），取放货各留 2 tick。
+     */
+    private localCarrierTarget(): number {
+        const floor = this.localCarrierFloor()
+        if (!this.controller || !this.controller.my) {
+            return floor
+        }
+        const rate = this.find(FIND_SOURCES).length * workerSetting.sourceRate
+        if (!rate) {
+            return floor
+        }
+        const ticksPerTile = calcTicksPerTile(getBody('carrier', this))
+        const distances = this.memory.harvestSpawnDistance ?? {}
+        let total = 0
+        let count = 0
+        for (const sourceId in distances) {
+            total += distances[sourceId]
+            count++
+        }
+        // 还没量过距离时按 15 格估
+        const oneWay = count ? total / count : 15
+        const roundTrip = Math.ceil(2 * oneWay / ticksPerTile) + 4
+        return Math.max(floor, Math.ceil(rate * roundTrip / this.carrierCapacity()))
+    }
+
+    /**
+     * 单个外矿矿点的回运车稳态数量：产能 × 往返 / 单车运力，夹在 [1, carryMax]。
+     * 往返按房间线性距离估单程（和 refreshRemoteHarvesterSpawn 同一套：50 格/房 + 25 格余量）。
+     */
+    private remoteCarrierTargetOf(roomName: string): number {
+        if (!this.controller || !this.controller.my) {
+            return 0
+        }
+        const ticksPerTile = calcTicksPerTile(getBody('remoteCarrier', this))
+        const oneWay = Game.map.getRoomLinearDistance(this.name, roomName) * 50 + 25
+        const roundTrip = Math.ceil(2 * oneWay / ticksPerTile) + 4
+        const need = Math.ceil(workerSetting.sourceRate * roundTrip / this.carrierCapacity())
+        return Math.max(1, Math.min(remoteSetting.carryMax, need))
+    }
+
+    /**
+     * 本地 carrier 的实际保底值：只留下限 1 只，稳态由 localCarrierTarget 决定。
+     * spawnTable.carrier 是旧的固定配额，不再参与保底（否则下限会永远停在表值）。
+     */
     private localCarrierFloor(): number {
-        const level = this.controller ? this.controller.level : 0
-        return Math.max(spawnTable.carrier[level] ?? 0, carrierSetting.localFloor)
+        return carrierSetting.localFloor
     }
 
     /**
@@ -2529,13 +2571,14 @@ export default class RoomExtension extends Room {
     /**
      * 该矿点是否已经排了孵化/正在孵化（spawn 任务或 spawning 中的 creep 带同一矿点）
      */
-    private remoteSourcePending(role: 'remoteHarvester' | 'remoteCarrier', sourceId: string): boolean {
+    private remoteSourcePending(role: 'remoteHarvester' | 'remoteCarrier', sourceId: string): number {
+        let count = 0
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
         for (const key in spawnBuckets) {
             for (const task of spawnBuckets[key] ?? []) {
                 if (task?.taskParam?.[0] === role
                     && task?.taskParam?.[2] === sourceId) {
-                    return true
+                    count++
                 }
             }
         }
@@ -2550,10 +2593,10 @@ export default class RoomExtension extends Room {
                 ? spawningMemory.remoteCarrySourceId
                 : spawningMemory.harvestSourceId
             if (bound === sourceId) {
-                return true
+                count++
             }
         }
-        return false
+        return count
     }
 
     private remoteHarvestSourceOf(creep: Creep): string | undefined {
@@ -3137,7 +3180,8 @@ export default class RoomExtension extends Room {
         console.log("Global init Spawn")
         let spawnNum: { [role in Role]: number } = {
             'harvester': this.find(FIND_SOURCES).length,
-            'carrier': spawnTable['carrier'][level],
+            // 本地 carrier 按产能/运力算稳态，不再用固定表值
+            'carrier': this.localCarrierTarget(),
             'worker': spawnTable['worker'][level],
             'emptyWorker': spawnTable['emptyWorker'][level],
             // 外矿 harvester 不参与自动补员：配额故意为 0，让它 reSpawn=false，
@@ -3246,11 +3290,13 @@ export default class RoomExtension extends Room {
                         param: []
                     })
                 }
-                // emptyWorker 只是临时取能状态，按原职业统计，否则每次推送代码都会
-                // 把正在取能的 worker 当成缺失，重复排队孵化
-                const role = creep.memory.role === 'emptyWorker'
-                    ? (creep.memory.oldRole ?? creep.memory.role)
-                    : creep.memory.role
+                // 按名字定身份：emptyWorker/sleep/外矿转职都只是临时岗位，
+                // 配额要按出生职业算，否则每次推送代码都会把临时岗位当成缺失重复孵化。
+                // 名字不合约定的老 creep 退回 oldRole/当前角色兜底。
+                const role = baseRoleOf(creepName)
+                    ?? (creep.memory.role === 'emptyWorker'
+                        ? (creep.memory.oldRole ?? creep.memory.role)
+                        : creep.memory.role)
                 // 代码推送会清空 Memory.rooms（包括事件），这里给现存的 harvester 重新挂换班事件
                 if (role === 'harvester' || role === 'remoteHarvester') {
                     if (assignedSource) {
@@ -3617,7 +3663,13 @@ export default class RoomExtension extends Room {
                     if (memory.oldRole) {
                         memory.role = memory.oldRole
                     }
-                    if (memory.role === 'harvester') {
+                    // 身份按名字（出生职业）分池：转职中的 carrier 死了仍补本地池，
+                    // 外矿覆盖因此空出一只，再单独补回运车。两个池人数互不影响。
+                    const baseRole = baseRoleOf(creepName)
+                    if (baseRole === 'carrier' || baseRole === 'remoteCarrier') {
+                        room.reconcileCarrier()
+                        room.reconcileRemoteCarriers()
+                    } else if (memory.role === 'harvester') {
                         // harvester 正常由换班事件提前替补；意外死亡时在这里兜底补员。
                         // 不看 reSpawn：换班窗口内有 3~4 只矿工时推代码，替补会被全局配额
                         // 标成 reSpawn=false，只按它自己的死亡事件走就永远不补人，
@@ -3719,6 +3771,8 @@ export default class RoomExtension extends Room {
 
     buildOver(x: number, y: number) {
         const structures = this.lookForAt(LOOK_STRUCTURES, x, y)
+        // 建成的 spawn/extension 会提高单车运力，carrier 稳态数量要跟着重算
+        let energyCapacityChanged = false
         for (const structure of structures) {
             if (structure.onBuild) {
                 structure.onBuild()
@@ -3726,6 +3780,7 @@ export default class RoomExtension extends Room {
             // 新建的 spawn/extension 加入能量结构顺序表，后续 spawn 就能直接用它
             if (structure.structureType === STRUCTURE_SPAWN || structure.structureType === STRUCTURE_EXTENSION) {
                 this.registerEnergyStructure(structure.id as Id<StructureSpawn | StructureExtension>)
+                energyCapacityChanged = true
             }
             // 新建 container 立即刷新容器列表，不用等 100 tick 兜底
             if (structure.structureType === STRUCTURE_CONTAINER) {
@@ -3743,6 +3798,13 @@ export default class RoomExtension extends Room {
         // 工地建成 = 槽位释放：把道路 pending 里的下一批挂上（异步续批，不等轮询）
         if (this.memory.roadPlan?.pending?.length) {
             this.flushRoadSites()
+        }
+        // 运力变了：按新运力重算两个池的稳态目标。已经孵化的车不回收，
+        // 多出来的自然死亡后按新目标收敛；排队中的任务体型是排队时算的，
+        // 孵化后下一轮补员会用新体型。
+        if (energyCapacityChanged) {
+            this.reconcileCarrier()
+            this.reconcileRemoteCarriers()
         }
     }
 
@@ -3782,6 +3844,9 @@ export default class RoomExtension extends Room {
                 this.memory.creepTask.spawnTask = {}
             }
             this.initSpawn(this.controller.level)
+            // 新等级体型/运力变了，两个 carrier 池的稳态目标跟着重算
+            this.reconcileCarrier()
+            this.reconcileRemoteCarriers()
             this.refreshUpgradeTask()
             this.registEvent(checkRoomLevelEvent(Game.time + 1))
             return
@@ -4095,17 +4160,58 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * 10 tick 扫描：本地 carrier 低于保底数量时补一个。
-     * 转职去外矿的车会让本地数量下降，这里负责兜底。
+     * 按出生职业（名字）统计本房人数，含排队/孵化中的 spawn 任务。
+     * 临时岗位（emptyWorker / sleep / 转职 remoteCarrier）不改变归属：
+     * 一辆 carrier 临时去外矿仍算本地 carrier，回来时也不会多出一辆。
      */
-    refreshCarrierQuota(): void {
-        const floor = this.localCarrierFloor()
-        if (!floor) {
-            return
+    private countBaseRole(role: Role): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom === this.name && baseRoleOf(name) === role) {
+                count++
+            }
         }
-        if (this.countRoleWithSpawnQueue('carrier') < floor) {
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === role) {
+                    count++
+                }
+            }
+        }
+        return count
+    }
+
+    /**
+     * 本地 carrier 稳态补员：按名字（出生职业）计数，低于稳态目标才补。
+     * 转职去外矿是临时的，身份不变，所以转职/回程都不需要补员；只在
+     * 死亡、extension/spawn 建成、升级这些改变产能/运力的事件后调用。
+     */
+    reconcileCarrier(): void {
+        if (this.countBaseRole('carrier') < this.localCarrierTarget()) {
             this.addToSpawnList('carrier')
         }
+    }
+
+    /**
+     * 外矿回运车稳态补员：覆盖数里包含临时转职过来的本地 carrier
+     * （remoteSourceCarrierCount 按当前岗位 + 矿点绑定统计），
+     * 所以一辆本地车转过去顶班时不会重复孵化。死亡/回程后调用。
+     */
+    reconcileRemoteCarriers(): void {
+        const plan = Memory.remotePlan?.[this.name]
+        if (!plan || plan.enabled === false) {
+            return
+        }
+        this.refreshRemoteCarrierSpawn(plan)
+    }
+
+    /**
+     * 10 tick 扫描兜底：按稳态目标补本地 carrier（事件漏掉时兜底）。
+     */
+    refreshCarrierQuota(): void {
+        this.reconcileCarrier()
     }
 
     /**

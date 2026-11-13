@@ -18,11 +18,9 @@ export const spawnSetting = {
 export const spawnTable: { [role in Role]: number[] } = {
     //               0, 1, 2, 3, 4, 5, 6, 7, 8
     'harvester':    [0, 0, 0, 0, 0, 0, 0, 0, 0], // harvester 根据房间source数量动态调整
-    // 配额按"总 WORK/CARRY 部件与产能匹配"定，而不是按人数拍：
-    // 满体型 carrier 单趟 CARRY = 容量/100（RCL2 5 → RCL8 25，250 → 1250），
-    // 按总运力不变配人数：RCL2 3×250≈750、RCL3 2×400=800、RCL4+ 2 只就够。
-    // 保留 2 只作冗余。本地升级能量由 worker 自己从 container 取（energyTask），
-    // carrier 只负责 spawn/extension/tower 补能和回运。
+    // 本地 carrier 不再按这张表孵化：稳态数量由 localCarrierTarget()
+    // 按"矿点产能 × 往返 / 单车运力"算（下限 carrierSetting.localFloor）。
+    // 这里只保留历史值作参考，initSpawn 不会读它。
     'carrier':      [0, 1, 3, 2, 2, 2, 2, 2, 2],
     // 主矿 2 个矿点：RCL2 产能 16/tick，RCL3+ 约 24/tick。
     // 满体型 worker 的 WORK = (容量-150)/150（RCL3 4 WORK、RCL4 7 WORK）。
@@ -61,8 +59,9 @@ export const mineralSetting = {
 // 本地 carrier 保底数量：运输车和本地 carrier 体型完全一样，
 // 外矿缺车时优先把空闲的本地 carrier 转职过去，但本地至少留这么多，
 // 否则 spawn/extension 补能会断档。
+// 稳态数量由 localCarrierTarget() 按产能/运力算，这里只是下限（兜底 1 只）。
 export const carrierSetting = {
-    localFloor: 4,
+    localFloor: 1,
 }
 
 // worker 人数按可用产能动态决定（不是按固定配额）：
