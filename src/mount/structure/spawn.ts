@@ -74,39 +74,48 @@ export default class SpawnExtension extends Spawn {
                     this.pos.y + 2,
                     {align: 'left', opacity: 0.8, font: "20px"})
                 if (this.room.energyAvailable < energyNeeded) {
-                    // 正常情况等 carryTask 补能即可；等太久说明房间已经补不上能量
-                    // （典型是 carrier 全灭），按当前能量换一个买得起的最小体型先孵出来，
-                    // 否则 priority 0 的大体型任务会把后面的 carrier/worker 全部堵死。
+                    // 只有本地 carrier 允许缩体型；其它角色一直等满体型。
                     const waited = task.queuedAt === undefined ? 0 : Game.time - task.queuedAt
-                    if (waited < spawnSetting.affordWaitTicks) {
-                        return
-                    }
-                    // 能量还在增长：说明房间正在回血（carrier 在往 spawn/extension 搬），
-                    // 继续等，不要急着把大体型任务砍成小体型。只有连续一个窗口都不增长
-                    // 才兜底；同时用总时长硬上限保证一定会有结果。
-                    if (task.queuedEnergy !== undefined && this.room.energyAvailable > task.queuedEnergy) {
-                        task.queuedEnergy = this.room.energyAvailable
-                        task.queuedAt = Game.time
-                        const age = task.createdAt === undefined ? 0 : Game.time - task.createdAt
-                        if (age < spawnSetting.affordMaxWaitTicks) {
+                    const aliveCarriers = this.room.aliveCarrierCount()
+                    if (role === 'carrier') {
+                        if (aliveCarriers > 0) {
+                            // 有车：先等 timer；到点后运力够就继续等，不够才缩体型出车
+                            if (waited < spawnSetting.affordWaitTicks) {
+                                return
+                            }
+                            if (!this.room.checkCarrier()) {
+                                task.queuedAt = Game.time
+                                return
+                            }
+                        }
+                        // 没车直接孵；有车且运力不够则在 timer 到点后孵：
+                        // 按当前能量缩到最大可负担体型（“尽可能大”）
+                        const fallbackBody = getBodyForEnergy('carrier', this.room, this.room.energyAvailable)
+                        if (!fallbackBody) {
                             return
                         }
-                    }
-                    // 缩体型之前先看是不是运输真不够：稳态配额按满体型算，实际在跑
-                    // 的小车运力不足时配额会一直显示“够了”，房间就卡在小车上。
-                    // 这时按当前能量插一辆救急 carrier（reSpawn=false），
-                    // 每次兜底触发补一辆，经济恢复后它死掉不再自动补。
-                    if (this.room.checkCarrier()) {
-                        this.room.addRescueCarrier()
-                    }
-                    const fallbackBody = getBodyForEnergy(role, this.room, this.room.energyAvailable)
-                    if (!fallbackBody) {
-                        return
-                    }
-                    task.taskParam[1] = fallbackBody
-                    rolePart = fallbackBody
-                    energyNeeded = CalBodyCost(fallbackBody)
-                    if (this.room.energyAvailable < energyNeeded) {
+                        task.taskParam[1] = fallbackBody
+                        rolePart = fallbackBody
+                        energyNeeded = CalBodyCost(fallbackBody)
+                        if (this.room.energyAvailable < energyNeeded) {
+                            return
+                        }
+                    } else {
+                        // 非 carrier 不缩体型，保持满体型等待。
+                        // 没车：立刻插救急 carrier；有车：等 timer 到点后按运力决定要不要插。
+                        // 救急车插到当前堵住的桶队首，补上能量后大体型任务自然能孵。
+                        if (aliveCarriers === 0) {
+                            this.room.addRescueCarrier(activeKey)
+                            task.queuedAt = Game.time
+                            return
+                        }
+                        if (waited < spawnSetting.affordWaitTicks) {
+                            return
+                        }
+                        if (this.room.checkCarrier()) {
+                            this.room.addRescueCarrier(activeKey)
+                        }
+                        task.queuedAt = Game.time
                         return
                     }
                 }

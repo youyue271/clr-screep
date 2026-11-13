@@ -5,14 +5,11 @@
 export const spawnPercent = 0.6
 export const spawnPercentFull = 1
 
-// spawn 队列等能量的兜底阈值：任务排队超过这么多 tick 还买不起 body，
-// 就按当前能量换一个买得起的最小体型先孵化。
-// 正常补能 100 tick 内早就够了，只在 carrier 全灭之类的饿死场景生效。
+// spawn 队列等能量的兜底阈值：任务排队超过这么多 tick 还买不起满体型 body，
+// 就按当前能量缩小体型 / 让救急 carrier 插队。
+// 只有本地 carrier 允许缩体型，其它角色一直等满体型。
 export const spawnSetting = {
     affordWaitTicks: 100,
-    // 总等待硬上限：能量一直在缓慢增长时也会在这么多 tick 后强制缩体型，
-    // 保证兜底一定生效（正常 100 tick 内涨够就不会走到这里）
-    affordMaxWaitTicks: 400,
 }
 
 export const spawnTable: { [role in Role]: number[] } = {

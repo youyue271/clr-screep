@@ -3522,7 +3522,7 @@ export default class RoomExtension extends Room {
         }
     }
 
-    addToSpawnList(role: Role, sourceId?: Id<any>, targetRoom?: string, missionId?: string, reSpawn?: boolean, body?: BodyPartConstant[]) {
+    addToSpawnList(role: Role, sourceId?: Id<any>, targetRoom?: string, missionId?: string, reSpawn?: boolean, body?: BodyPartConstant[], frontOfBucket?: string) {
         if (!this.memory.creepTask) {
             return
         }
@@ -3547,12 +3547,8 @@ export default class RoomExtension extends Room {
                 : role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
                 && role !== 'claimer' && role !== 'attacker' && role !== 'miner',
                 targetRoom, missionId],
-            // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
-            // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
+            // 记录排队时间：spawn 等能量超过阈值后按运力决定缩体型/插救急车
             queuedAt: Game.time,
-            // 记录排队时的能量高水位：能量还在增长就说明房间在回血，先不缩体型
-            queuedEnergy: this.energyAvailable,
-            createdAt: Game.time,
             // 外矿/侦察兵排在最后：本地换班/补员都做完了才轮得到它们
             priority: role == 'harvester' ? 0
                 : role == 'carrier' ? 1
@@ -3571,11 +3567,20 @@ export default class RoomExtension extends Room {
             persistent: false, 
             reservedBy: []
         }
-        const key = String(task.priority)
+        // frontOfBucket：救急 carrier 专用。直接插到"当前堵住的桶"队首，
+        // 才能真正插队；否则被 priority 0 的 harvester 卡住时永远轮不到它。
+        const key = frontOfBucket ?? String(task.priority)
+        if (frontOfBucket) {
+            task.priority = Number(frontOfBucket)
+        }
         if (!spawnBuckets[key]) {
             spawnBuckets[key] = []
         }
-        spawnBuckets[key].push(task)
+        if (frontOfBucket) {
+            spawnBuckets[key].unshift(task)
+        } else {
+            spawnBuckets[key].push(task)
+        }
     }
 
     /**
@@ -4450,7 +4455,12 @@ export default class RoomExtension extends Room {
      * priority 1 保证能插到堵着的 priority 3 外矿任务前面。
      * 每次 spawn 兜底触发补一辆，连续触发就连续补，相当于动态调运力。
      */
-    addRescueCarrier(): boolean {
+    /**
+     * 救急 carrier：按当前能量算"尽可能大"的体型，插到堵住的桶队首。
+     * frontOfBucket 由 spawn 传入（当前正在处理、买不起体型的那个桶），
+     * 保证它能真正插队，而不是排在 priority 1 桶尾被 priority 0 的任务挡死。
+     */
+    addRescueCarrier(frontOfBucket?: string): boolean {
         const body = getBodyForEnergy('carrier', this, this.energyAvailable)
         if (!body) {
             return false
@@ -4465,8 +4475,28 @@ export default class RoomExtension extends Room {
                 }
             }
         }
-        this.addToSpawnList('carrier', undefined, undefined, undefined, false, body)
+        this.addToSpawnList('carrier', undefined, undefined, undefined, false, body, frontOfBucket)
         return true
+    }
+
+    /**
+     * 当前可用的本方运输单位（carrier + 临时转成 emptyWorker 的本地 carrier）。
+     * 按当前岗位算，不算已经转去外矿/睡觉的车。
+     * spawn 用它判断"本地还有没有车"：没车要立刻出救急车。
+     */
+    aliveCarrierCount(): number {
+        let count = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom !== this.name) {
+                continue
+            }
+            if (creep.memory.role === 'carrier'
+                || (creep.memory.role === 'emptyWorker' && creep.memory.oldRole === 'carrier')) {
+                count++
+            }
+        }
+        return count
     }
 
     /**

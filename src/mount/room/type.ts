@@ -411,7 +411,7 @@ interface Room {
      * 对添加孵化列表的简单封装
      * @param role
      */
-    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string, reSpawn?: boolean, body?: BodyPartConstant[]): void
+    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string, reSpawn?: boolean, body?: BodyPartConstant[], frontOfBucket?: string): void
 
     /**
      * event相关
@@ -503,10 +503,15 @@ interface Room {
     checkCarrier(): boolean
 
     /**
-     * 紧急补一辆按当前能量买得起的 carrier，reSpawn=false、priority 1。
-     * 队列里已有救急车时不再加。
+     * 紧急补一辆按当前能量买得起的 carrier，reSpawn=false。
+     * frontOfBucket：插到堵住的桶队首真正插队；队列里已有救急车时不再加。
      */
-    addRescueCarrier(): boolean
+    addRescueCarrier(frontOfBucket?: string): boolean
+
+    /**
+     * 存活的本方运输单位数量（carrier + 临时转成 emptyWorker 的本地 carrier）。
+     */
+    aliveCarrierCount(): number
 
     /**
      * 外矿回运车稳态补员：按产能/运力算每个矿点的目标车数，
