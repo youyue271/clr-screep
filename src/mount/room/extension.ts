@@ -1,4 +1,4 @@
-import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, initializeArray} from "@/util/utils";
+import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getBodyForEnergy, getClaimerBody, initializeArray} from "@/util/utils";
 import {mapping, plan1Buckets, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1, plan2CoreBuckets, plan2ClusterBuckets, EnergyBucketPlan} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
 import {carrierSetting, containerWatermark, harvestSetting, mineralSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, warSetting, workerSetting} from "@/setting";
@@ -2508,6 +2508,14 @@ export default class RoomExtension extends Room {
         if (!rate) {
             return floor
         }
+        return Math.max(floor, Math.ceil(rate * this.carrierRoundTrip() / this.carrierCapacity()))
+    }
+
+    /**
+     * 本地 carrier 一趟往返的 tick 数：矿点→spawn 距离按满体型走速折算，
+     * 取放货各留 2 tick。距离是布局/地形属性，不随现有 creep 的体型变化。
+     */
+    private carrierRoundTrip(): number {
         const ticksPerTile = calcTicksPerTile(getBody('carrier', this))
         const distances = this.memory.harvestSpawnDistance ?? {}
         let total = 0
@@ -2518,8 +2526,7 @@ export default class RoomExtension extends Room {
         }
         // 还没量过距离时按 15 格估
         const oneWay = count ? total / count : 15
-        const roundTrip = Math.ceil(2 * oneWay / ticksPerTile) + 4
-        return Math.max(floor, Math.ceil(rate * roundTrip / this.carrierCapacity()))
+        return Math.ceil(2 * oneWay / ticksPerTile) + 4
     }
 
     /**
@@ -3325,7 +3332,7 @@ export default class RoomExtension extends Room {
         }
     }
 
-    addToSpawnList(role: Role, sourceId?: Id<any>, targetRoom?: string, missionId?: string) {
+    addToSpawnList(role: Role, sourceId?: Id<any>, targetRoom?: string, missionId?: string, reSpawn?: boolean, body?: BodyPartConstant[]) {
         if (!this.memory.creepTask) {
             return
         }
@@ -3342,8 +3349,12 @@ export default class RoomExtension extends Room {
             // 外矿/侦察角色的补员统一由扫描逻辑决定，死亡后不走
             // creepRecycle 无条件重孵：否则两者会在死亡同一 tick 各补一只（竞态超编），
             // 停用房也会继续补人
-            taskParam: [role, getBody(role, this), sourceId,
-                role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
+            // 显式传入 body 优先（救急 carrier 按当前能量算的体型），否则按满容量算
+            taskParam: [role, body ?? getBody(role, this), sourceId,
+                // 显式传入的 reSpawn 优先（救急 carrier 传 false）；
+                // 外矿/侦察角色默认不重孵，其余角色死亡后由 creepRecycle 按需重孵
+                reSpawn !== undefined ? reSpawn
+                : role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
                 && role !== 'claimer' && role !== 'attacker' && role !== 'miner',
                 targetRoom, missionId],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
@@ -4192,6 +4203,80 @@ export default class RoomExtension extends Room {
         if (this.countBaseRole('carrier') < this.localCarrierTarget()) {
             this.addToSpawnList('carrier')
         }
+    }
+
+    /**
+     * 本地运输是不是真的不够（给 spawn 兜底分支判断用）。
+     * localCarrierTarget 用满体型算，实际在跑的车可能被 spawn 的兜底体型砍成小车，
+     * 辆数够了但总运力不够——车永远长不大，补一辆才有意义。
+     * 按实际总载重比：稳态需要的在途载重 = 产能 × 往返 tick。
+     * 没有可搬的能量（container/link/storage/掉落物都没货）时不补，补了也搬不动。
+     */
+    checkCarrier(): boolean {
+        const movable = !!this.bestEnergyContainer(1)
+            || (this.storage
+                ? this.storage.store.getUsedCapacity(RESOURCE_ENERGY) > storageSetting.reserveEnergy
+                : false)
+            || this.find(FIND_DROPPED_RESOURCES)
+                .some(resource => resource.resourceType === RESOURCE_ENERGY && resource.amount > 0)
+        if (!movable) {
+            return false
+        }
+        const rate = this.find(FIND_SOURCES).length * workerSetting.sourceRate
+        if (!rate) {
+            return false
+        }
+        let capacity = 0
+        for (const name in Game.creeps) {
+            const creep = Game.creeps[name]
+            if (creep.memory.spawnRoom !== this.name) {
+                continue
+            }
+            // 本地没活时 carrier 会以 emptyWorker + oldRole=carrier 的形态取能，
+            // 是同一套运输体型，必须算进去
+            if (creep.memory.role !== 'carrier'
+                && !(creep.memory.role === 'emptyWorker' && creep.memory.oldRole === 'carrier')) {
+                continue
+            }
+            capacity += creep.store.getCapacity()
+        }
+        // 已经排队/孵化中的 carrier 也算，避免同一个兜底窗口反复往队列里塞车
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] !== 'carrier') {
+                    continue
+                }
+                const body = task.taskParam[1] as BodyPartConstant[] | undefined
+                capacity += (body ?? []).filter(part => part === CARRY).length * 50
+            }
+        }
+        return capacity < rate * this.carrierRoundTrip()
+    }
+
+    /**
+     * 紧急补一辆救急 carrier：体型按当前能量刚好买得起，
+     * reSpawn=false（经济恢复后死了不再无条件补，交回稳态配额决定），
+     * priority 1 保证能插到堵着的 priority 3 外矿任务前面。
+     * 每次 spawn 兜底触发补一辆，连续触发就连续补，相当于动态调运力。
+     */
+    addRescueCarrier(): boolean {
+        const body = getBodyForEnergy('carrier', this, this.energyAvailable)
+        if (!body) {
+            return false
+        }
+        // 队列里同一时刻只留一辆救急车：兜底窗口里每 tick 都会走到这里，
+        // 不限量会一次塞进一长串小车，挤占后面 normal 补员的位置
+        const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        for (const key in spawnBuckets) {
+            for (const task of spawnBuckets[key] ?? []) {
+                if (task?.taskParam?.[0] === 'carrier' && task.taskParam[3] === false) {
+                    return false
+                }
+            }
+        }
+        this.addToSpawnList('carrier', undefined, undefined, undefined, false, body)
+        return true
     }
 
     /**

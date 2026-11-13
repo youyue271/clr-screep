@@ -400,7 +400,7 @@ interface Room {
      * 对添加孵化列表的简单封装
      * @param role
      */
-    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string): void
+    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string, reSpawn?: boolean, body?: BodyPartConstant[]): void
 
     /**
      * event相关
@@ -484,6 +484,18 @@ interface Room {
      * 转职去外矿不改变身份，所以转职/回程不会触发补员。
      */
     reconcileCarrier(): void
+
+    /**
+     * 本地运输是否真不够：按实际活着的 carrier 总载重（含排队任务）
+     * 对比"产能 × 往返 tick"的在途需求。没有可搬能量时返回 false。
+     */
+    checkCarrier(): boolean
+
+    /**
+     * 紧急补一辆按当前能量买得起的 carrier，reSpawn=false、priority 1。
+     * 队列里已有救急车时不再加。
+     */
+    addRescueCarrier(): boolean
 
     /**
      * 外矿回运车稳态补员：按产能/运力算每个矿点的目标车数，

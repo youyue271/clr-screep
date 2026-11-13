@@ -92,6 +92,13 @@ export default class SpawnExtension extends Spawn {
                             return
                         }
                     }
+                    // 缩体型之前先看是不是运输真不够：稳态配额按满体型算，实际在跑
+                    // 的小车运力不足时配额会一直显示“够了”，房间就卡在小车上。
+                    // 这时按当前能量插一辆救急 carrier（reSpawn=false），
+                    // 每次兜底触发补一辆，经济恢复后它死掉不再自动补。
+                    if (this.room.checkCarrier()) {
+                        this.room.addRescueCarrier()
+                    }
                     const fallbackBody = getBodyForEnergy(role, this.room, this.room.energyAvailable)
                     if (!fallbackBody) {
                         return
