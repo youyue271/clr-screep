@@ -45,8 +45,17 @@ export const spawnTable: { [role in Role]: number[] } = {
     // 中央 carrier 不按这张表孵化：由 ensureCenterCarrier 在 link 解锁且
     // 中央 link + 至少一条转发 link + storage 都到位后补一只常驻
     'centerCarrier': [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // miner 不按这张表孵化：由 ensureMiner 在 extractor 建成后按矿点补一只
+    'miner':        [0, 0, 0, 0, 0, 0, 0, 0, 0],
     // sleep 是矿采空后的临时状态，从不孵化
     'sleep':        [0, 0, 0, 0, 0, 0, 0, 0, 0],
+}
+
+// 矿物开采：extractor 需要 RCL6；冷却 5 tick 是引擎常量，
+// 用户代码里拿不到 EXTRACTOR_COOLDOWN，只能在这里存一份。
+export const mineralSetting = {
+    minRcl: 6,
+    extractorCooldown: 5,
 }
 
 // 本地 carrier 保底数量：运输车和本地 carrier 体型完全一样，

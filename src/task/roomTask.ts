@@ -144,6 +144,79 @@ export function getContainerEnergy(room: Room): MyTask[] {
 }
 
 /**
+ * 矿物常驻采集任务：每个房间最多一条，miner 只认它。
+ * taskParam = [mineralId, 采矿格 x, 采矿格 y]
+ */
+export function getMineralHarvestTask(room: Room): MyTask[] {
+    const plan = room.memory.mineralPlan
+    if (!plan || !plan.minePos) {
+        return []
+    }
+    const mineral = Game.getObjectById<Mineral>(plan.mineralId as Id<Mineral>)
+    if (!mineral) {
+        return []
+    }
+    const pos = room.getPositionAt(plan.minePos[0], plan.minePos[1])
+    // 采矿格必须是矿物相邻的独立格；memory 被推代码清空后可能残留 [0,0]，
+    // 发出去 miner 会往房间角跑，这里直接不发
+    if (!pos || pos.isEqualTo(mineral.pos) || !pos.inRangeTo(mineral.pos, 1)) {
+        return []
+    }
+    return [{
+        taskType: 'mineralHarvestTask',
+        taskFunc: 'harvestMineral',
+        taskParam: [mineral.id, pos.x, pos.y],
+        priority: 0,
+        capacity: 1,
+        persistent: true,
+        targetId: mineral.id,
+    }]
+}
+
+/**
+ * 矿物回运任务：采矿格 container（还没建成时用地上矿堆）里的矿物送 storage。
+ * 并发按当前存量/平均载重动态算，和能源任务同一套口径；
+ * 没有 storage / 没有可运的矿物时不发布。
+ * taskParam = [mineralType, 采矿格 x, 采矿格 y, storageId]
+ */
+export function getMineralCarryTask(room: Room): MyTask[] {
+    const plan = room.memory.mineralPlan
+    const storage = room.storage
+    if (!plan || !plan.minePos || !storage) {
+        return []
+    }
+    const mineral = Game.getObjectById<Mineral>(plan.mineralId as Id<Mineral>)
+    const pos = room.getPositionAt(plan.minePos[0], plan.minePos[1])
+    if (!mineral || !pos) {
+        return []
+    }
+    // 非法采矿格（[0,0]/矿物本格）：没有可回运的目标，别发布任务
+    if (pos.isEqualTo(mineral.pos) || !pos.inRangeTo(mineral.pos, 1)) {
+        return []
+    }
+    const container = pos.lookFor(LOOK_STRUCTURES)
+        .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
+    const pile = pos.lookFor(LOOK_RESOURCES)
+        .find(item => item.resourceType === mineral.mineralType) as Resource | undefined
+    const amount = (container ? container.store.getUsedCapacity(mineral.mineralType) : 0)
+        + (pile ? pile.amount : 0)
+    if (!amount) {
+        return []
+    }
+    const maxCarry = room.carrierCapacity()
+    return [{
+        taskType: 'mineralCarryTask',
+        taskFunc: 'carryMineral',
+        taskParam: [mineral.mineralType, plan.minePos[0], plan.minePos[1], storage.id],
+        priority: 2,
+        capacity: Math.max(1, Math.ceil(amount / maxCarry)),
+        persistent: false,
+        // container 还没建成时用房间级标记，建成后自动换成 container id
+        targetId: container ? container.id : `mineral-${room.name}`,
+    }]
+}
+
+/**
  * 掉落物/墓碑的机会队列：都会衰减，不能按固定任务容量管理。
  * 评分越高越优先：量越大、剩余寿命越短、离 spawn 越近。
  * 只保留前 opportunitySetting.maxTasks 条。
@@ -421,7 +494,8 @@ export function createBuildTask(targetList:ConstructionSite[]): MyTask[]{
         // 注意：这里必须用 includes，in 判断的是数组下标而不是元素
         // 前期优先建 spawn/extension（直接决定能孵化多少 creep），container 其次
         const priority1Structures: StructureConstant[] = [STRUCTURE_EXTENSION, STRUCTURE_SPAWN]
-        const priority2Structures: StructureConstant[] = [STRUCTURE_TOWER]
+        // extractor 提到塔同档：先建 extractor 再建采矿格 container，miner 才能尽早开工
+        const priority2Structures: StructureConstant[] = [STRUCTURE_TOWER, STRUCTURE_EXTRACTOR]
         const priority4Structures: StructureConstant[] = [STRUCTURE_ROAD, STRUCTURE_RAMPART, STRUCTURE_WALL]
         if (priority1Structures.includes(constructionType)) {
             priority = 1

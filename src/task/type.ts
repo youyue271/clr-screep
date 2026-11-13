@@ -50,3 +50,7 @@ type TaskType = 'workTask'
     | 'transferTask'
     | 'scoutTask'
     | 'claimTask'
+    // 矿物常驻采集：miner 只领这一条
+    | 'mineralHarvestTask'
+    // 矿物回运：采矿格 container/地上矿堆 -> storage
+    | 'mineralCarryTask'

@@ -124,6 +124,10 @@ export default class SpawnExtension extends Spawn {
                             harvestSourceId: role === 'harvester' || role === 'remoteHarvester'
                                 ? task?.taskParam?.[2] as Id<Source> | undefined
                                 : undefined,
+                            // miner 绑定矿物 id：换班/回收/重挂唤醒事件时认人
+                            mineralId: role === 'miner'
+                                ? task?.taskParam?.[2] as Id<Mineral> | undefined
+                                : undefined,
                             // 外矿运输车绑定矿点/外矿房：只运这个矿点脚下的 container
                             remoteCarrySourceId: role === 'remoteCarrier'
                                 ? task?.taskParam?.[2] as Id<Source> | undefined

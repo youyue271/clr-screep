@@ -1,5 +1,5 @@
 import { getEnergyTask } from "@/task/roomTask";
-import { containerWatermark, remoteSetting } from "@/setting";
+import { containerWatermark, mineralSetting, remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { assessRemoteVision } from "@/global/war/remote/l2";
 import { classifyThreat, isRemotePaused } from "@/util/threat";
@@ -24,7 +24,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'emptyWorker': ['energyTask'],
     // 本地补能永远先认领；桶任务优先（一次覆盖整桶），塔/spawn/布局外结构再走单目标
     // 本地没活时才转换角色去外矿拉货
-    'carrier': ['bucketCarryTask', 'carryTask'],
+    // 补能（extension/spawn/塔）优先，全部没活时才去拉矿物
+    'carrier': ['bucketCarryTask', 'carryTask', 'mineralCarryTask'],
     'remoteHarvester': ['remoteHarvestTask'],
     // 外矿专用运输只做外矿往返，保证外矿 container 不会因为本地任务不断出现而被饿死
     'remoteCarrier': ['remoteCarryTask'],
@@ -38,6 +39,8 @@ const roleToTask: { [role in Role]: TaskType[] } = {
     'sleep': [],
     // 中央 carrier 只领建筑间搬运任务，不参与本地补能/外矿
     'centerCarrier': ['transferTask'],
+    // 矿物开采：常驻采集任务，冷却/采空期间进 sleep 等唤醒事件
+    'miner': ['mineralHarvestTask'],
 }
 
 export default class CreepExtension extends Creep {
@@ -502,6 +505,145 @@ export default class CreepExtension extends Creep {
     sleep(): boolean {
         this.say('zzz')
         return false
+    }
+
+    /**
+     * 矿物开采：站矿点旁的固定采矿格（range 1）。
+     * - extractor 冷却期间睡到冷却结束；
+     * - 采空睡到再生；
+     * - 采集成功睡固定 5 tick + 1（冷却回合末才结算，本 tick 读不到新值），
+     *   醒来正好是冷却归零的第一 tick，不每 tick 空转 harvest。
+     * 采矿格上是 container，harvest 溢出由引擎自动填进脚下 container。
+     */
+    harvestMineral(mineralId: Id<Mineral>, mineX: number, mineY: number): boolean {
+        const mineral = Game.getObjectById<Mineral>(mineralId)
+        if (!mineral) {
+            return true
+        }
+        // 任务里可能是非法采矿格（memory 被推代码清空后重算失败会写 [0,0]）：
+        // 别往房间角跑，直接结束任务，等房间重新发一个合法的
+        const dx = Math.abs(mineX - mineral.pos.x)
+        const dy = Math.abs(mineY - mineral.pos.y)
+        if (dx > 1 || dy > 1 || (!dx && !dy)) {
+            return true
+        }
+        this.memory.mineralId = mineral.id
+        if (this.room.name !== mineral.pos.roomName) {
+            this.moveTo(new RoomPosition(mineX, mineY, mineral.pos.roomName),
+                {visualizePathStyle: {stroke: '#ffaa00'}})
+            return false
+        }
+        const minePos = new RoomPosition(mineX, mineY, this.room.name)
+        if (!this.pos.isEqualTo(minePos)) {
+            this.moveTo(minePos, {visualizePathStyle: {stroke: '#ffaa00'}})
+            return false
+        }
+        this.say('⛏️矿物')
+        if (mineral.mineralAmount <= 0) {
+            this.sleepUntilMineralReady(mineral)
+            return false
+        }
+        const extractor = mineral.pos.lookFor(LOOK_STRUCTURES)
+            .find(item => item.structureType === STRUCTURE_EXTRACTOR) as StructureExtractor | undefined
+        if (!extractor) {
+            // extractor 工地还没建好：ensureExtractor 已经排了建造任务，原地等
+            return false
+        }
+        if (extractor.cooldown > 0) {
+            this.sleepUntilMineralReady(mineral, extractor.cooldown)
+            return false
+        }
+        const res = this.harvest(mineral)
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(mineral, {range: 1, visualizePathStyle: {stroke: '#ffaa00'}})
+            return false
+        }
+        if (res === OK) {
+            // 采完立刻睡：冷却归零的第一 tick 再回来
+            this.sleepUntilMineralReady(mineral, mineralSetting.extractorCooldown + 1)
+            // 采矿格出了新矿物：同步回运任务（约每 6 tick 一次，不是每 tick 轮询）
+            this.room.syncMineralCarryTask()
+            return false
+        }
+        // ERR_TIRED 等异常：下一 tick 重新判断
+        this.sleepUntilMineralReady(mineral, 1)
+        return false
+    }
+
+    /**
+     * 矿物冷却/采空睡眠：和矿点采空睡眠同一套机制
+     * （换 sleep 伪任务、存原任务、挂 wakeCreep 事件），醒来直接接着采。
+     */
+    sleepUntilMineralReady(mineral: Mineral, waitTicks?: number): void {
+        const work = this.memory.currentWork
+        if (!work || work.taskFunc === 'sleep') {
+            return
+        }
+        this.memory.mineralId = mineral.id
+        this.memory.oldRole = this.memory.role
+        this.memory.role = 'sleep'
+        this.memory.currentWork = {
+            id: `sleep-${this.name}`,
+            taskFunc: 'sleep',
+            taskParam: [work, this.memory.currentWorkType],
+            priority: 0,
+            capacity: 1,
+            persistent: true,
+            reservedBy: [],
+        }
+        this.memory.working = true
+        // 采空等再生；冷却睡眠由调用方给确定 tick
+        const wait = waitTicks ?? (Math.max(1, mineral.ticksToRegeneration ?? 1) + 1)
+        // 事件挂在出生房：miner 只在本房工作，但保持和 harvester 一致
+        const eventRoom = Game.rooms[this.memory.spawnRoom] ?? this.room
+        eventRoom.registEvent({
+            triggerTime: Game.time + Math.max(1, wait),
+            triggerFunc: 'wakeCreep',
+            param: [this.name],
+        })
+    }
+
+    /**
+     * 矿物回运：采矿格 container（没建成时用地上矿堆）-> storage（唯一终点）。
+     * 身上有货先送 storage；到采矿格取货；源空了结束任务，
+     * 由 miner 下次收矿重新发布。
+     */
+    carryMineral(mineralType: ResourceConstant, mineX: number, mineY: number, storageId: Id<StructureStorage>): boolean {
+        const storage = Game.getObjectById<StructureStorage>(storageId)
+        // 非法采矿格（[0,0] 占位符 / 越界）：任务作废，别往房间角跑
+        if (mineX < 0 || mineY < 0 || (mineX === 0 && mineY === 0) || mineX > 49 || mineY > 49) {
+            return true
+        }
+        const homeRoom = storage ? storage.pos.roomName : this.room.name
+        if (this.store.getUsedCapacity(mineralType) > 0) {
+            if (!storage) {
+                return true
+            }
+            if (this.pos.inRangeTo(storage, 1)) {
+                this.transfer(storage, mineralType)
+                return false
+            }
+            this.moveTo(storage, {visualizePathStyle: {stroke: '#aa00ff'}})
+            return false
+        }
+        const minePos = new RoomPosition(mineX, mineY, homeRoom)
+        if (!this.pos.isEqualTo(minePos)) {
+            this.moveTo(minePos, {visualizePathStyle: {stroke: '#aa00ff'}})
+            return false
+        }
+        const container = minePos.lookFor(LOOK_STRUCTURES)
+            .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
+        if (container && container.store.getUsedCapacity(mineralType) > 0) {
+            this.withdraw(container, mineralType)
+            return false
+        }
+        const pile = minePos.lookFor(LOOK_RESOURCES)
+            .find(item => item.resourceType === mineralType) as Resource | undefined
+        if (pile && pile.amount > 0) {
+            this.pickup(pile)
+            return false
+        }
+        return true
     }
 
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant) {

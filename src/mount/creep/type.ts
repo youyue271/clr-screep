@@ -8,6 +8,8 @@ interface CreepMemory {
     reSpawn: boolean
     // 提前换班的 harvester 孵化时指定的矿点，保证接替的是同一个矿
     harvestSourceId?: Id<Source>
+    // miner 绑定的矿物 id：换班/回收/推代码重挂时认人用
+    mineralId?: Id<Mineral>
     // 外矿运输车孵化时绑定的矿点/外矿房：只领这个矿点 container 的回运任务，
     // 按"每个矿一只"专门孵化，不再由本地 carrier 转换而来
     remoteCarrySourceId?: Id<Source>
@@ -65,6 +67,9 @@ type Role = 'worker'
     // 中央搬运：站在 link/storage/terminal 中间的固定格，只做建筑之间的中转搬运。
     // 不领本地补能任务，任务形式是通用的 transferTask（from/to/resourceType）
     | 'centerCarrier'
+    // 矿物开采：站在矿点旁的固定采矿格 container 上采，冷却/采空期间睡眠，
+    // 体型和 harvester 同构，由 ensureMiner 按 extractor 补员
+    | 'miner'
 
 interface Creep {
 
@@ -92,6 +97,14 @@ interface Creep {
      * @param ContainerPosY
      */
     harvestSource(sourceId: Id<any>, containerPosX?:number, ContainerPosY?:number): boolean
+    /**
+     * 矿物开采：站矿点旁固定采矿格，采完自动进冷却睡眠；采空睡到再生。
+     */
+    harvestMineral(mineralId: Id<Mineral>, mineX: number, mineY: number): boolean
+    /**
+     * 把矿物从采矿格 container（没建成时用地上矿堆）运回 storage。
+     */
+    carryMineral(mineralType: ResourceConstant, mineX: number, mineY: number, storageId: Id<StructureStorage>): boolean
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant): boolean
     collectEnergy(id: Id<any>): boolean
     upgrade(controllerId: Id<StructureController>): boolean

@@ -1,8 +1,8 @@
 import {CalBodyCost, calcSpawnTicks, calcTicksPerTile, getBody, getClaimerBody, initializeArray} from "@/util/utils";
 import {mapping, plan1Buckets, plan2_Core, plan2_extensionCluster1, plan2_extensionCluster2, plan2_Lab, plan1, plan2CoreBuckets, plan2ClusterBuckets, EnergyBucketPlan} from "@/global/autoplan/autoplan";
 import log from "@/util/log";
-import {carrierSetting, containerWatermark, harvestSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, warSetting, workerSetting} from "@/setting";
-import {createBuildTask, getBucketCarryTask, getCarryList, getCoreLinkTransferTask, getEnergyTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
+import {carrierSetting, containerWatermark, harvestSetting, mineralSetting, remoteSetting, repairSetting, roadSetting, spawnTable, storageSetting, wallSetting, warSetting, workerSetting} from "@/setting";
+import {createBuildTask, getBucketCarryTask, getCarryList, getCoreLinkTransferTask, getEnergyTask, getMineralCarryTask, getMineralHarvestTask, getRemoteCarryTasks, getRemoteHarvestTasks, getRepairTasks, getWallRepairTasks, harvestSource, upgrade, upgradeTaskCapacityOf} from "@/task/roomTask";
 import {checkRoomLevelEvent, showRoomPlanEvent} from "@/event/roomEvent";
 import {isHighwayRoom, planRemoteRooms, pruneSourcelessRemoteRooms} from "@/global/autoplan/remotePlan";
 import {onRemoteDeath} from "@/global/war/remote/l1";
@@ -64,7 +64,10 @@ export default class RoomExtension extends Room {
             // 通用建筑间搬运（中央 carrier 用）：[fromId, toId, resourceType]
             'transferTask': {},
             'scoutTask': {},
-            'claimTask': {}
+            'claimTask': {},
+            // 矿物开采：采集任务常驻，回运任务按采矿格存量动态发布
+            'mineralHarvestTask': {},
+            'mineralCarryTask': {}
         }
 
         this.initResource()
@@ -88,6 +91,8 @@ export default class RoomExtension extends Room {
         }
         // link 已就绪但中央 carrier 死了/任务被重建：补常驻搬运任务和一只 carrier
         this.ensureCenterCarrier()
+        // 推代码后恢复矿物任务/miner；没有 extractor 时自己返回
+        this.ensureMiner()
 
         this.registEvent(checkRoomLevelEvent(Game.time + 1))
     }
@@ -100,6 +105,9 @@ export default class RoomExtension extends Room {
         this.construct(this.controller.level)
         // 确保矿点 container 工地存在：已有 container 会被直接复用，不会另起新点
         this.containerPos()
+        // 矿物开采（RCL6）：先放 extractor，再放采矿格 container；
+        // 位置只算一次，之后复用 memory.mineralPlan
+        this.ensureExtractor()
         // 布局完成后计算 spawn 到各矿点的距离，供 harvester 提前换班使用
         this.cacheHarvestSpawnDistances()
         // link 规划要在登记建造任务之前：新工地当 tick 就能进 constructTask
@@ -1858,6 +1866,310 @@ export default class RoomExtension extends Room {
     }
 
     /**
+     * 采矿格是否可用：mineral 相邻（range 1）、非墙、没有被 container/道路/rampart
+     * 以外的建筑占住。extractor 在矿点格上，不会占采矿格。
+     */
+    private isMineralMineTile(mineralPos: RoomPosition, minePos: [number, number]): boolean {
+        const pos = this.getPositionAt(minePos[0], minePos[1])
+        if (!pos || pos.isEqualTo(mineralPos) || !pos.inRangeTo(mineralPos, 1)) {
+            return false
+        }
+        if (pos.lookFor(LOOK_TERRAIN)[0] === 'wall') {
+            return false
+        }
+        return !pos.lookFor(LOOK_STRUCTURES).some(item =>
+            item.structureType !== STRUCTURE_CONTAINER
+            && item.structureType !== STRUCTURE_ROAD
+            && item.structureType !== STRUCTURE_RAMPART)
+    }
+
+    /**
+     * 矿点相邻格上已有的 container（含 container 工地）。
+     * 推代码会清空 Memory.rooms，mineralPlan 要重算；先复用已有 container 的格子，
+     * 否则每次推代码都会在矿点旁另选一格再放一个 container。
+     * 已建成的 container 优先于工地：旧 bug 可能留下一个多余的 container 工地，
+     * 不能因为它排在前面的扫描顺序就丢掉已经建好的那一格。
+     */
+    private findMineralContainerTile(mineralPos: RoomPosition): RoomPosition | undefined {
+        const built: RoomPosition[] = []
+        const sites: RoomPosition[] = []
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (!dx && !dy) {
+                    continue
+                }
+                const pos = this.getPositionAt(mineralPos.x + dx, mineralPos.y + dy)
+                if (!pos || pos.lookFor(LOOK_TERRAIN)[0] === 'wall') {
+                    continue
+                }
+                if (pos.lookFor(LOOK_STRUCTURES)
+                    .some(item => item.structureType === STRUCTURE_CONTAINER)) {
+                    built.push(pos)
+                } else if (pos.lookFor(LOOK_CONSTRUCTION_SITES)
+                    .some(item => item.structureType === STRUCTURE_CONTAINER)) {
+                    sites.push(pos)
+                }
+            }
+        }
+        return built[0] ?? sites[0]
+    }
+
+    /**
+     * 矿物开采规划（RCL6）：
+     * - mineral 本身是 obstacle，采矿格必须是相邻的可走格，选离布局中心最近的；
+     * - 先放 extractor 工地（矿点格），再放采矿格 container 工地；
+     * - 位置和矿物 id 一次算好写进 memory.mineralPlan，之后只复用。
+     * 由 initBuildList 调用：房间初始化、RCL 变化时检查一次，不做周期轮询。
+     */
+    ensureExtractor(): void {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
+        if (this.controller.level < mineralSetting.minRcl) {
+            return
+        }
+        const mineral = this.find(FIND_MINERALS)[0] as Mineral | undefined
+        if (!mineral) {
+            return
+        }
+        const plan = this.memory.mineralPlan
+            ?? (this.memory.mineralPlan = { mineralId: mineral.id, minePos: [0, 0] })
+        plan.mineralId = mineral.id
+        // 采矿格失效（还没选 / 位置被占）才重新选点。
+        // 推代码会清空 Memory.rooms，plan 要重算：优先复用矿点旁已有的 container 格，
+        // 否则会在旁边另选一格再放一个 container（实测会重复放）。
+        if (!this.isMineralMineTile(mineral.pos, plan.minePos)) {
+            const existing = this.findMineralContainerTile(mineral.pos)
+            if (existing) {
+                plan.minePos = [existing.x, existing.y]
+            } else {
+                const candidates: RoomPosition[] = []
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        if (!dx && !dy) {
+                            continue
+                        }
+                        const pos = this.getPositionAt(mineral.pos.x + dx, mineral.pos.y + dy)
+                        if (!pos || pos.lookFor(LOOK_TERRAIN)[0] === 'wall') {
+                            continue
+                        }
+                        // 有非 container 工地就换一格；container 工地/container 格要保留，
+                        // 那是之前规划好的采矿格，重算时直接复用
+                        if (pos.lookFor(LOOK_CONSTRUCTION_SITES).some(item =>
+                            item.structureType !== STRUCTURE_CONTAINER)) {
+                            continue
+                        }
+                        if (pos.lookFor(LOOK_STRUCTURES).some(item =>
+                            item.structureType !== STRUCTURE_CONTAINER
+                            && item.structureType !== STRUCTURE_ROAD
+                            && item.structureType !== STRUCTURE_RAMPART)) {
+                            continue
+                        }
+                        candidates.push(pos)
+                    }
+                }
+                // 一格都选不出来就保留旧值，交给 ensureMiner/任务层拦（不会写 [0,0] 覆盖有效值）
+                if (candidates.length) {
+                    const anchor = this.memory.roomPlanType === 2 && this.memory.plan2Pos?.core
+                        ? this.memory.plan2Pos.core
+                        : this.memory.plan1Pos
+                    const anchorPos = anchor ? this.getPositionAt(anchor[0], anchor[1]) : null
+                    const best = anchorPos
+                        ? anchorPos.findClosestByPath(candidates, {algorithm: 'astar'}) ?? candidates[0]
+                        : candidates[0]
+                    plan.minePos = [best.x, best.y]
+                }
+            }
+        }
+        // 先 extractor（矿点格），后 container（采矿格）
+        const hasExtractor = mineral.pos.lookFor(LOOK_STRUCTURES)
+            .some(item => item.structureType === STRUCTURE_EXTRACTOR)
+        const hasExtractorSite = mineral.pos.lookFor(LOOK_CONSTRUCTION_SITES)
+            .some(item => item.structureType === STRUCTURE_EXTRACTOR)
+        // 选不出合法采矿格时绝不在 [0,0] 放工地
+        const minePos = this.isMineralMineTile(mineral.pos, plan.minePos)
+            ? this.getPositionAt(plan.minePos[0], plan.minePos[1])
+            : undefined
+        const hasContainer = minePos?.lookFor(LOOK_STRUCTURES)
+            .some(item => item.structureType === STRUCTURE_CONTAINER)
+        const hasContainerSite = minePos?.lookFor(LOOK_CONSTRUCTION_SITES)
+            .some(item => item.structureType === STRUCTURE_CONTAINER)
+        let placed = false
+        if (!hasExtractor && !hasExtractorSite) {
+            if (this.createConstructionSite(mineral.pos.x, mineral.pos.y, STRUCTURE_EXTRACTOR) === OK) {
+                placed = true
+            }
+        }
+        if (!hasContainer && !hasContainerSite && minePos) {
+            if (this.createConstructionSite(minePos.x, minePos.y, STRUCTURE_CONTAINER) === OK) {
+                placed = true
+            }
+        }
+        // 工地是 intent，本 tick 的 FIND_CONSTRUCTION_SITES 看不到，下一 tick 再登记建造任务
+        if (placed) {
+            this.registEvent({
+                triggerTime: Game.time + 1,
+                triggerFunc: 'registerMineralSiteTasks',
+                param: [],
+            })
+        }
+    }
+
+    /**
+     * 把矿物格/采矿格上的新工地登记进 constructTask。
+     * extractor 在 createBuildTask 里是 priority 2，container 是 3，保证先建 extractor。
+     */
+    registerMineralSiteTasks(): void {
+        const plan = this.memory.mineralPlan
+        if (!plan) {
+            return
+        }
+        const sites: ConstructionSite[] = []
+        const mineral = Game.getObjectById<Mineral>(plan.mineralId as Id<Mineral>)
+        if (mineral) {
+            const site = mineral.pos.lookFor(LOOK_CONSTRUCTION_SITES)
+                .find(item => item.structureType === STRUCTURE_EXTRACTOR)
+            if (site) {
+                sites.push(site)
+            }
+        }
+        const minePos = this.getPositionAt(plan.minePos[0], plan.minePos[1])
+        const containerSite = minePos?.lookFor(LOOK_CONSTRUCTION_SITES)
+            .find(item => item.structureType === STRUCTURE_CONTAINER)
+        if (containerSite) {
+            sites.push(containerSite)
+        }
+        const missing = sites.filter(site => !this.hasBuildTaskFor(site.id))
+        if (missing.length) {
+            this.registTask(createBuildTask(missing))
+        }
+    }
+
+    /**
+     * extractor 建成：回填矿点信息并启动 miner。
+     */
+    onExtractorBuilt(extractor: StructureExtractor): void {
+        const mineral = extractor.pos.lookFor(LOOK_MINERALS)[0] ?? this.find(FIND_MINERALS)[0]
+        if (mineral) {
+            const plan = this.memory.mineralPlan
+                ?? (this.memory.mineralPlan = { mineralId: mineral.id, minePos: [0, 0] })
+            plan.mineralId = mineral.id
+        }
+        this.ensureMiner()
+    }
+
+    /**
+     * 矿物常驻采集补员：
+     * - 有 extractor 才工作；确保常驻采集任务存在；
+     * - 矿物有量且当前没有 miner（含排队）时补一只；
+     * - 矿物采空时按 ticksToRegeneration 挂一次再生时刻的补员事件，
+     *   因为 miner 会睡到再生，但 5 万 tick 的再生周期大概率活不到。
+     */
+    ensureMiner(): void {
+        if (!this.controller || !this.controller.my) {
+            return
+        }
+        if (this.controller.level < mineralSetting.minRcl) {
+            return
+        }
+        const plan = this.memory.mineralPlan
+        if (!plan || !plan.minePos) {
+            return
+        }
+        const mineral = Game.getObjectById<Mineral>(plan.mineralId as Id<Mineral>)
+        if (!mineral) {
+            return
+        }
+        const extractor = mineral.pos.lookFor(LOOK_STRUCTURES)
+            .find(item => item.structureType === STRUCTURE_EXTRACTOR)
+        if (!extractor) {
+            return
+        }
+        // 采矿格非法（还没选好 / 被别的建筑占住）时不发任务、不排 miner：
+        // 否则任务里会带 [0,0]，miner 会往房间角跑
+        if (!this.isMineralMineTile(mineral.pos, plan.minePos)) {
+            return
+        }
+        const [mineX, mineY] = plan.minePos
+        // 常驻采集任务：幂等，缺了才补；采矿格改过的旧任务作废后重新登记
+        const harvestTasks = getMineralHarvestTask(this)
+        if (harvestTasks.length) {
+            const buckets = this.normalizeTaskBuckets('mineralHarvestTask')
+            let exists = false
+            for (const key in buckets) {
+                const queue = buckets[key] ?? []
+                for (let i = queue.length - 1; i >= 0; i--) {
+                    const task = queue[i]
+                    if (!task || task.targetId !== mineral.id) {
+                        continue
+                    }
+                    if (task.taskParam?.[1] !== mineX || task.taskParam?.[2] !== mineY) {
+                        queue.splice(i, 1)
+                        continue
+                    }
+                    exists = true
+                }
+                if (!queue.length) {
+                    delete buckets[key]
+                }
+            }
+            if (!exists) {
+                this.registTask(harvestTasks)
+            }
+        }
+        if (mineral.mineralAmount <= 0) {
+            const wait = mineral.ticksToRegeneration
+            if (wait && (!plan.regenWakeAt || plan.regenWakeAt <= Game.time)) {
+                plan.regenWakeAt = Game.time + wait + 1
+                this.registEvent({
+                    triggerTime: plan.regenWakeAt,
+                    triggerFunc: 'ensureMiner',
+                    param: [],
+                })
+            }
+            return
+        }
+        if (this.countRoleWithSpawnQueue('miner') === 0) {
+            this.addToSpawnList('miner', mineral.id)
+        }
+    }
+
+    /**
+     * 矿物回运任务同步：按采矿格当前存量动态更新并发。
+     * 同一目标只保留一条任务；目标从地上矿堆换成 container 时清掉旧标记的任务。
+     */
+    syncMineralCarryTask(): void {
+        const tasks = getMineralCarryTask(this)
+        if (!tasks.length) {
+            return
+        }
+        const want = tasks[0]
+        const buckets = this.normalizeTaskBuckets('mineralCarryTask')
+        for (const key in buckets) {
+            const queue = buckets[key]
+            if (!queue) {
+                continue
+            }
+            const kept = queue.filter(task => task.targetId === want.targetId)
+            if (kept.length) {
+                buckets[key] = kept
+            } else {
+                delete buckets[key]
+            }
+        }
+        for (const key in buckets) {
+            const existing = (buckets[key] ?? []).find(task => task.targetId === want.targetId)
+            if (existing) {
+                // 只更新动态并发和参数，保留 reservedBy：正在路上的 carrier 不掉任务
+                existing.capacity = want.capacity
+                existing.taskParam = want.taskParam
+                return
+            }
+        }
+        this.registTask(tasks)
+    }
+
+    /**
      * link 转发事件：把一条 link 里的能量发给中央 link。
      * 由 remoteCarrier 投递成功后挂 +1 tick 执行（transfer 是 intent，当 tick 读不到）。
      * 遇到冷却/中央 link 满时按事件推迟，不退回周期扫描。
@@ -2842,6 +3154,9 @@ export default class RoomExtension extends Room {
             // 中央 carrier 由 ensureCenterCarrier 按 link 门槛补员，不进这张表；
             // 配额 0 会让现存 carrier 的 reSpawn=false，死亡由 creepRecycle 单独兜底
             'centerCarrier': 0,
+            // miner 由 ensureMiner 在 extractor 建成后按矿点补一只，配额保持 0；
+            // 死亡不走无条件重孵，由 creepRecycle 单独兜底
+            'miner': 0,
             // sleep 是矿采空后的临时状态，从不孵化
             'sleep': 0,
         }
@@ -2964,7 +3279,7 @@ export default class RoomExtension extends Room {
         }
     }
 
-    addToSpawnList(role: Role, sourceId?: Id<Source>, targetRoom?: string, missionId?: string) {
+    addToSpawnList(role: Role, sourceId?: Id<any>, targetRoom?: string, missionId?: string) {
         if (!this.memory.creepTask) {
             return
         }
@@ -2983,7 +3298,7 @@ export default class RoomExtension extends Room {
             // 停用房也会继续补人
             taskParam: [role, getBody(role, this), sourceId,
                 role !== 'remoteHarvester' && role !== 'remoteCarrier' && role !== 'viewer'
-                && role !== 'claimer' && role !== 'attacker',
+                && role !== 'claimer' && role !== 'attacker' && role !== 'miner',
                 targetRoom, missionId],
             // 记录排队时间：spawn 等能量超过阈值后会按当前能量缩小体型兜底，
             // 避免 carrier 全灭时 priority 0 的大体型任务把整队堵死
@@ -3000,6 +3315,8 @@ export default class RoomExtension extends Room {
                 : role == 'remoteHarvester' ? 3
                 : role == 'remoteCarrier' ? 3
                 : role == 'claimer' ? 3
+                // miner 只在 extractor 建成后按矿点补一只，排在外矿同档之后
+                : role == 'miner' ? 3
                 // 反击队和经济补员同档：650 能量，不压 harvester/carrier
                 : role == 'attacker' ? 2
                 : 2,
@@ -3315,6 +3632,10 @@ export default class RoomExtension extends Room {
                         // 中央 carrier 是常驻单岗：initSpawn 配额为 0，推代码后必然
                         // reSpawn=false，只能在这里按 link 门槛补员（不看 reSpawn）
                         room.ensureCenterCarrier()
+                    } else if (memory.role === 'miner') {
+                        // miner 常驻单岗：配额为 0，同样不看 reSpawn；
+                        // 矿物采空时 ensureMiner 会自己挂再生事件，不会白排孵化
+                        room.ensureMiner()
                     } else if (memory.reSpawn) {
                         if (memory.role === 'worker') {
                             // worker 人数按产能动态算：低于目标才补，避免产能下降后还 1:1 续命
@@ -3413,6 +3734,10 @@ export default class RoomExtension extends Room {
             // 新建 link：坐标对上规划位时把 linkId 补进对应外矿回运任务
             if (structure.structureType === STRUCTURE_LINK) {
                 this.onLinkBuilt(structure as StructureLink)
+            }
+            // extractor 建成：登记矿物采集任务并补一只 miner
+            if (structure.structureType === STRUCTURE_EXTRACTOR) {
+                this.onExtractorBuilt(structure as StructureExtractor)
             }
         }
         // 工地建成 = 槽位释放：把道路 pending 里的下一批挂上（异步续批，不等轮询）

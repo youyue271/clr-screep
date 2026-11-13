@@ -152,6 +152,13 @@ interface RoomMemory {
     linkPlan?: LinkPlan
     // 布局外的道路规划：几何一次算到 RCL8，按等级分段施工
     roadPlan?: RoadPlan
+    // 矿物开采规划：mineral id + 固定采矿格（mineral 相邻、离布局中心最近的可走格）
+    mineralPlan?: {
+        mineralId: Id<Mineral>
+        minePos: [number, number]
+        // 矿物采空后安排的一次补员事件时间：防止重复登记，也用于推代码后恢复
+        regenWakeAt?: number
+    }
 }
 
 interface LinkPlan {
@@ -356,6 +363,28 @@ interface Room {
      * 确保某个矿点有 harvester（换班/死亡补员用）
      */
     ensureHarvesterForSource(sourceId: Id<Source>): boolean
+
+    /**
+     * 矿物开采规划：RCL6 后放 extractor，再放采矿格 container。
+     * 位置一次算好写进 memory.mineralPlan，不反复找点。
+     */
+    ensureExtractor(): void
+
+    /**
+     * 矿物常驻采集补员：extractor 建成后保证采集任务 + 一只 miner；
+     * 矿物采空时挂再生时刻的补员事件。
+     */
+    ensureMiner(): void
+
+    /**
+     * 矿物回运任务同步：按采矿格当前存量动态更新并发，同目标只保留一条任务。
+     */
+    syncMineralCarryTask(): void
+
+    /**
+     * extractor 建成事件：登记 miner 补员和矿物任务。
+     */
+    onExtractorBuilt(extractor: StructureExtractor): void
 
     /**
      * 唤醒睡眠中的矿工：恢复原职业和采空中断前保存的任务

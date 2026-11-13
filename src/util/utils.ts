@@ -73,6 +73,9 @@ export function getBody(role: CreepRoleConstant, room: Room): BodyPartConstant[]
     switch (role) {
         case 'harvester':
             return getHarvesterBody(room)
+        case 'miner':
+            // 矿物开采和能量采集一样站 container 上持续 harvest，体型直接复用
+            return getHarvesterBody(room)
         case 'carrier':
             return getCarrierBody(room)
         case 'worker':
@@ -220,6 +223,7 @@ export function getBodyForEnergy(role: CreepRoleConstant, room: Room, energy: nu
     const budget = Math.min(energy, room.energyCapacityAvailable)
     switch (role) {
         case 'harvester':
+        case 'miner':
         case 'remoteHarvester': {
             // 和 getHarvesterBody 同构，只是能量基准换成当前可用量
             const num = Math.floor((budget - 50) / 250)
