@@ -603,49 +603,6 @@ export default class CreepExtension extends Creep {
         })
     }
 
-    /**
-     * 矿物回运：采矿格 container（没建成时用地上矿堆）-> storage（唯一终点）。
-     * 身上有货先送 storage；到采矿格取货；源空了结束任务，
-     * 由 miner 下次收矿重新发布。
-     */
-    carryMineral(mineralType: ResourceConstant, mineX: number, mineY: number, storageId: Id<StructureStorage>): boolean {
-        const storage = Game.getObjectById<StructureStorage>(storageId)
-        // 非法采矿格（[0,0] 占位符 / 越界）：任务作废，别往房间角跑
-        if (mineX < 0 || mineY < 0 || (mineX === 0 && mineY === 0) || mineX > 49 || mineY > 49) {
-            return true
-        }
-        const homeRoom = storage ? storage.pos.roomName : this.room.name
-        if (this.store.getUsedCapacity(mineralType) > 0) {
-            if (!storage) {
-                return true
-            }
-            if (this.pos.inRangeTo(storage, 1)) {
-                this.transfer(storage, mineralType)
-                return false
-            }
-            this.moveTo(storage, {visualizePathStyle: {stroke: '#aa00ff'}})
-            return false
-        }
-        const minePos = new RoomPosition(mineX, mineY, homeRoom)
-        if (!this.pos.isEqualTo(minePos)) {
-            this.moveTo(minePos, {visualizePathStyle: {stroke: '#aa00ff'}})
-            return false
-        }
-        const container = minePos.lookFor(LOOK_STRUCTURES)
-            .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
-        if (container && container.store.getUsedCapacity(mineralType) > 0) {
-            this.withdraw(container, mineralType)
-            return false
-        }
-        const pile = minePos.lookFor(LOOK_RESOURCES)
-            .find(item => item.resourceType === mineralType) as Resource | undefined
-        if (pile && pile.amount > 0) {
-            this.pickup(pile)
-            return false
-        }
-        return true
-    }
-
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant) {
         const structure = Game.getObjectById(id)
         if (!structure) {
@@ -875,7 +832,7 @@ export default class CreepExtension extends Creep {
         return false
     }
 
-    carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean {
+    carryEnergy(targetId: Id<any>, resourceType: ResourceConstant, sourceId?: Id<any>): boolean {
         if (this.store.getUsedCapacity(resourceType) > 0) {
             const target = Game.getObjectById(targetId)
             if (!target) {
@@ -889,7 +846,54 @@ export default class CreepExtension extends Creep {
             }
             return false
         }
+        // 显式来源（矿物回运）：直接从指定 container/矿堆取，取空就结束任务；
+        // 不转 emptyWorker，也不去找别的能量源
+        if (sourceId) {
+            return !this.refillCarryFromId(sourceId, resourceType)
+        }
         return !this.refillCarryFromSource(resourceType)
+    }
+
+    /**
+     * 从指定来源取货：建筑走 withdraw，地上掉落物走 pickup。
+     * 两者都是 range 1 动作，站相邻格即可，不用挤上采矿格（那里常驻 miner）。
+     * true = 继续任务；false = 来源没了/取空，结束任务等房间重新发布。
+     */
+    private refillCarryFromId(sourceId: Id<any>, resourceType: ResourceConstant): boolean {
+        const source: any = Game.getObjectById(sourceId)
+        if (!source) {
+            this.removeCurrentWorkFromQueue()
+            return false
+        }
+        // 地上掉落物：amount 是资源堆的字段，建筑没有
+        if (source.amount !== undefined) {
+            const res = this.pickup(source)
+            if (res === ERR_NOT_IN_RANGE) {
+                this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
+                return true
+            }
+            if (res === OK || res === ACTION_BLOCKED) {
+                return true
+            }
+            // 资源堆被抢光 / 目标无效：结束本任务
+            this.removeCurrentWorkFromQueue()
+            return false
+        }
+        if ((source.store?.getUsedCapacity(resourceType) ?? 0) <= 0) {
+            this.removeCurrentWorkFromQueue()
+            return false
+        }
+        const res = this.withdraw(source, resourceType)
+        if (res === ERR_NOT_IN_RANGE) {
+            this.moveTo(source, {visualizePathStyle: {stroke: '#ffff00'}})
+            return true
+        }
+        if (res === OK || res === ACTION_BLOCKED) {
+            return true
+        }
+        // 取空 / 塞不下（身上有别的东西）：结束任务，由房间按存量重新发布
+        this.removeCurrentWorkFromQueue()
+        return false
     }
 
     /**

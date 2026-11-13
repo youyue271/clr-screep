@@ -175,9 +175,9 @@ export function getMineralHarvestTask(room: Room): MyTask[] {
 
 /**
  * 矿物回运任务：采矿格 container（还没建成时用地上矿堆）里的矿物送 storage。
- * 并发按当前存量/平均载重动态算，和能源任务同一套口径；
- * 没有 storage / 没有可运的矿物时不发布。
- * taskParam = [mineralType, 采矿格 x, 采矿格 y, storageId]
+ * 执行函数复用 carrier 的 carryEnergy：taskParam = [storageId, mineralType, 来源 id]，
+ * carrier 到 range 1 就能 withdraw/pickup，不用挤上被 miner 常驻的采矿格。
+ * 并发按当前存量/平均载重动态算；没有 storage / 没有可运的矿物时不发布。
  */
 export function getMineralCarryTask(room: Room): MyTask[] {
     const plan = room.memory.mineralPlan
@@ -198,16 +198,18 @@ export function getMineralCarryTask(room: Room): MyTask[] {
         .find(item => item.structureType === STRUCTURE_CONTAINER) as StructureContainer | undefined
     const pile = pos.lookFor(LOOK_RESOURCES)
         .find(item => item.resourceType === mineral.mineralType) as Resource | undefined
-    const amount = (container ? container.store.getUsedCapacity(mineral.mineralType) : 0)
-        + (pile ? pile.amount : 0)
+    const containerAmount = container ? container.store.getUsedCapacity(mineral.mineralType) : 0
+    const amount = containerAmount + (pile ? pile.amount : 0)
     if (!amount) {
         return []
     }
+    // container 有货优先从 container 取；container 空但矿堆有货就取矿堆
+    const source = container && containerAmount > 0 ? container : pile!
     const maxCarry = room.carrierCapacity()
     return [{
         taskType: 'mineralCarryTask',
-        taskFunc: 'carryMineral',
-        taskParam: [mineral.mineralType, plan.minePos[0], plan.minePos[1], storage.id],
+        taskFunc: 'carryEnergy',
+        taskParam: [storage.id, mineral.mineralType, source.id],
         priority: 2,
         capacity: Math.max(1, Math.ceil(amount / maxCarry)),
         persistent: false,

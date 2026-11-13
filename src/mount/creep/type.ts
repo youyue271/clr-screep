@@ -101,10 +101,6 @@ interface Creep {
      * 矿物开采：站矿点旁固定采矿格，采完自动进冷却睡眠；采空睡到再生。
      */
     harvestMineral(mineralId: Id<Mineral>, mineX: number, mineY: number): boolean
-    /**
-     * 把矿物从采矿格 container（没建成时用地上矿堆）运回 storage。
-     */
-    carryMineral(mineralType: ResourceConstant, mineX: number, mineY: number, storageId: Id<StructureStorage>): boolean
     getEnergyFromStructure(id: Id<any>, energyType: ResourceConstant): boolean
     collectEnergy(id: Id<any>): boolean
     upgrade(controllerId: Id<StructureController>): boolean
@@ -114,7 +110,11 @@ interface Creep {
      * 普通死亡要等 spawn 时按自然 TTL 挂的事件，部件被打光提前死会空名额很久。
      */
     suicideAndRespawn(): void
-    carryEnergy(targetId: Id<any>, resourceType: ResourceConstant): boolean
+    /**
+     * 搬运：身上有货投 target；空手时从 sourceId（可选）或就近能量源取货。
+     * 矿物回运用它并传 sourceId，取空即结束任务。
+     */
+    carryEnergy(targetId: Id<any>, resourceType: ResourceConstant, sourceId?: Id<any>): boolean
     /**
      * 通用搬运：从 from 取 resourceType 送到 to，参数完全来自 transferTask。
      * 目标满/来源空时原地等（persistent 任务不释放），目标消失才结束任务。
