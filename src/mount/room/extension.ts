@@ -1730,8 +1730,8 @@ export default class RoomExtension extends Room {
     /**
      * 中央 carrier 的固定站位：布局里离 link/storage/terminal 最均衡的道路格。
      * 用布局局部坐标算（terminal 没建也有位置），结果缓存在 linkPlan 里。
-     * plan1 的 S/T/L 不共邻，选贴着 link 和 storage 的那格（(25,18)）；
-     * plan2 三个都贴着（(3,3)，也就是阵型正中）。
+     * plan1 的 link 挪到 (3,5) 后，S/T/L（以及隔壁的 factory）都贴着 (4,5)；
+     * plan2 同理，三个都贴着 (3,3)，也就是阵型正中。
      */
     centerCarrierPos(): [number, number] | undefined {
         if (!this.memory.creepTask) {
