@@ -1260,6 +1260,7 @@ export default class RoomExtension extends Room {
         // 外矿 link：位置持久化在顶层 remotePlan 里，推代码后不用重新寻路
         const remotes = plan.remotes ?? (plan.remotes = {})
         const remotePlan = Memory.remotePlan?.[this.name]
+        const activeRemotes: { [roomName: string]: boolean } = {}
         let remoteLinkChanged = false
         for (const roomName in remotePlan?.rooms ?? {}) {
             const state = remotePlan.rooms[roomName]
@@ -1271,19 +1272,34 @@ export default class RoomExtension extends Room {
                 continue
             }
             let pos = state.remoteLinkPos
-            if (!pos) {
-                pos = this.computeRemoteLinkPos(roomName, assigned)
-                if (pos) {
-                    state.remoteLinkPos = pos
-                    // 新确定了外矿出口位置：道路目标集合变了
+            // 旧数据/地形变了：已存的位置放不了 link 时重算一次，不用手工清 Memory
+            if (!pos || pos.length < 2 || !this.remoteLinkPosUsable(roomName, pos)) {
+                const recomputed = this.computeRemoteLinkPos(roomName, assigned)
+                if (!pos || !recomputed || pos[0] !== recomputed[0] || pos[1] !== recomputed[1]) {
+                    // 外矿出口位置变了：道路目标集合也变了
                     remoteLinkChanged = true
+                }
+                if (recomputed) {
+                    state.remoteLinkPos = recomputed
+                    pos = recomputed
+                } else {
+                    delete state.remoteLinkPos
+                    pos = undefined
                 }
             }
             if (!pos) {
                 continue
             }
+            activeRemotes[roomName] = true
             remotes[roomName] = { pos }
             assigned.push(pos)
+        }
+        // 停用/没有 container 的外矿：清掉旧的重复规划位，别让过期坐标继续被兜底逻辑读到。
+        // 顶层 remotePlan 里的原始坐标保留，重新启用时还能拿来校验/复用
+        for (const roomName in remotes) {
+            if (!activeRemotes[roomName]) {
+                delete remotes[roomName]
+            }
         }
 
         // 回填/清理 id：结构被拆后旧 id 不能留着
@@ -1634,7 +1650,7 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * link 可以放：不是墙、没有建筑、没有工地。
+     * link 可以放：不是墙，没有建筑/工地，也不是矿点/矿物/矿层。
      */
     private linkTileFree(pos: [number, number]): boolean {
         const terrain = this.getTerrain()
@@ -1651,7 +1667,73 @@ export default class RoomExtension extends Room {
         if (position.lookFor(LOOK_CONSTRUCTION_SITES).length) {
             return false
         }
+        if (position.lookFor(LOOK_SOURCES).length) {
+            return false
+        }
+        if (position.lookFor(LOOK_MINERALS).length) {
+            return false
+        }
+        if (position.lookFor(LOOK_DEPOSITS).length) {
+            return false
+        }
         return true
+    }
+
+    /**
+     * 持久化的外矿 link 位置还能不能用：
+     * - 这一格已经有 link：直接认（重算反而会把已建好的 link 挪出计划）
+     * - 否则必须是主房通往该外矿出口的 3~6 格带内、能放 link 的空地
+     */
+    private remoteLinkPosUsable(remoteRoom: string, pos: [number, number]): boolean {
+        const position = this.getPositionAt(pos[0], pos[1])
+        if (!position) {
+            return false
+        }
+        const hasLink = position.lookFor(LOOK_STRUCTURES).some(
+            (structure: Structure) => structure.structureType === STRUCTURE_LINK
+        )
+        if (hasLink) {
+            return true
+        }
+        const exits = Game.map.describeExits(this.name)
+        if (!exits) {
+            return false
+        }
+        let dirKey: string | undefined
+        for (const key in exits) {
+            if (exits[key] === remoteRoom) {
+                dirKey = key
+                break
+            }
+        }
+        if (!dirKey) {
+            return false
+        }
+        const distance = dirKey === '3' ? 49 - pos[0]
+            : dirKey === '7' ? pos[0]
+                : dirKey === '5' ? 49 - pos[1]
+                    : dirKey === '1' ? pos[1]
+                        : -1
+        if (distance < 3 || distance > 6) {
+            return false
+        }
+        return this.linkTileFree(pos)
+    }
+
+    /**
+     * 外矿回运没有可用 link 时的兜底丢货位：主房内、该外矿出口附近。
+     * 读持久化计划并校验，旧数据不会再把货丢到墙上/矿点上。
+     */
+    remoteLinkDropPosOf(remoteRoom: string): RoomPosition | undefined {
+        const pos = Memory.remotePlan?.[this.name]?.rooms?.[remoteRoom]?.remoteLinkPos
+            ?? this.memory.linkPlan?.remotes?.[remoteRoom]?.pos
+        if (!pos || pos.length < 2) {
+            return undefined
+        }
+        if (!this.remoteLinkPosUsable(remoteRoom, pos)) {
+            return undefined
+        }
+        return this.getPositionAt(pos[0], pos[1])
     }
 
     private hasBuildTaskFor(siteId: string): boolean {
