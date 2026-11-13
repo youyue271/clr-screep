@@ -24,8 +24,12 @@ interface CreepMemory {
     linkWaitTicks?: number
     // 外矿 container 已经消失（外矿房停用/被拆）：本次回程卸完货就结束循环
     remoteAbort?: boolean
-    // 侦察兵当前要探的房间；探完清空，等待新目标
-    scoutTarget?: string
+    // 侦察兵孵化时绑定的驻守房：每房一只，到房后不再离开
+    viewerRoom?: string
+    // 该房已经有人接管视野 / 进入复探冷却：回主房自毁，不再补
+    viewerRetire?: boolean
+    // 驻守格缓存 [x, y, roomName]，避免每 tick 找空地
+    viewerPost?: [number, number, string]
     // claimer 孵化时绑定的目标房（显式 claim 或外矿保留），
     // 每个目标房常驻一只，避免一只 claimer 在多房间之间来回跑
     claimerTarget?: string
@@ -140,10 +144,10 @@ interface Creep {
      */
     remoteCarry(containerId: Id<StructureContainer>, targetRoom: string, homeRoom: string, sinkId?: Id<any>, linkId?: Id<StructureLink>): boolean
     /**
-     * 侦察兵常驻任务：探明相邻房间并写情报；没有目标时原地随机走，等新任务。
-     * 一直返回 false，只有主房关掉外矿时才回主房释放任务。
+     * 侦察兵常驻任务：走到孵化时绑定的房，停在固定驻守格提供视野。
+     * 房间不再需要视野/外矿关闭时回主房自毁。一直返回 false。
      */
-    scout(homeRoom: string): boolean
+    scout(homeRoom: string, targetRoom?: string): boolean
     /**
      * 睡眠态的唯一动作：每 tick 说 zzz。
      * 唤醒由主房事件队列里的 wakeCreep 负责，不做每 tick 的条件判断。

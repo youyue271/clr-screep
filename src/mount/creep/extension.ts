@@ -208,6 +208,12 @@ export default class CreepExtension extends Creep {
                     }
                     queue = [...queue].sort((a, b) =>
                         (a?.reservedBy?.length ?? 0) - (b?.reservedBy?.length ?? 0))
+                } else if (taskType === 'scoutTask') {
+                    // 每只 viewer 只驻守孵化时绑定的房，不领其他房的侦察任务
+                    queue = this.boundScoutQueue(queue)
+                    if (!queue.length) {
+                        continue
+                    }
                 } else if (taskType === 'energyTask') {
                     // 多个 container / 掉落物时优先去没人预约的，避免所有缺能量的 creep 挤在一个矿点
                     queue = [...queue].sort((a, b) =>
@@ -1622,103 +1628,97 @@ export default class CreepExtension extends Creep {
     }
 
     /**
-     * 侦察兵常驻任务：从外矿计划里挑需要情报的房间，走过去写情报；
-     * 没有目标时回主房随机走，等待 autoplan 以后新增的房间。
-     * 一直返回 false，只有主房关掉外矿时才回主房释放任务。
+     * 侦察兵常驻任务：每只 viewer 孵化时绑定一个房（memory.viewerRoom），
+     * 到房后停在固定驻守格，不再跨房巡游。情报由主房 10 tick 扫描按视野刷新。
+     * 房间已有人接管/进入复探冷却/外矿关闭时主房会打 viewerRetire，回主房后自毁。
      */
-    scout(homeRoom: string): boolean {
+    scout(homeRoom: string, targetRoom?: string): boolean {
         const plan = Memory.remotePlan?.[homeRoom]
         if (!plan || plan.enabled === false) {
-            // 外矿总开关关了：回主房释放任务（releaseCurrentWork 用的是主房队列）
-            if (this.room.name === homeRoom) {
-                return true
-            }
-            this.moveToRoom(homeRoom)
-            return false
+            this.memory.viewerRetire = true
         }
-        const target = this.memory.scoutTarget
-        if (target) {
-            if (this.room.name === target) {
-                this.say('👁️侦察完毕')
-                assessRemoteVision(homeRoom, this.room, 'creep')
-                delete this.memory.scoutTarget
-                return false
-            }
-            // 侦察兵只支持在相邻房之间导航：先回主房，再从主房去目标
+        if (this.memory.viewerRetire) {
             if (this.room.name !== homeRoom) {
                 this.moveToRoom(homeRoom)
                 return false
             }
-            if (!this.moveToRoom(target)) {
-                // 从主房都走不到：当作不可用，避免反复派同一个房
-                this.markScoutUnreachable(homeRoom, target)
-                delete this.memory.scoutTarget
+            this.say('💤退场')
+            this.suicideAndRespawn()
+            return false
+        }
+        const target = targetRoom ?? this.memory.viewerRoom
+        if (!target) {
+            // 没有绑定房（旧版本 viewer）：回主房等统一退场
+            if (this.room.name !== homeRoom) {
+                this.moveToRoom(homeRoom)
             }
             return false
         }
-        // 没有目标时先回主房待命，避免留在外矿房没法接新任务
-        if (this.room.name !== homeRoom) {
-            this.moveToRoom(homeRoom)
+        if (this.room.name !== target) {
+            if (!this.moveToRoom(target)) {
+                // 从主房都走不到：当作不可用，避免反复派同一个房
+                this.markScoutUnreachable(homeRoom, target)
+                this.memory.viewerRetire = true
+            }
             return false
         }
-        const next = this.pickScoutTarget(homeRoom)
-        if (next) {
-            this.memory.scoutTarget = next
-            this.say('👁️去侦察')
-            this.moveToRoom(next)
-            return false
+        // 到房：停在固定驻守格，不再发多余移动
+        const post = this.viewerPost(target)
+        if (post && !this.pos.isEqualTo(post)) {
+            this.moveTo(post, { visualizePathStyle: { stroke: '#00ffff' } })
         }
-        // 没活：原地随便走走，等新任务
-        this.randomWalk()
         return false
     }
 
     /**
-     * 常驻侦察兵轮巡：挑情报最老（scoutedAt 最小）的计划房，停用房也一起复查。
-     * 自动重开靠它兜底：到站后 scout() 会调 L2 评估，安全就恢复 enabled。
-     * 没有 scoutedAt 的房视为 0，优先探。
+     * 驻守格：房间中心附近的空地，避开矿点/矿物/建筑/工地/出口/控制器，
+     * 结果缓存在 memory.viewerPost，避免每 tick 扫描。
      */
-    private pickScoutTarget(homeRoom: string): string | undefined {
-        const plan = Memory.remotePlan?.[homeRoom]
-        if (!plan?.rooms) {
+    private viewerPost(roomName: string): RoomPosition | undefined {
+        const cached = this.memory.viewerPost
+        if (cached && cached[2] === roomName) {
+            return new RoomPosition(cached[0], cached[1], roomName)
+        }
+        const room = Game.rooms[roomName]
+        if (!room) {
             return undefined
         }
-        // 只从真实相邻房（describeExits）里挑：findExitTo 对非相邻房的行为不可靠，
-        // 盲选会让侦察兵在错误的出口之间来回撞。地形静态，走不通的房直接永久跳过。
-        const exits = Game.map.describeExits(homeRoom) ?? {}
-        const now = Game.time
-        let best: string | undefined
-        let bestAt = Infinity
-        let due: string | undefined
-        let dueAt = Infinity
-        for (const dir in exits) {
-            const roomName = exits[dir]
-            if (!roomName || !plan.rooms[roomName]) {
-                continue
-            }
-            const intel = Memory.mapIntel?.[roomName]
-            if (intel?.unreachable) {
-                continue
-            }
-            // 还没到复探时间：先不去（强敌停用房、武装敌对没结束的房）
-            if (intel?.retryAt !== undefined && intel.retryAt > now) {
-                continue
-            }
-            // 到点的复探优先：尽快确认外矿能不能恢复生产
-            if (intel?.retryAt !== undefined) {
-                if (intel.retryAt < dueAt) {
-                    dueAt = intel.retryAt
-                    due = roomName
+        const terrain = room.getTerrain()
+        const controller = room.controller
+        for (let radius = 0; radius <= 10; radius++) {
+            for (let dx = -radius; dx <= radius; dx++) {
+                for (let dy = -radius; dy <= radius; dy++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) {
+                        continue
+                    }
+                    const x = 25 + dx
+                    const y = 25 + dy
+                    if (x < 1 || x > 48 || y < 1 || y > 48) {
+                        continue
+                    }
+                    if (terrain.get(x, y) === TERRAIN_MASK_WALL) {
+                        continue
+                    }
+                    const pos = room.getPositionAt(x, y)
+                    if (!pos) {
+                        continue
+                    }
+                    // 控制器旁留给 claimer
+                    if (controller && pos.getRangeTo(controller) <= 1) {
+                        continue
+                    }
+                    if (pos.lookFor(LOOK_SOURCES).length || pos.lookFor(LOOK_MINERALS).length) {
+                        continue
+                    }
+                    if (pos.lookFor(LOOK_STRUCTURES).length || pos.lookFor(LOOK_CONSTRUCTION_SITES).length) {
+                        continue
+                    }
+                    this.memory.viewerPost = [x, y, roomName]
+                    return pos
                 }
-                continue
-            }
-            const at = intel?.scoutedAt ?? 0
-            if (at < bestAt) {
-                bestAt = at
-                best = roomName
             }
         }
-        return due ?? best
+        return undefined
     }
 
     /**
@@ -1925,34 +1925,6 @@ export default class CreepExtension extends Creep {
         // 被别人保留满/无权限：用实时状态刷情报，避免反复尝试
         assessRemoteVision(homeRoom, this.room, 'creep')
         return false
-    }
-
-    /**
-     * 侦察兵待命时的随机移动：只在本房间内走，不跨出口。
-     */
-    private randomWalk(): void {
-        const directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT]
-        const delta: { [dir: number]: [number, number] } = {
-            [TOP]: [-1, 0],
-            [TOP_RIGHT]: [-1, 1],
-            [RIGHT]: [0, 1],
-            [BOTTOM_RIGHT]: [1, 1],
-            [BOTTOM]: [1, 0],
-            [BOTTOM_LEFT]: [1, -1],
-            [LEFT]: [0, -1],
-            [TOP_LEFT]: [-1, -1],
-        }
-        const dir = directions[Math.floor(Math.random() * directions.length)]
-        const [dx, dy] = delta[dir]
-        const x = this.pos.x + dx
-        const y = this.pos.y + dy
-        if (x < 1 || x > 48 || y < 1 || y > 48) {
-            return
-        }
-        if (this.room.getTerrain().get(x, y) === TERRAIN_MASK_WALL) {
-            return
-        }
-        this.move(dir)
     }
 
     /**
@@ -2227,6 +2199,17 @@ export default class CreepExtension extends Creep {
             return queue
         }
         return queue.filter(task => task?.taskParam?.[0] === boundContainerId)
+    }
+
+    /**
+     * viewer 只领自己孵化时绑定房间的侦察任务；旧版本没绑定的不限制（随后会退场）。
+     */
+    private boundScoutQueue(queue: TaskEntity[]): TaskEntity[] {
+        const boundRoom = this.memory.viewerRoom
+        if (!boundRoom) {
+            return queue
+        }
+        return queue.filter(task => task?.taskParam?.[1] === boundRoom)
     }
 
     /**

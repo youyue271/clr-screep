@@ -769,51 +769,146 @@ export default class RoomExtension extends Room {
     }
 
     /**
-     * 常驻侦察任务：每个主房一个，capacity 1，priority 4（不挡富余能量门槛）。
-     * 侦察兵认领后一直持有，内部自己从 plan 里挑下一个要探的房。
+     * 常驻侦察任务：每个需要视野的房间一条，capacity 1，priority 4。
+     * viewer 孵化时绑定房间（memory.viewerRoom），只领自己那条，
+     * 到房后驻守，不再跨房巡游。
      */
     private syncScoutTask(): void {
         const buckets = this.normalizeTaskBuckets('scoutTask')
         for (const key in buckets) {
             delete buckets[key]
         }
-        buckets['4'] = [{
-            id: `scout-${this.name}`,
-            taskFunc: 'scout',
-            taskParam: [this.name],
-            priority: 4,
-            capacity: 1,
-            persistent: true,
-            targetId: this.name,
-            reservedBy: [],
-        }]
+        const tasks: TaskEntity[] = []
+        for (const roomName of this.scoutCoverageRooms()) {
+            tasks.push({
+                id: `scout-${this.name}-${roomName}`,
+                taskFunc: 'scout',
+                taskParam: [this.name, roomName],
+                priority: 4,
+                capacity: 1,
+                persistent: true,
+                targetId: roomName,
+                reservedBy: [],
+            })
+        }
+        if (tasks.length) {
+            buckets['4'] = tasks
+        }
     }
 
     /**
-     * 常驻一个侦察兵：持续轮巡相邻房，给外矿自动重开和战争情报提供视野。
-     * 只要外矿计划开着就一直保持 1 个（存活或排队都算）。priority 2 与 worker 同档：
-     * 侦察兵只有 100 能量、6 tick 就孵完，排在 4 会被 harvester/外矿任务长期压住。
+     * 需要专门 viewer 提供视野的房间：
+     * - 启用中、房里没有其他我方 creep（harvester/claimer 自带视野）；
+     * - 停用/暂停房到点复探（retryAt 到期），复探完再按新情报决定。
+     * 不可达房跳过；复探冷却中的房跳过，避免送人头。
+     */
+    private scoutCoverageRooms(): string[] {
+        const result: string[] = []
+        const plan = Memory.remotePlan?.[this.name]
+        if (!plan || plan.enabled === false || !plan.rooms) {
+            return result
+        }
+        const now = Game.time
+        for (const roomName in plan.rooms) {
+            const state = plan.rooms[roomName]
+            if (!state) {
+                continue
+            }
+            const intel = Memory.mapIntel?.[roomName]
+            if (intel?.unreachable) {
+                continue
+            }
+            if (intel?.retryAt !== undefined) {
+                // 到点的复探优先派一次；冷却中不派
+                if (intel.retryAt <= now) {
+                    result.push(roomName)
+                }
+                continue
+            }
+            if (state.enabled === false) {
+                continue
+            }
+            const room = Game.rooms[roomName]
+            // 房里已经有其他我方 creep：视野和情报由它顺带刷新
+            if (room && room.find(FIND_MY_CREEPS).some(creep => creep.memory.role !== 'viewer')) {
+                continue
+            }
+            result.push(roomName)
+        }
+        return result
+    }
+
+    /**
+     * 按房维持 viewer：每个需要视野的房间一只（绑定 memory.viewerRoom）。
+     * 已经不需要的房间（有人接管/进入复探冷却/不可达）给现存 viewer 打退场标记，
+     * 它回主房后自毁，不再补。旧版本没有绑定房的 viewer 同样退场。
+     * priority 2 与 worker 同档：侦察兵只有 100 能量、6 tick 就孵完，
+     * 排在 4 会被 harvester/外矿任务长期压住。
      */
     private refreshScoutSpawn(): void {
-        const plan = Memory.remotePlan?.[this.name]
-        if (!plan || plan.enabled === false) {
-            return
+        const desired = this.scoutCoverageRooms()
+        const desiredSet: { [roomName: string]: boolean } = {}
+        for (const roomName of desired) {
+            desiredSet[roomName] = true
         }
+        const alive: { [roomName: string]: boolean } = {}
         for (const creepName in Game.creeps) {
             const creep = Game.creeps[creepName]
-            if (creep.memory.spawnRoom === this.name && creep.memory.role === 'viewer') {
-                return
+            if (creep.memory.spawnRoom !== this.name || creep.memory.role !== 'viewer') {
+                continue
             }
+            const roomName = creep.memory.viewerRoom
+            if (!roomName || !desiredSet[roomName]) {
+                creep.memory.viewerRetire = true
+                continue
+            }
+            delete creep.memory.viewerRetire
+            alive[roomName] = true
         }
+        // 出生有 1 tick 延迟：排队中的同房 viewer 也算已有，避免重复孵化。
+        // 已经有 harvester/claimer 在排队去这个房时也不用派 viewer，
+        // 之前排上的 viewer 任务一并取消（等它出生再退场更浪费）。
         const spawnBuckets = this.normalizeTaskBuckets('spawnTask')
+        const incoming: { [roomName: string]: boolean } = {}
         for (const key in spawnBuckets) {
             for (const task of spawnBuckets[key] ?? []) {
-                if (task?.taskParam?.[0] === 'viewer') {
-                    return
+                const role = task?.taskParam?.[0]
+                const roomName = task?.taskParam?.[4] as string | undefined
+                if (role && role !== 'viewer' && roomName
+                    && (role === 'remoteHarvester' || role === 'claimer')) {
+                    incoming[roomName] = true
                 }
             }
         }
-        this.addToSpawnList('viewer')
+        const pending: { [roomName: string]: boolean } = {}
+        for (const key in spawnBuckets) {
+            const queue = spawnBuckets[key]
+            if (!queue) {
+                continue
+            }
+            spawnBuckets[key] = queue.filter(task => {
+                if (task?.taskParam?.[0] !== 'viewer') {
+                    return true
+                }
+                const roomName = task?.taskParam?.[4] as string | undefined
+                if (!roomName || !desiredSet[roomName] || incoming[roomName]
+                    || alive[roomName] || pending[roomName]) {
+                    return false
+                }
+                pending[roomName] = true
+                return true
+            })
+            if (!spawnBuckets[key].length) {
+                delete spawnBuckets[key]
+            }
+        }
+        for (const roomName of desired) {
+            // 已有 harvester/claimer 在排队去这个房：等它出生自带视野，不再派 viewer
+            if (alive[roomName] || pending[roomName] || incoming[roomName]) {
+                continue
+            }
+            this.addToSpawnList('viewer', undefined, roomName)
+        }
     }
 
     /**
@@ -3310,6 +3405,10 @@ export default class RoomExtension extends Room {
                 const savedWorkType = outsideHome ? creep.memory.currentWorkType : undefined
                 // claimer 绑定的目标房也要保住，否则每次推代码都会解绑回主房重孵
                 const savedClaimerTarget = creep.memory.claimerTarget
+                // viewer 绑定的驻守房/驻守格/退场标记同理：丢了会当成旧侦察兵退场
+                const savedViewerRoom = creep.memory.viewerRoom
+                const savedViewerRetire = creep.memory.viewerRetire
+                const savedViewerPost = creep.memory.viewerPost
                 // 反击队的目标房同理：丢了会回家摆烂，这一轮弱敌就没人清了
                 const savedAttackerTarget = creep.memory.attackerTarget
                 // L3 任务绑定：推代码后丢了 missionId，小队会被当成无任务的旧单位
@@ -3337,6 +3436,15 @@ export default class RoomExtension extends Room {
                 }
                 if (savedClaimerTarget) {
                     creep.memory.claimerTarget = savedClaimerTarget
+                }
+                if (savedViewerRoom) {
+                    creep.memory.viewerRoom = savedViewerRoom
+                }
+                if (savedViewerRetire) {
+                    creep.memory.viewerRetire = true
+                }
+                if (savedViewerPost) {
+                    creep.memory.viewerPost = savedViewerPost
                 }
                 if (savedAttackerTarget) {
                     creep.memory.attackerTarget = savedAttackerTarget
