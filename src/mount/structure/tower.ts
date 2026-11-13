@@ -1,4 +1,5 @@
 import {towerSetting} from "@/setting";
+import {isWhitelistedCreep} from "@/util/whitelist";
 
 /**
  * 塔的逻辑：只读 global.room 中的扫描缓存，不在每 tick 做 find。
@@ -38,7 +39,8 @@ export default class TowerExtension extends StructureTower {
         let fallback: Creep | undefined
         for (const id of ids) {
             const target = Game.getObjectById<Creep>(id)
-            if (!target) {
+            // 扫描缓存有间隔，期间可能被加进白名单；这里再兜底校验一次
+            if (!target || isWhitelistedCreep(target)) {
                 continue
             }
             if (this.pos.inRangeTo(target, TOWER_OPTIMAL_RANGE)) {

@@ -38,6 +38,12 @@ interface BodySet {
  */
 type ThreatLevel = 'none' | 'harmless' | 'raid' | 'assault' | 'siege'
 
+/**
+ * 玩家白名单模式：
+ * pass 只放行纯 MOVE 侦察兵；full 该玩家所有 creep 都不打。
+ */
+type WhitelistMode = 'pass' | 'full'
+
 interface ThreatSummary {
     level: ThreatLevel
     // 敌对 creep 数量（只算还活着的）

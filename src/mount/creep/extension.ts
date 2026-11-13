@@ -3,6 +3,7 @@ import { containerWatermark, mineralSetting, remoteSetting } from "@/setting";
 import log from "@/util/log";
 import { assessRemoteVision } from "@/global/war/remote/l2";
 import { classifyThreat, isRemotePaused } from "@/util/threat";
+import { filterHostileCreeps } from "@/util/whitelist";
 import { onRemoteHarvestSignal, rememberRemoteTarget } from "@/global/war/remote/l1";
 import {
     ensureMissionMember,
@@ -2002,7 +2003,7 @@ export default class CreepExtension extends Creep {
         const home = Game.rooms[homeRoom]
         // 主房遭强敌：先回防，任务里的人也不例外
         if (home) {
-            const homeLevel = classifyThreat(home.find(FIND_HOSTILE_CREEPS)).level
+            const homeLevel = classifyThreat(filterHostileCreeps(home.find(FIND_HOSTILE_CREEPS))).level
             if (homeLevel === 'assault' || homeLevel === 'siege') {
                 if (this.room.name !== homeRoom) {
                     this.moveToRoom(homeRoom)
@@ -2096,7 +2097,7 @@ export default class CreepExtension extends Creep {
             this.moveToRoom(homeRoom)
             return
         }
-        const hostiles = this.room.find(FIND_HOSTILE_CREEPS)
+        const hostiles = filterHostileCreeps(this.room.find(FIND_HOSTILE_CREEPS))
         const threat = classifyThreat(hostiles)
         if (threat.level === 'assault' || threat.level === 'siege') {
             // 敌人增援已经不是弱敌：撤退，把房留给后续扩编
@@ -2150,8 +2151,8 @@ export default class CreepExtension extends Creep {
             this.moveToRoom(homeRoom)
             return
         }
-        // core 刷出来的防守兵挡路就先打近的
-        const defenders = this.room.find(FIND_HOSTILE_CREEPS).filter(creep =>
+        // core 刷出来的防守兵挡路就先打近的（白名单玩家的兵不算）
+        const defenders = filterHostileCreeps(this.room.find(FIND_HOSTILE_CREEPS)).filter(creep =>
             creep.getActiveBodyparts(ATTACK) > 0
             || creep.getActiveBodyparts(RANGED_ATTACK) > 0)
         const guard = defenders.sort((a, b) => this.pos.getRangeTo(a) - this.pos.getRangeTo(b))[0]

@@ -1,5 +1,6 @@
 import { warSetting } from "@/setting"
 import { classifyThreat, isNpcUser } from "@/util/threat"
+import { filterHostileCreeps } from "@/util/whitelist"
 import type { RemoteL1Report } from "../types"
 import { onRemoteDecision } from "./l3"
 
@@ -69,7 +70,8 @@ function assessRoom(room: Room, me?: string): RemoteAssessment {
     const controller = room.controller
     const owner = controller?.owner?.username
     const reservation = controller?.reservation?.username
-    const creeps = room.find(FIND_HOSTILE_CREEPS)
+    // 白名单玩家的 creep 直接忽略：不参与威胁分级，也不触发暂停/反击/出征
+    const creeps = filterHostileCreeps(room.find(FIND_HOSTILE_CREEPS))
     const structures = room.find(FIND_HOSTILE_STRUCTURES)
     const threat = classifyThreat(creeps)
     const users: string[] = []

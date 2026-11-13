@@ -116,6 +116,11 @@ interface Memory {
     legacyWallCleared?: { [roomName: string]: boolean }
     // L3 作战任务与历史（反击/出征）
     war?: WarMemory
+    // 玩家白名单（顶层键，推代码后仍保留，由玩家手动维护）：
+    // username -> pass（只放行纯 MOVE 侦察兵）/ full（所有 creep 都不打）
+    whitelist?: {
+        players?: { [username: string]: WhitelistMode }
+    }
 }
 
 interface RoomMemory {
