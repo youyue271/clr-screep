@@ -1,4 +1,5 @@
 import {energyStructureScanInterval, repairPriority, towerSetting, wallSetting} from "@/setting";
+import {filterHostileCreeps} from "@/util/whitelist"
 
 /**
  * 房间环境扫描：低频执行 find，把结果以 id 的形式缓存在 global.room 中，
@@ -67,7 +68,8 @@ export default class RoomScanExtension extends Room {
     }
 
     private refreshThreat(cache: RoomGlobalCache): void {
-        const hostiles = this.find(FIND_HOSTILE_CREEPS)
+        // 白名单玩家的 creep 不算敌情：塔不打、也不触发 defend 模式
+        const hostiles = filterHostileCreeps(this.find(FIND_HOSTILE_CREEPS))
         cache.hostileIds = hostiles.map(creep => creep.id)
 
         const hurt = this.find(FIND_MY_CREEPS)

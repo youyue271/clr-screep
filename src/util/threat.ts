@@ -1,4 +1,5 @@
 import {warSetting} from "@/setting"
+import {filterHostileCreeps} from "@/util/whitelist"
 
 /**
  * 数某个 creep 还活着的部件（hits > 0）。
@@ -99,7 +100,8 @@ export function isWeakThreat(summary: ThreatSummary): boolean {
  * 外矿 creep 在自己房里每 tick 都能用，不依赖 10 tick 的情报刷新。
  */
 export function hasArmedHostile(room: Room): boolean {
-    return isArmedThreat(classifyThreat(room.find(FIND_HOSTILE_CREEPS)))
+    // 白名单玩家的兵不算威胁，外矿 creep 不必因为它们在房里就撤
+    return isArmedThreat(classifyThreat(filterHostileCreeps(room.find(FIND_HOSTILE_CREEPS))))
 }
 
 /**

@@ -1,5 +1,6 @@
 import { callRemoteL2 } from "./l2"
 import type { RemoteL1Report, RemoteSignal } from "../types"
+import { filterHostileCreeps } from "@/util/whitelist"
 
 /** 离开外矿房后多少 tick 内死亡仍然归因到这次外矿任务 */
 const RECENT_LEAVE_TICKS = 100
@@ -114,7 +115,8 @@ function buildReport(
     if (!room) {
         return report
     }
-    const creeps = room.find(FIND_HOSTILE_CREEPS)
+    // 白名单玩家的 creep 不算敌情（建筑仍按敌对处理）
+    const creeps = filterHostileCreeps(room.find(FIND_HOSTILE_CREEPS))
     const structures = room.find(FIND_HOSTILE_STRUCTURES)
     report.hasHostile = creeps.length > 0 || structures.length > 0
     if (creeps.length) {
