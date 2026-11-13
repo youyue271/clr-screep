@@ -134,6 +134,12 @@ interface Creep {
      * 按房间名走到目标房间。没有视野时用房间出口导航，只支持相邻房间
      */
     moveToRoom(roomName: string): boolean
+
+    /**
+     * 本 tick 没移动过、却停在房间出口格上的 creep，往房内走一步。
+     * 引擎会把停在出口格的 creep 每 tick 送到隔壁房，空闲 creep 会来回乒乓。
+     */
+    leaveBorderIfIdle(): void
     /**
      * 外矿常驻采集：到矿点后站 container 上采，矿点空了顺手修 container。
      * 这个任务一直持有到 creep 死亡，永远返回 false。
